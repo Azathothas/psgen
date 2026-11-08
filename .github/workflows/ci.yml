@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-musl
+      - name: build
+        run: cargo build --locked --release --target x86_64-unknown-linux-musl
+      - name: stage binary
+        run: |
+          mkdir -p target/release
+          cp target/x86_64-unknown-linux-musl/release/psgen target/release/psgen
+      - name: test
+        run: sh tests/smoke.sh

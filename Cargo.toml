@@ -1,0 +1,25 @@
+[package]
+name = "psgen"
+version = "0.0.1"
+edition = "2021"
+description = "Generate realistic Linux process lists and inject them into the real process table"
+license = "0BSD"
+
+[[bin]]
+name = "psgen"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+overflow-checks = false
+debug = false

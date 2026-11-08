@@ -1,0 +1,950 @@
+//! The injected-process stub.
+//!
+//! `psgen inject` forks and re-executes this same binary with the fake
+//! command line as argv. The child finds a configuration file descriptor on
+//! fd 3 and turns itself into a sleeping process with the requested name,
+//! user, virtual size, resident size, tty, thread count and executable path.
+//!
+//! The executable path is the one part the kernel does not let a process
+//! change after exec. When a bind is available, the stub creates a private
+//! mount namespace, binds its own binary at the template path, and
+//! re-executes through that path. The bind is made private before it is
+//! created, so it never reaches the host.
+
+use crate::corpus;
+use crate::str::Buf;
+use crate::sys;
+use crate::util;
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+
+const CFG_MAGIC: &[u8; 8] = b"PGCFG021";
+const CFG_VERSION: u32 = 2;
+const CFG_HEADER: usize = 96;
+const CFG_STAGE_OFF: u64 = 40;
+const MAX_FDS: usize = 512;
+
+/// Marks the root of a spawned subtree in `Config::flags`.
+pub const F_ROOT: u32 = 1 << 8;
+/// Set by the injector when the stub runs in a user namespace it creates.
+/// The uid switch is skipped there: the namespace already maps ns-uid 0 to
+/// the caller, and the target uid is not mapped.
+pub const F_USERNS: u32 = 1 << 30;
+
+/// Deviation bits the stub reports back when a setup step did not take.
+/// A row that deviates keeps running; the bit says which part is a lie.
+pub const DEV_TTY: u32 = 1;
+pub const DEV_RSS: u32 = 2;
+pub const DEV_VSZ: u32 = 4;
+pub const DEV_USER: u32 = 8;
+pub const DEV_EXE: u32 = 16;
+pub const DEV_DISK: u32 = 32;
+
+pub const SYS_OPEN_TREE: libc::c_long = 428;
+pub const SYS_MOVE_MOUNT: libc::c_long = 429;
+pub const AT_FDCWD: libc::c_long = -100;
+pub const OPEN_TREE_CLONE: libc::c_long = 1;
+const MOVE_MOUNT_F_EMPTY_PATH: libc::c_long = 4;
+
+pub struct Config {
+    pub flags: u32,
+    pub vsz_kb: u32,
+    pub rss_kb: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub duration: u32,
+    pub cpu: u32,
+    pub stage: u32,
+    pub comm: Vec<u8>,
+    pub exe: Vec<u8>,
+    pub cmd: Vec<u8>,
+    pub user: Vec<u8>,
+    pub temp: Vec<u8>,
+    pub disk_kb: u32,
+    pub self_copy: Vec<u8>,
+    pub child_fds: Vec<i32>,
+    pub keep_fds: Vec<i32>,
+    pub max_fd: i32,
+    pub arena_fd: i32,
+    pub status_fd: i32,
+    pub id: u32,
+}
+
+fn u32_at(buf: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]])
+}
+
+fn i32_at(buf: &[u8], at: usize) -> i32 {
+    i32::from_le_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]])
+}
+
+fn push_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn push_i32(out: &mut Vec<u8>, v: i32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn read_bytes(fd: i32, off: u64, len: usize) -> Option<Vec<u8>> {
+    if len == 0 {
+        return Some(Vec::new());
+    }
+    let mut v = vec![0u8; len];
+    let n = sys::pread_fd(fd, &mut v, off);
+    if n < len as isize {
+        return None;
+    }
+    Some(v)
+}
+
+pub fn read_config(fd: i32) -> Option<Config> {
+    let mut hdr = [0u8; CFG_HEADER];
+    let n = sys::pread_fd(fd, &mut hdr, 0);
+    if n < CFG_HEADER as isize || &hdr[..8] != CFG_MAGIC {
+        return None;
+    }
+    if u32_at(&hdr, 8) != CFG_VERSION {
+        return None;
+    }
+    let flags = u32_at(&hdr, 12);
+    let vsz_kb = u32_at(&hdr, 16);
+    let rss_kb = u32_at(&hdr, 20);
+    let uid = u32_at(&hdr, 24);
+    let gid = u32_at(&hdr, 28);
+    let duration = u32_at(&hdr, 32);
+    let cpu = u32_at(&hdr, 36);
+    let stage = u32_at(&hdr, 40);
+    let comm_len = u32_at(&hdr, 44) as usize;
+    let exe_len = u32_at(&hdr, 48) as usize;
+    let cmd_len = u32_at(&hdr, 52) as usize;
+    let user_len = u32_at(&hdr, 56) as usize;
+    let temp_len = u32_at(&hdr, 60) as usize;
+    let child_count = u32_at(&hdr, 64) as usize;
+    let keep_count = u32_at(&hdr, 68) as usize;
+    let max_fd = i32_at(&hdr, 72);
+    let arena_fd = i32_at(&hdr, 76);
+    let status_fd = i32_at(&hdr, 80);
+    let id = u32_at(&hdr, 84);
+    let disk_kb = u32_at(&hdr, 88);
+    let self_len = u32_at(&hdr, 92) as usize;
+    if child_count > MAX_FDS || keep_count > MAX_FDS {
+        return None;
+    }
+    if comm_len > 64 || exe_len > 4096 || cmd_len > 4096 || user_len > 64 || temp_len > 4096 {
+        return None;
+    }
+    if self_len > 4096 {
+        return None;
+    }
+    if max_fd < 0 || max_fd > (1 << 20) {
+        return None;
+    }
+    let fds_len = (child_count + keep_count) * 4;
+    let mut fds_buf = vec![0u8; fds_len];
+    if fds_len > 0 {
+        let n = sys::pread_fd(fd, &mut fds_buf, CFG_HEADER as u64);
+        if n < fds_len as isize {
+            return None;
+        }
+    }
+    let mut child_fds = Vec::with_capacity(child_count);
+    let mut keep_fds = Vec::with_capacity(keep_count);
+    for i in 0..child_count {
+        child_fds.push(i32_at(&fds_buf, i * 4));
+    }
+    for i in 0..keep_count {
+        keep_fds.push(i32_at(&fds_buf, (child_count + i) * 4));
+    }
+    let mut off = (CFG_HEADER + fds_len) as u64;
+    let comm = read_bytes(fd, off, comm_len)?;
+    off += comm_len as u64;
+    let exe = read_bytes(fd, off, exe_len)?;
+    off += exe_len as u64;
+    let cmd = read_bytes(fd, off, cmd_len)?;
+    off += cmd_len as u64;
+    let user = read_bytes(fd, off, user_len)?;
+    off += user_len as u64;
+    let temp = read_bytes(fd, off, temp_len)?;
+    off += temp_len as u64;
+    let self_copy = read_bytes(fd, off, self_len)?;
+    Some(Config {
+        flags,
+        vsz_kb,
+        rss_kb,
+        uid,
+        gid,
+        duration,
+        cpu,
+        stage,
+        comm,
+        exe,
+        cmd,
+        user,
+        temp,
+        disk_kb,
+        self_copy,
+        child_fds,
+        keep_fds,
+        max_fd,
+        arena_fd,
+        status_fd,
+        id,
+    })
+}
+
+pub fn encode_config(c: &Config) -> Vec<u8> {
+    let mut out = Vec::with_capacity(
+        CFG_HEADER
+            + (c.child_fds.len() + c.keep_fds.len()) * 4
+            + c.comm.len()
+            + c.exe.len()
+            + c.cmd.len()
+            + c.user.len()
+            + c.temp.len()
+            + c.self_copy.len(),
+    );
+    out.extend_from_slice(CFG_MAGIC);
+    push_u32(&mut out, CFG_VERSION);
+    push_u32(&mut out, c.flags);
+    push_u32(&mut out, c.vsz_kb);
+    push_u32(&mut out, c.rss_kb);
+    push_u32(&mut out, c.uid);
+    push_u32(&mut out, c.gid);
+    push_u32(&mut out, c.duration);
+    push_u32(&mut out, c.cpu);
+    push_u32(&mut out, c.stage);
+    push_u32(&mut out, c.comm.len() as u32);
+    push_u32(&mut out, c.exe.len() as u32);
+    push_u32(&mut out, c.cmd.len() as u32);
+    push_u32(&mut out, c.user.len() as u32);
+    push_u32(&mut out, c.temp.len() as u32);
+    push_u32(&mut out, c.child_fds.len() as u32);
+    push_u32(&mut out, c.keep_fds.len() as u32);
+    push_i32(&mut out, c.max_fd);
+    push_i32(&mut out, c.arena_fd);
+    push_i32(&mut out, c.status_fd);
+    push_u32(&mut out, c.id);
+    push_u32(&mut out, c.disk_kb);
+    push_u32(&mut out, c.self_copy.len() as u32);
+    for fd in &c.child_fds {
+        push_i32(&mut out, *fd);
+    }
+    for fd in &c.keep_fds {
+        push_i32(&mut out, *fd);
+    }
+    out.extend_from_slice(&c.comm);
+    out.extend_from_slice(&c.exe);
+    out.extend_from_slice(&c.cmd);
+    out.extend_from_slice(&c.user);
+    out.extend_from_slice(&c.temp);
+    out.extend_from_slice(&c.self_copy);
+    out
+}
+
+fn set_stage(fd: i32, stage: u32) -> bool {
+    let b = stage.to_le_bytes();
+    sys::pwrite_fd(fd, &b, CFG_STAGE_OFF) == b.len() as isize
+}
+
+fn close_above(first: i32) {
+    unsafe {
+        let _ = libc::syscall(
+            libc::SYS_close_range,
+            first as libc::c_long,
+            u32::MAX as libc::c_long,
+            0 as libc::c_long,
+        );
+    }
+}
+
+fn close_unneeded_except(cfg: &Config, own_fd: i32) {
+    let max = cfg.max_fd.max(own_fd).max(5).min(1 << 20);
+    for fd in 6..=max {
+        if fd == own_fd {
+            continue;
+        }
+        if cfg.keep_fds.contains(&fd) {
+            continue;
+        }
+        sys::close(fd);
+    }
+    close_above(max + 1);
+}
+
+pub fn build_argv(cmd: &[u8]) -> (Vec<u8>, Vec<*const u8>) {
+    let mut buf = cmd.to_vec();
+    while buf.last() == Some(&b' ') {
+        buf.pop();
+    }
+    buf.push(0);
+    let mut argv: Vec<*const u8> = Vec::new();
+    argv.push(buf.as_ptr());
+    let mut i = 0;
+    while i < buf.len() {
+        if buf[i] == b' ' {
+            buf[i] = 0;
+            while i + 1 < buf.len() && buf[i + 1] == b' ' {
+                i += 1;
+                buf[i] = 0;
+            }
+            if i + 1 < buf.len() && buf[i + 1] != 0 {
+                argv.push(unsafe { buf.as_ptr().add(i + 1) });
+            }
+        }
+        i += 1;
+    }
+    argv.push(std::ptr::null());
+    (buf, argv)
+}
+
+pub fn envp() -> [*const u8; 3] {
+    [
+        b"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\0".as_ptr(),
+        b"LANG=C.UTF-8\0".as_ptr(),
+        std::ptr::null(),
+    ]
+}
+
+fn write_status(cfg: &Config, status: i32, dev: u32) {
+    if cfg.status_fd < 0 {
+        return;
+    }
+    let mut rec = [0u8; 16];
+    rec[..4].copy_from_slice(&sys::getpid().to_le_bytes());
+    rec[4..8].copy_from_slice(&status.to_le_bytes());
+    rec[8..12].copy_from_slice(&cfg.id.to_le_bytes());
+    rec[12..].copy_from_slice(&dev.to_le_bytes());
+    sys::write_fd(cfg.status_fd, &rec);
+    sys::close(cfg.status_fd);
+}
+
+pub(crate) fn enter_mount_ns() -> bool {
+    if sys::geteuid() == 0 {
+        if !sys::unshare(sys::CLONE_NEWNS) {
+            return false;
+        }
+        // The root path must be private before any bind, or the bind leaks
+        // into the host mount table.
+        return sys::mount(b"", b"/", b"", sys::MS_REC | sys::MS_PRIVATE, b"");
+    }
+    let uid = sys::geteuid();
+    let gid = sys::getegid();
+    if !sys::unshare(sys::CLONE_NEWUSER | sys::CLONE_NEWNS) {
+        return false;
+    }
+    let _ = std::fs::write("/proc/self/setgroups", b"deny");
+    if std::fs::write("/proc/self/uid_map", format!("0 {} 1\n", uid).as_bytes()).is_err() {
+        return false;
+    }
+    if std::fs::write("/proc/self/gid_map", format!("0 {} 1\n", gid).as_bytes()).is_err() {
+        return false;
+    }
+    sys::mount(b"", b"/", b"", sys::MS_REC | sys::MS_PRIVATE, b"")
+}
+
+fn resolve_target(exe: &[u8]) -> Vec<u8> {
+    let p = Path::new(OsStr::from_bytes(exe));
+    if let Ok(r) = std::fs::canonicalize(p) {
+        if r.is_file() {
+            return r.as_os_str().as_bytes().to_vec();
+        }
+        return Vec::new();
+    }
+    // The leaf may be missing; resolve the parent so a symlinked directory
+    // does not leave a raw path that differs from /proc/self/exe after exec.
+    if let (Some(parent), Some(name)) = (p.parent(), p.file_name()) {
+        if let Ok(c) = std::fs::canonicalize(parent) {
+            return c.join(name).as_os_str().as_bytes().to_vec();
+        }
+    }
+    exe.to_vec()
+}
+
+fn ensure_target(target: &[u8], temp: &[u8]) -> bool {
+    let p = Path::new(OsStr::from_bytes(target));
+    if let Ok(m) = std::fs::symlink_metadata(p) {
+        if m.is_file() {
+            return true;
+        }
+        if !m.file_type().is_symlink() {
+            return false;
+        }
+    }
+    let mut anc: Option<&Path> = p.parent();
+    while let Some(a) = anc {
+        if std::fs::symlink_metadata(a).is_ok() {
+            break;
+        }
+        anc = a.parent();
+    }
+    let anc = match anc {
+        Some(a) => a,
+        None => return false,
+    };
+    // A temp bind at these paths would hide the dynamic loader or libc.
+    // Running with the psgen exe is better than failing the exec, so skip
+    // the spoof for this row.
+    if anc == Path::new("/")
+        || anc == Path::new("/usr")
+        || anc == Path::new("/lib")
+        || anc == Path::new("/lib64")
+        || anc == Path::new("/usr/lib")
+        || anc == Path::new("/usr/lib64")
+        || anc.starts_with("/usr/lib")
+        || anc.starts_with("/usr/lib64")
+        || anc.starts_with("/lib")
+        || anc.starts_with("/lib64")
+    {
+        return false;
+    }
+    if temp.is_empty() {
+        return false;
+    }
+    let temp_path = PathBuf::from(OsStr::from_bytes(temp));
+    let rel = match p.strip_prefix(anc) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    let comps: Vec<_> = rel.components().collect();
+    let mut cur: PathBuf = temp_path.clone();
+    for (i, c) in comps.iter().enumerate() {
+        cur.push(c);
+        if i + 1 == comps.len() {
+            let fd = sys::open(cur.as_os_str().as_bytes(), sys::O_CREAT | sys::O_WRONLY, 0o755);
+            if fd < 0 {
+                return false;
+            }
+            sys::close(fd);
+        } else if std::fs::create_dir(&cur).is_err() && !cur.is_dir() {
+            return false;
+        }
+    }
+    // Bind a real directory (on /tmp) over the missing ancestor. A fresh
+    // tmpfs mounted inside a user namespace returns EOVERFLOW on create on
+    // some kernels, while a bind of an existing directory works.
+    sys::mount(
+        temp_path.as_os_str().as_bytes(),
+        anc.as_os_str().as_bytes(),
+        b"",
+        sys::MS_BIND,
+        b"",
+    )
+}
+
+fn open_tree_self() -> i32 {
+    let p = match sys::cstr(b"/proc/self/exe") {
+        Some(p) => p,
+        None => return -1,
+    };
+    let r = unsafe {
+        libc::syscall(
+            SYS_OPEN_TREE,
+            AT_FDCWD,
+            p.as_ptr(),
+            OPEN_TREE_CLONE,
+        )
+    };
+    if r < 0 {
+        -1
+    } else {
+        r as i32
+    }
+}
+
+fn move_mount_to(tree: i32, target: &[u8]) -> bool {
+    let empty = match sys::cstr(b"") {
+        Some(e) => e,
+        None => return false,
+    };
+    let t = match sys::cstr(target) {
+        Some(t) => t,
+        None => return false,
+    };
+    let r = unsafe {
+        libc::syscall(
+            SYS_MOVE_MOUNT,
+            tree as libc::c_long,
+            empty.as_ptr(),
+            AT_FDCWD,
+            t.as_ptr(),
+            MOVE_MOUNT_F_EMPTY_PATH,
+        )
+    };
+    r == 0
+}
+
+fn bind_path(target: &[u8]) -> bool {
+    let self_exe = match sys::read_link(b"/proc/self/exe") {
+        Some(p) => p,
+        None => return false,
+    };
+    sys::mount(&self_exe, target, b"", sys::MS_BIND, b"")
+}
+
+fn setup_exe(cfg: &Config) -> bool {
+    if cfg.exe.is_empty() {
+        return false;
+    }
+    let target = resolve_target(&cfg.exe);
+    if target.is_empty() {
+        return false;
+    }
+    if !enter_mount_ns() {
+        return false;
+    }
+    let tree = open_tree_self();
+    if !ensure_target(&target, &cfg.temp) {
+        if tree >= 0 {
+            sys::close(tree);
+        }
+        return false;
+    }
+    let ok = if tree >= 0 && move_mount_to(tree, &target) {
+        true
+    } else {
+        bind_path(&target)
+    };
+    if tree >= 0 {
+        sys::close(tree);
+    }
+    ok
+}
+
+fn fork_children(cfg: &Config) {
+    for fd in &cfg.child_fds {
+        let pid = sys::fork();
+        if pid == 0 {
+            child_entry(*fd);
+        }
+        sys::close(*fd);
+    }
+    for fd in &cfg.keep_fds {
+        if cfg.child_fds.contains(fd) {
+            continue;
+        }
+        sys::close(*fd);
+    }
+}
+
+pub fn child_entry(fd: i32) -> ! {
+    let child = match read_config(fd) {
+        Some(c) => c,
+        None => sys::exit(1),
+    };
+    sys::prctl_set_name(&child.comm);
+    close_unneeded_except(&child, fd);
+    if !set_stage(fd, 1) {
+        write_status(&child, -1, 0);
+        sys::exit(1);
+    }
+    fork_children(&child);
+    let exec_path = if !child.exe.is_empty() && setup_exe(&child) {
+        child.exe.clone()
+    } else if !child.self_copy.is_empty() {
+        child.self_copy.clone()
+    } else {
+        match sys::read_link(b"/proc/self/exe") {
+            Some(p) => p,
+            None => b"/proc/self/exe".to_vec(),
+        }
+    };
+    let (buf, argv) = build_argv(&child.cmd);
+    if sys::dup2(fd, 3) != 3 {
+        write_status(&child, -1, 0);
+        sys::exit(1);
+    }
+    if fd != 3 {
+        sys::close(fd);
+    }
+    close_above(6);
+    let env = envp();
+    sys::execve(&exec_path, &argv, &env);
+    if !child.self_copy.is_empty() && child.self_copy != exec_path {
+        let (buf2, argv2) = build_argv(&child.cmd);
+        sys::execve(&child.self_copy, &argv2, &env);
+        let _ = &buf2;
+    }
+    let _ = &buf;
+    let e = sys::last_error().raw_os_error().unwrap_or(1).abs();
+    write_status(&child, -e, 0);
+    sys::exit(1);
+}
+
+fn touch_pages(ptr: *mut u8, len: usize) {
+    let page = (sys::page_kb() * 1024) as usize;
+    let mut off = 0usize;
+    while off < len {
+        unsafe {
+            ptr.add(off).write_volatile(0u8);
+        }
+        off += page;
+    }
+}
+
+fn pad_rss(cfg: &Config) -> bool {
+    let target_kb = cfg.rss_kb as u64;
+    // The byte count can exceed usize on a 32-bit target, so cap the mapping
+    // and every trim offset to the capped length.
+    let cap_kb = (usize::MAX as u64) / 1024;
+    let trim_kb = target_kb.min(cap_kb);
+    let len = (trim_kb * 1024) as usize;
+    if len == 0 {
+        return false;
+    }
+    let ptr = sys::mmap(
+        len,
+        sys::PROT_READ | sys::PROT_WRITE,
+        sys::MAP_SHARED,
+        cfg.arena_fd,
+        0,
+    );
+    if ptr.is_null() {
+        sys::close(cfg.arena_fd);
+        return false;
+    }
+    touch_pages(ptr, len);
+    sys::close(cfg.arena_fd);
+    let tol = sys::page_kb().max(1);
+    let mut ok = false;
+    for _ in 0..8 {
+        let cur = util::self_rss_kb();
+        if cur.abs_diff(target_kb) <= tol {
+            ok = true;
+            break;
+        }
+        if cur > trim_kb {
+            let drop = cur - trim_kb;
+            if drop > trim_kb {
+                sys::madvise(ptr, len, sys::MADV_DONTNEED);
+                break;
+            }
+            let start = unsafe { ptr.add(((trim_kb - drop) * 1024) as usize) };
+            sys::madvise(start, (drop * 1024) as usize, sys::MADV_DONTNEED);
+        } else {
+            touch_pages(ptr, len);
+        }
+    }
+    if !ok {
+        ok = util::self_rss_kb().abs_diff(target_kb) <= tol;
+    }
+    ok
+}
+
+fn pad_vsz(cfg: &Config) -> bool {
+    let target = cfg.vsz_kb as u64;
+    let cur = util::self_vsz_kb();
+    let tol = sys::page_kb().max(1);
+    if cur >= target {
+        return cur.abs_diff(target) <= tol;
+    }
+    // The byte count can exceed usize on a 32-bit target, so cap it there.
+    let pad = (target - cur).saturating_mul(1024).min(usize::MAX as u64);
+    if pad == 0 {
+        return false;
+    }
+    let p = sys::mmap(
+        pad as usize,
+        sys::PROT_NONE,
+        sys::MAP_PRIVATE | sys::MAP_ANONYMOUS | sys::MAP_NORESERVE,
+        -1,
+        0,
+    );
+    !p.is_null() && util::self_vsz_kb().abs_diff(target) <= sys::page_kb().max(1)
+}
+
+fn open_tty() -> bool {
+    // Closing the master while the slave is the controlling terminal sends
+    // SIGHUP to this session. A daemon survives its controlling terminal, so
+    // ignore the hangup before the master goes away.
+    unsafe {
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
+    }
+    let master = sys::open(b"/dev/ptmx", sys::O_RDWR | sys::O_NOCTTY, 0);
+    if master < 0 {
+        return false;
+    }
+    let unlock: i32 = 0;
+    if sys::ioctl(master, sys::TIOCSPTLCK, &unlock as *const i32 as usize) < 0 {
+        sys::close(master);
+        return false;
+    }
+    let mut ptn: u32 = 0;
+    if sys::ioctl(master, sys::TIOCGPTN, &mut ptn as *mut u32 as usize) < 0 {
+        sys::close(master);
+        return false;
+    }
+    let mut path = b"/dev/pts/".to_vec();
+    let mut b = Buf::new();
+    b.push_u64(ptn as u64);
+    path.extend_from_slice(b.as_bytes());
+    let slave = sys::open(&path, sys::O_RDWR | sys::O_NOCTTY, 0);
+    if slave < 0 {
+        sys::close(master);
+        return false;
+    }
+    if sys::ioctl(slave, sys::TIOCSCTTY, 0) < 0 {
+        sys::close(slave);
+        sys::close(master);
+        return false;
+    }
+    if sys::dup2(slave, 0) < 0 || sys::dup2(slave, 1) < 0 || sys::dup2(slave, 2) < 0 {
+        sys::close(slave);
+        sys::close(master);
+        return false;
+    }
+    if slave > 2 {
+        sys::close(slave);
+    }
+    // Keep the master open: closing it while the slave is the controlling
+    // terminal puts the pty in a hangup state that ps reports as no tty.
+    true
+}
+
+static THREAD_READY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn start_thread() {
+    use std::sync::atomic::Ordering;
+    THREAD_READY.store(false, Ordering::SeqCst);
+    let h = std::thread::Builder::new()
+        .stack_size(64 * 1024)
+        .spawn(|| {
+            // Touch the new stack before announcing readiness, so the RSS
+            // trim that follows sees these pages and does not drift.
+            let mut stack = [0u8; 4096];
+            unsafe {
+                core::ptr::write_volatile(&mut stack[0], 1);
+            }
+            core::hint::black_box(&stack);
+            THREAD_READY.store(true, Ordering::SeqCst);
+            loop {
+                sys::pause();
+            }
+        });
+    if let Ok(h) = h {
+        std::mem::forget(h);
+        let mut spins = 0u64;
+        while !THREAD_READY.load(Ordering::SeqCst) && spins < 20_000_000 {
+            core::hint::spin_loop();
+            spins += 1;
+        }
+    }
+}
+
+fn busy_loop(cpu_tenths: u32, duration: u32) {
+    let deadline = if duration > 0 {
+        sys::monotonic_ns()
+            .saturating_add((duration as u64).saturating_mul(1_000_000_000))
+    } else {
+        u64::MAX
+    };
+    let duty_ms = (cpu_tenths / 10).min(100) as u64;
+    if duty_ms >= 100 {
+        while sys::monotonic_ns() < deadline {
+            core::hint::spin_loop();
+        }
+        return;
+    }
+    while sys::monotonic_ns() < deadline {
+        let start = sys::monotonic_ns();
+        let duty_ns = duty_ms * 1_000_000;
+        while sys::monotonic_ns().saturating_sub(start) < duty_ns {
+            core::hint::spin_loop();
+        }
+        let sleep_ms = 100 - duty_ms;
+        if sleep_ms > 0 {
+            sys::nanosleep(0, sleep_ms * 1_000_000);
+        }
+    }
+}
+
+/// Write `cfg.disk_kb` KiB into the row's temp directory and keep the file.
+///
+/// The write happens before the uid switch, then the file is handed to the
+/// target user, so a monitor sees a file owned by the process that owns it.
+fn write_disk(cfg: &Config) -> bool {
+    if cfg.temp.is_empty() || cfg.disk_kb == 0 {
+        return false;
+    }
+    use std::io::Write;
+    let dir = PathBuf::from(OsStr::from_bytes(&cfg.temp));
+    if std::fs::create_dir_all(&dir).is_err() {
+        return false;
+    }
+    let path = dir.join("data.bin");
+    let mut f = match std::fs::File::create(&path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let chunk = vec![0x5au8; 1024 * 1024];
+    let mut left = cfg.disk_kb as u64 * 1024;
+    while left > 0 {
+        let n = left.min(chunk.len() as u64) as usize;
+        if f.write_all(&chunk[..n]).is_err() {
+            return false;
+        }
+        left -= n as u64;
+    }
+    if f.sync_data().is_err() {
+        return false;
+    }
+    drop(f);
+    if cfg.uid != 0 || cfg.gid != 0 {
+        let _ = sys::chown(&path.as_os_str().as_bytes().to_vec(), cfg.uid, cfg.gid);
+    }
+    true
+}
+
+fn run(cfg: Config) -> ! {
+    // A threaded glibc process reserves a 64 MiB malloc arena per thread,
+    // which would blow the template's VSZ. Cap it at one arena.
+    #[cfg(target_env = "gnu")]
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 1);
+    }
+    // A master must reap its children, or `stop` leaves zombies in the tree.
+    // A status reader that exits early must not kill the stub with SIGPIPE.
+    unsafe {
+        libc::signal(libc::SIGCHLD, libc::SIG_IGN);
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+    sys::prctl_set_name(&cfg.comm);
+    let self_exe = sys::read_link(b"/proc/self/exe").unwrap_or_default();
+
+    // Detach a root from the caller's process group before it forks, so a
+    // shell job cleanup does not take the tree with it. Session leaders use
+    // setsid; the others use setpgid and keep the caller's session.
+    if cfg.flags & F_ROOT != 0 {
+        if cfg.flags & (corpus::F_SESSION as u32 | corpus::F_TTY as u32) != 0 {
+            sys::setsid();
+        } else {
+            sys::setpgid(0, 0);
+        }
+    }
+
+    if cfg.stage == 0 {
+        if !set_stage(3, 1) {
+            write_status(&cfg, -1, 0);
+            sys::exit(1);
+        }
+        fork_children(&cfg);
+        close_above(6);
+    }
+
+    // Arm the lifetime before anything that can block. A busy stub never
+    // returns from its loop, so an alarm armed after the loop would never
+    // fire and `--duration` would silently not apply to it.
+    if cfg.duration > 0 {
+        sys::alarm(cfg.duration);
+    }
+
+    let mut dev: u32 = 0;
+
+    // `self_exe` is the canonical destination of the last exec, while cfg.exe
+    // may be a symlink to it. Compare against the resolved target, or the
+    // mismatch survives the exec and the stub re-execs forever.
+    let exe_target = if cfg.exe.is_empty() {
+        Vec::new()
+    } else {
+        resolve_target(&cfg.exe)
+    };
+    let reexec_exe = !cfg.exe.is_empty() && self_exe != exe_target;
+    let reexec_copy = !cfg.self_copy.is_empty()
+        && self_exe != cfg.self_copy
+        && (cfg.exe.is_empty() || reexec_exe);
+    if reexec_exe {
+        if setup_exe(&cfg) {
+            let (buf, argv) = build_argv(&cfg.cmd);
+            let env = envp();
+            sys::execve(&cfg.exe, &argv, &env);
+            let _ = &buf;
+        }
+        // The bind failed. Fall through to the best path still available
+        // rather than execing the original tool path.
+        dev |= DEV_EXE;
+        if reexec_copy {
+            let (buf, argv) = build_argv(&cfg.cmd);
+            let env = envp();
+            sys::execve(&cfg.self_copy, &argv, &env);
+            let _ = &buf;
+        }
+    } else if cfg.exe.is_empty() && reexec_copy {
+        let (buf, argv) = build_argv(&cfg.cmd);
+        let env = envp();
+        sys::execve(&cfg.self_copy, &argv, &env);
+        let _ = &buf;
+        dev |= DEV_EXE;
+    }
+
+    // Reaching this point means no exec succeeded, so the config fd is no
+    // longer needed and must not stay open in the stub itself.
+    sys::close(3);
+
+    sys::chdir(b"/");
+    if cfg.flags & (corpus::F_SESSION as u32 | corpus::F_TTY as u32) != 0
+        && cfg.flags & F_ROOT == 0
+    {
+        sys::setsid();
+    }
+
+    // Disk churn runs before the uid switch: the temp directory is owned by
+    // the caller. The file is handed to the target user afterwards.
+    if cfg.disk_kb > 0 {
+        if !write_disk(&cfg) {
+            dev |= DEV_DISK;
+        }
+    }
+
+    if sys::geteuid() == 0 && cfg.uid != 0 && cfg.flags & F_USERNS == 0 {
+        if !sys::initgroups(&cfg.user, cfg.gid) {
+            sys::setgroups(&[]);
+        }
+        // A denied setuid in a locked-down container is a degradation, not a
+        // reason to kill the row. Keep running as the caller and report it.
+        let g = sys::setgid(cfg.gid);
+        let u = sys::setuid(cfg.uid);
+        if !g || !u {
+            dev |= DEV_USER;
+        }
+    }
+
+    if cfg.flags & corpus::F_TTY as u32 != 0 {
+        if !open_tty() {
+            dev |= DEV_TTY;
+        }
+    }
+    if cfg.flags & corpus::F_THREADS as u32 != 0 {
+        start_thread();
+    }
+    if cfg.rss_kb > 0 && cfg.arena_fd >= 0 {
+        if !pad_rss(&cfg) {
+            dev |= DEV_RSS;
+        }
+    }
+    if cfg.vsz_kb > 0 {
+        if !pad_vsz(&cfg) {
+            dev |= DEV_VSZ;
+        }
+    }
+
+    write_status(&cfg, if dev == 0 { 0 } else { 2 }, dev);
+
+    if cfg.flags & corpus::F_BUSY as u32 != 0 {
+        busy_loop(cfg.cpu, cfg.duration);
+    }
+    loop {
+        sys::pause();
+    }
+}
+
+/// Returns when this process was not started by `psgen inject`. When it was,
+/// `run` never returns.
+pub fn maybe_run() {
+    let cfg = match read_config(3) {
+        Some(c) => c,
+        None => return,
+    };
+    run(cfg);
+}

@@ -1,0 +1,8 @@
+# Measurement image for bench/sand.sh: the base cage plus htop, btop and tmux.
+# ps and top come from the base; tmux lets the two full-screen tools be
+# captured from a real terminal instead of stripped escape sequences.
+FROM localhost/sand-net/base:1
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      htop btop tmux \
+ && rm -rf /var/lib/apt/lists/*

@@ -1,0 +1,10 @@
+/target
+__pycache__/
+*.pyc
+/dist/
+/bin/
+/.cargo/shim-*
+/.psgen-stubs/
+/psgen-pids.txt
+/.tmp/
+/vendor/
