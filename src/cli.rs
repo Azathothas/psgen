@@ -230,12 +230,13 @@ USAGE
 
 COMMON
   -n, --count N       rows or commands (list: all templates, table: 30,
-                      table --live: all, inject: 12). A family that has fewer
+                      table --live: all, inject: 12). A count is met by
+                      repeating rows a real host runs more than once; a
                       request that cannot be met at all prints a warning.
   -s, --seed N        fix the selection and jitter; START and TIME still
                       follow the wall clock
-  -p, --profile NAME  server (default), dev, desktop; list honours the weights
-                      only above the template count, table and inject always do
+  -p, --profile NAME  server (default), dev, desktop; honoured by list, table
+                      and inject
   -f, --family NAME   sys, web, db, ctr, dev, mon, sto, mail, desk, net
       --utc-offset M  minutes east of UTC for the START column, -1440..1440
                       (default 0)
@@ -582,15 +583,11 @@ fn applies(sub: Sub, name: &str) -> bool {
             "--pidfile" | "--force" | "--elevate" | "--plan" | "-q" | "--quiet"
         ),
         Corpus => false,
+        // `check` validates the corpus itself: no profile, no seeding, and a
+        // family only narrows which templates it looks at.
         Check => matches!(
             name,
-            "-s" | "--seed"
-                | "-p"
-                | "--profile"
-                | "-f"
-                | "--family"
-                | "--binaries"
-                | "--require-binaries"
+            "-f" | "--family" | "--binaries" | "--require-binaries"
         ),
         Unit => matches!(
             name,
@@ -994,6 +991,9 @@ pub fn parse(args: &[Vec<u8>]) -> Result<Args, ParseError> {
     }
     if a.json && a.sub == Sub::Inject && !a.dry_run {
         return Err("--json on inject needs --dry-run".into());
+    }
+    if a.plan && a.sub == Sub::Inject && !a.dry_run {
+        return Err("--plan on inject needs --dry-run".into());
     }
     if a.require_binaries && a.sub != Sub::Check {
         return Err("--require-binaries only applies to check".into());

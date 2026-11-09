@@ -1394,9 +1394,31 @@ def check_regressions2(tmp):
             out.append((stat, start, tm, cmd))
         return out
 
-    for (a, b) in zip(offsets(live), offsets(ref)):
-        if a != b:
-            fail(f"#3: live column offsets {a} differ from ps {b}")
+    # Only compare rows that both sides parsed: the two reads are not atomic, so
+    # a process that exits between them has no pair.
+    def by_pid(lines):
+        out = {}
+        for line in lines[1:]:
+            m = PS_RE.match(line)
+            if not m:
+                continue
+            try:
+                stat = line.index(m.group("stat"), 40)
+                start = line.index(m.group("start"), stat)
+                tm = line.index(m.group("time"), start)
+                cmd = line.index(m.group("cmd"), tm)
+            except ValueError:
+                continue
+            out[int(m.group("pid"))] = (stat, start, tm, cmd)
+        return out
+
+    mine, theirs = by_pid(live), by_pid(ref)
+    common = set(mine) & set(theirs)
+    if len(common) < 5:
+        fail(f"#3: only {len(common)} rows are common to the two tables")
+    for pid in common:
+        if mine[pid] != theirs[pid]:
+            fail(f"#3: live column offsets {mine[pid]} differ from ps {theirs[pid]} for {pid}")
     if any("\n" in l for l in live):
         fail("#3: live table emitted a raw newline")
     # A zombie's COMMAND must carry <defunct>, as ps prints it.
@@ -1444,7 +1466,9 @@ def check_regressions2(tmp):
                  ["list", "--json", "-n", "1"],
                  ["table", "--live", "-f", "web"],
                  ["doctor", "--json", "--lines", "5"],
-                 ["check", "--utc-offset", "300"]):
+                 ["check", "--utc-offset", "300"],
+                 ["check", "-p", "desktop"],
+                 ["inject", "--plan"]):
         if run(args, check=False).returncode != 2:
             fail(f"#9: {args} was accepted")
 
