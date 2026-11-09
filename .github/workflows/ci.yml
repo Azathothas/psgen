@@ -40,7 +40,9 @@ jobs:
           if command -v systemd-analyze >/dev/null 2>&1; then
             systemd-analyze verify /tmp/psgen.service || true
           fi
-          grep -qv 'proc-fs-nets.target' /tmp/psgen.service
+          ! grep -q 'proc-fs-nets.target' /tmp/psgen.service
+          grep -q '^RuntimeDirectory=psgen$' /tmp/psgen.service
+          grep -q '^ExecStop=-' /tmp/psgen.service
 
   test:
     runs-on: ubuntu-24.04
