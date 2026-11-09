@@ -188,6 +188,13 @@ fn expand(cmd: &str, rng: &mut Rng, self_user: &[u8], uid: Option<u32>) -> Vec<u
     out.v
 }
 
+fn cand_weight(t: &Tmpl, weights: &[u16; 10], family: Option<u8>) -> u64 {
+    match family {
+        Some(_) => t.weight as u64,
+        None => weights[t.fam as usize] as u64 * t.weight as u64,
+    }
+}
+
 fn weighted_total(weights: &[u16; 10], family: Option<u8>) -> u64 {
     let mut total = 0u64;
     for t in corpus::CORPUS.iter() {
@@ -196,11 +203,7 @@ fn weighted_total(weights: &[u16; 10], family: Option<u8>) -> u64 {
                 continue;
             }
         }
-        let w = match family {
-            Some(_) => t.weight as u64,
-            None => weights[t.fam as usize] as u64 * t.weight as u64,
-        };
-        total += w;
+        total += cand_weight(t, weights, family);
     }
     total
 }
@@ -217,10 +220,7 @@ fn weighted_index(rng: &mut Rng, weights: &[u16; 10], family: Option<u8>) -> usi
                 continue;
             }
         }
-        let w = match family {
-            Some(_) => t.weight as u64,
-            None => weights[t.fam as usize] as u64 * t.weight as u64,
-        };
+        let w = cand_weight(t, weights, family);
         if n < w {
             return idx;
         }
@@ -301,6 +301,20 @@ fn resolve_user(t: &Tmpl, opts: &Opts) -> (Vec<u8>, u32, u32) {
     }
 }
 
+fn boot_age(rng: &mut Rng, uptime: u64) -> u64 {
+    // One draw with a fixed modulus. The fallback reuses that draw rather
+    // than taking a second one: a second draw on a short-uptime host would
+    // move every later value in the stream and break the same-seed contract
+    // between uptime 10 and uptime 11.
+    let age = rng.fraction(90);
+    let base = uptime.saturating_sub(age);
+    if base == 0 {
+        30 + age * 570 / 90
+    } else {
+        base
+    }
+}
+
 fn make_proc(t: &Tmpl, tmpl: usize, rng: &mut Rng, opts: &Opts, uptime: u64) -> Proc {
     let (user, uid, gid) = resolve_user(t, opts);
     let vsz = jitter(rng, t.vsz, 12);
@@ -314,15 +328,7 @@ fn make_proc(t: &Tmpl, tmpl: usize, rng: &mut Rng, opts: &Opts, uptime: u64) -> 
     }
     let cpu = (t.cpu as i32 + rng.range(0, 4) as i32 - 2).clamp(0, 999);
     let age = if t.flags & (corpus::F_LONG | corpus::F_SESSION) != 0 {
-        // One draw with a fixed modulus: a second draw on a short-uptime
-        // host would move every later value in the stream and break the
-        // same-seed contract.
-        let base = uptime.saturating_sub(rng.fraction(90));
-        if base == 0 {
-            30 + rng.fraction(570)
-        } else {
-            base
-        }
+        boot_age(rng, uptime)
     } else if t.flags & (corpus::F_BUSY | corpus::F_SHORT) != 0 {
         rng.range(3, 1800)
     } else if t.flags & corpus::F_CHILD != 0 {
@@ -576,11 +582,12 @@ struct Pids {
     next: i64,
     max: i64,
     base: i64,
+    used: std::collections::BTreeSet<i32>,
 }
 
 impl Pids {
     fn new(rng: &mut Rng, fit: &Fit) -> Pids {
-        let max = if fit.pid_max >= 1024 {
+        let max = if fit.pid_max >= 2 {
             fit.pid_max as i64 - 1
         } else {
             i64::MAX
@@ -590,18 +597,28 @@ impl Pids {
             next: base,
             max,
             base,
+            used: std::collections::BTreeSet::new(),
         }
     }
 
     fn step(&mut self, rng: &mut Rng) -> i32 {
         let delta = rng.range(1, 24) as i64;
-        self.next = self.next.saturating_add(delta);
-        if self.next > self.max {
-            // Wrap to the low end rather than printing a PID the kernel
-            // cannot allocate.
-            self.next = self.base.max(2).saturating_add(delta);
+        // A `ps` snapshot has one row per PID. Keep stepping past a PID that
+        // has already been handed out, including after the sequence wraps.
+        let tries = self.max.clamp(2, 1_000_000) as usize;
+        for _ in 0..tries {
+            self.next = self.next.saturating_add(delta);
             if self.next > self.max {
-                self.next = 2;
+                // Wrap to the low end rather than printing a PID the kernel
+                // cannot allocate.
+                self.next = self.base.max(2).saturating_add(delta);
+                if self.next > self.max {
+                    self.next = 2;
+                }
+            }
+            let pid = self.next as i32;
+            if self.used.insert(pid) {
+                return pid;
             }
         }
         self.next as i32
@@ -724,34 +741,48 @@ fn fill(
             continue;
         }
         candidates.push(idx);
-        total_w += weights[t.fam as usize] as u64 * t.weight as u64;
+        total_w += cand_weight(t, weights, opts.family);
     }
     if candidates.is_empty() || total_w == 0 {
         return;
     }
     // Quota per candidate, in proportion to weight, at least one each.
     let mut quota: Vec<usize> = Vec::with_capacity(candidates.len());
+    let mut caps: Vec<usize> = Vec::with_capacity(candidates.len());
     for idx in &candidates {
         let t = &corpus::CORPUS[*idx];
-        let w = weights[t.fam as usize] as u64 * t.weight as u64;
+        let w = cand_weight(t, weights, opts.family);
         quota.push((want as u64 * w / total_w) as usize);
+        // No single command may take more than a small share of the table: a
+        // host with 5000 processes has a handful of `cargo build` jobs, not a
+        // hundred. The floor keeps a small request spread over the templates
+        // that can supply it.
+        caps.push(repeat_cap(t, want).max((want / 25).max(1)));
     }
-    // No single command may take more than a small share of the table: a host
-    // with 5000 processes has a handful of `cargo build` jobs, not a hundred.
-    let cap = (want / 50).max(4);
-    for q in quota.iter_mut() {
-        if *q > cap {
-            *q = cap;
+    for (q, cap) in quota.iter_mut().zip(&caps) {
+        if *q > *cap {
+            *q = *cap;
         }
     }
     let mut extra = want.saturating_sub(quota.iter().sum::<usize>());
-    // Any leftover goes round-robin, so it is spread instead of accumulating
-    // on the first candidate.
-    let mut pos = 0usize;
+    // Any leftover goes round-robin, but only while the candidate still has
+    // room under its cap. Once every candidate is full, stop: `shortfall`
+    // reports the rows that cannot be supplied without a fake command.
     while extra > 0 {
-        quota[pos % candidates.len()] += 1;
-        pos += 1;
-        extra -= 1;
+        let mut progressed = false;
+        for pos in 0..quota.len() {
+            if extra == 0 {
+                break;
+            }
+            if quota[pos] < caps[pos] {
+                quota[pos] += 1;
+                extra -= 1;
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
     }
     for (pos, idx) in candidates.iter().enumerate() {
         let t = &corpus::CORPUS[*idx];
@@ -1067,6 +1098,48 @@ mod tests {
             let p = pids.step(&mut rng) as u64;
             assert!(p < fit.pid_max, "pid {} at or above pid_max", p);
             assert!(p > 1, "pid {} is reserved", p);
+        }
+    }
+
+    #[test]
+    fn pids_are_unique_within_one_table() {
+        let mut rng = Rng::new(7);
+        let fit = Fit {
+            mem_kb: 0,
+            pid_max: 32768,
+        };
+        let mut pids = Pids::new(&mut rng, &fit);
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..5000 {
+            let p = pids.step(&mut rng);
+            assert!(seen.insert(p), "pid {} repeated", p);
+        }
+    }
+
+    #[test]
+    fn pids_honour_a_small_pid_max() {
+        let mut rng = Rng::new(7);
+        let fit = Fit {
+            mem_kb: 0,
+            pid_max: 100,
+        };
+        let mut pids = Pids::new(&mut rng, &fit);
+        for _ in 0..50 {
+            let p = pids.step(&mut rng) as u64;
+            assert!(p < fit.pid_max, "pid {} at or above pid_max", p);
+        }
+    }
+
+    #[test]
+    fn boot_age_keeps_the_stream_at_low_uptime() {
+        // The same seed must produce the same later values whether the host
+        // has been up 10 or 11 seconds. Only the age itself may differ.
+        let mut a = Rng::new(99);
+        let mut b = Rng::new(99);
+        let _ = boot_age(&mut a, 10);
+        let _ = boot_age(&mut b, 11);
+        for _ in 0..16 {
+            assert_eq!(a.next_u64(), b.next_u64());
         }
     }
 
