@@ -33,14 +33,19 @@ jobs:
       - name: package
         run: cargo package --locked --no-verify
       - name: unit
-        # systemd-analyze catches a target that does not exist and an
-        # ExecStop that cannot run, which no test of the text itself can.
+        # systemd-analyze catches a target that does not exist and an ExecStop
+        # that cannot run. The greps below are what the job enforces: a
+        # runner's systemd is not the unit's target systemd, so the analyzer is
+        # advisory when it is not installed.
         run: |
           set -eu
           cargo build --locked --release
           ./target/release/psgen unit > /tmp/psgen.service
           if command -v systemd-analyze >/dev/null 2>&1; then
-            systemd-analyze verify /tmp/psgen.service
+            if ! systemd-analyze verify /tmp/psgen.service; then
+              echo "systemd-analyze rejected the printed unit" >&2
+              exit 1
+            fi
           fi
           if grep -q 'proc-fs-nets.target' /tmp/psgen.service; then
             echo "unit names a nonexistent target" >&2
@@ -48,6 +53,9 @@ jobs:
           fi
           grep -q '^RuntimeDirectory=psgen$' /tmp/psgen.service
           grep -q '^ExecStop=-' /tmp/psgen.service
+          grep -q '^ConditionPathExists=/proc/1/stat$' /tmp/psgen.service
+      - name: workflow
+        run: sh tests/workflow.sh
 
   test:
     runs-on: ubuntu-24.04

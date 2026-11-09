@@ -43,6 +43,9 @@ if cargo --version >/dev/null 2>&1 && [ -f "$ROOT/Cargo.toml" ]; then
     }
 fi
 
+echo "== workflow shell"
+sh "$ROOT/tests/workflow.sh"
+
 echo "== invariants and injection"
 python3 "$ROOT/tests/invariants.py"
 

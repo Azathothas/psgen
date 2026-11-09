@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+### Second review round
+
+- `-n` is a guarantee for `table` and `inject`: the count is met whenever any
+  in-scope template can repeat, split evenly over the templates a host runs many
+  of, so the busiest command is at the pigeonhole minimum instead of taking the
+  remainder. `--repeat-max N` is the explicit opt-out (`1` = never repeat,
+  `0` = no bound) and the shortfall message names it.
+- A table is capped at the host's PID space, never repeats a PID, never exceeds
+  `pid_max`, and reports the gap with the numbers. A host with `pid_max` below 3
+  yields the init row and says why.
+- `--host-mem`, `--host-pid-max` and `--host-uptime` generate for a named host,
+  which is how the fit rules are tested end to end.
+- The stub identifies the shadow leaf by its *opened descriptor* (regular file,
+  one link, the right owner, and for root not on FUSE or overlayfs), so a
+  hardlink or a FUSE type spoof is refused; `data.bin` gets the same treatment.
+  `cfg.exe` is held to the shape the injector produces.
+- The staging prune uses the same start-time-and-alive test as `stop`, so a
+  zombie no longer keeps a dead run's directory (which every container hit).
+- A failed `pipe2` reported "os error 0"; the spawn error paths capture errno at
+  the failing call.
+- `tests/helpers/deny_syscall.c` gives the suite a real seccomp denial, and
+  `tests/workflow.sh` runs the release pipeline's shell, with a fake `gh`,
+  outside GitHub.
+- `tests/invariants.py` gains a regression for every residual the review named.
+
 Fixes for the whole third and fourth beta-test rounds. Each area is a chain
 fix: the symptom and everything that shares its root cause.
 

@@ -176,14 +176,18 @@ jobs:
       - name: publish-crate
         # A large part of the point of the release is that `cargo install
         # psgen` gets the real tool instead of the 0.0.0 reservation. The
-        # job only runs for a final tag, and only when the token is present;
-        # a fork without the secret skips it rather than failing the release.
-        # `workflow_dispatch` uses the input tag, not the branch name.
-        if: ${{ !contains(github.event.inputs.tag || github.ref_name, '-') }}
+        # decision is made by scripts/release-notes.sh (tested in
+        # tests/workflow.sh), so this step is a thin wrapper and a fork without
+        # the secret skips instead of failing.
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           set -eu
+          if [ "$(sh scripts/release-notes.sh publish "$TAG")" != yes ]; then
+            echo "a prerelease does not publish the crate"
+            exit 0
+          fi
           if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
             echo "CARGO_REGISTRY_TOKEN is not set; skipping cargo publish"
             exit 0
@@ -195,39 +199,13 @@ jobs:
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           set -eu
+          # The rules live in scripts/release-notes.sh so they can be run and
+          # tested outside GitHub (tests/workflow.sh); this step only wires the
+          # tag to them.
+          sh scripts/release-notes.sh notes "$TAG" /tmp/notes.md
           pre=""
-          case "$TAG" in *-*) pre="--prerelease" ;; esac
-          # The fixed notes are the boilerplate; the entries for this tag are
-          # appended from CHANGELOG.md, so a release says what changed.
-          full=${TAG#v}
-          base=${full%%-*}
-          section() {
-            awk -v want="$1" '
-              $0 == want { on = 1; next }
-              /^## / && on { exit }
-              on { print }
-            ' CHANGELOG.md
-          }
-          nonempty() {
-            printf '%s' "$1" | grep -q '[^[:space:]]'
-          }
-          # A final tag uses its exact section. A prerelease uses Unreleased
-          # while it is nonempty, then falls back to the base version.
-          notes=$(section "## $full")
-          if ! nonempty "$notes"; then
-            case "$full" in
-              *-*) notes=$(section "## Unreleased") ;;
-            esac
+          if [ "$(sh scripts/release-notes.sh prerelease "$TAG")" = yes ]; then
+            pre="--prerelease"
           fi
-          if ! nonempty "$notes"; then
-            notes=$(section "## $base")
-          fi
-          if ! nonempty "$notes"; then
-            notes=$(section "## Unreleased")
-          fi
-          {
-            cat .github/release-notes.md
-            echo
-            printf '%s\n' "$notes"
-          } > /tmp/notes.md
-          gh release create "$TAG" $pre --verify-tag --title "psgen $TAG" --notes-file /tmp/notes.md dist/*
+          gh release create "$TAG" $pre --verify-tag --title "psgen $TAG" \
+            --notes-file /tmp/notes.md dist/*
