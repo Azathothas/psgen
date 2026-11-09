@@ -610,6 +610,10 @@ def check_injection():
              "--no-mem", "--no-tty", "--no-threads"], tmp, 6)
         for pid in pids:
             exe = read_exe(pid)
+            # Under qemu-user /proc/PID/exe is the emulator, which says nothing
+            # about the exe tier.
+            if emulated():
+                continue
             if Path(exe).resolve() == BIN.resolve():
                 continue
             # A host that has the template binary binds it; the documented
