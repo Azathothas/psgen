@@ -410,7 +410,8 @@ def check_injection():
              "--no-mem"], tmp, 30)
         time.sleep(0.4)
         rows = ps_rows()
-        if not any(rows.get(p) and rows[p]["tty"].startswith("pts/") for p in pids):
+        if can_pty() and not any(rows.get(p) and rows[p]["tty"].startswith("pts/")
+                                 for p in pids):
             fail("no injected process acquired a pty")
         if not any(rows.get(p) and "l" in rows[p]["stat"] for p in pids):
             fail("no injected process showed the threaded stat flag")
@@ -555,21 +556,15 @@ def check_injection():
              "--no-threads", "--duration", "1"], tmp, 2)
         time.sleep(2.2)
         for pid in pids:
-            try:
-                os.kill(pid, 0)
+            if alive(pid):
                 fail(f"pid {pid} survived --duration 1")
-            except ProcessLookupError:
-                pass
         stop_pidfile(pidfile)
         pidfile, pids, _ = inject_and_check(
             ["inject", "-n", "2", "--no-user", "--no-mem", "--no-tty",
              "--no-threads", "--wait", "--duration", "1"], tmp, 2)
         for pid in pids:
-            try:
-                os.kill(pid, 0)
+            if alive(pid):
                 fail(f"pid {pid} survived --wait --duration 1")
-            except ProcessLookupError:
-                pass
         stop_pidfile(pidfile)
 
         pidfile, pids, _ = inject_and_check(
@@ -587,11 +582,8 @@ def check_injection():
             fail("--busy produced no CPU time")
         time.sleep(2.2)
         for p in pids:
-            try:
-                os.kill(p, 0)
+            if alive(p):
                 fail(f"--busy --duration 2 pid {p} survived")
-            except ProcessLookupError:
-                pass
         stop_pidfile(pidfile)
 
 
@@ -950,7 +942,10 @@ def check_load():
     def limited(args, fsize):
         def preexec():
             soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
-            lim = hard if fsize is None else fsize
+            # a soft limit can never exceed the hard limit: clamping keeps the
+            # guard test runnable on a host whose hard RLIMIT_FSIZE is finite
+            lim = hard if fsize is None else (
+                fsize if hard == resource.RLIM_INFINITY else min(fsize, hard))
             resource.setrlimit(resource.RLIMIT_FSIZE, (lim, hard))
         cmd = [str(BIN)] + [str(a) for a in args]
         return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -970,6 +965,22 @@ def check_load():
     p = limited(["load", "--disk-util", "2048"], 1024 ** 3)
     if p.returncode != 1 or "exceeds RLIMIT_FSIZE" not in p.stderr:
         fail("load --disk-util ignored the RLIMIT_FSIZE guard")
+
+
+def can_pty() -> bool:
+    """True when this host lets a process acquire a pty (doctor says so)."""
+    p = run(["doctor", "--json"])
+    return '"pty":{"ok":true' in p.stdout.replace(" ", "")
+
+
+def alive(pid: int) -> bool:
+    """False when the PID is gone, or when it is a zombie left by a parent
+    that never reaped it: either way there is nothing left to signal."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return False
+    return stat[stat.rindex(")") + 2] != "Z"
 
 
 def check_inject_flags():
