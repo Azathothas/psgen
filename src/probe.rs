@@ -526,3 +526,48 @@ pub fn pidfile_creatable(path: &[u8]) -> bool {
 pub fn space(dir: &[u8]) -> Option<(u64, u64)> {
     sys::statvfs(dir)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pidfile_target_accepts_what_psgen_writes() {
+        // The header is eight bytes; an eight-byte comparison is what made a
+        // pidfile psgen had just written look foreign.
+        let dir = std::env::temp_dir().join(format!(".psgen-test-{}-a", sys::getpid()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("p.pid");
+        let body = format!(
+            "# psgen {} boot abc\n1\t2\tcomm\n",
+            crate::version::VERSION
+        );
+        std::fs::write(&path, body.as_bytes()).unwrap();
+        let bytes = path.as_os_str().as_bytes().to_vec();
+        assert!(pidfile_target_ok(&bytes));
+        // An empty file is fine too.
+        std::fs::write(&path, b"").unwrap();
+        assert!(pidfile_target_ok(&bytes));
+        // Something that is not a psgen pidfile is not.
+        std::fs::write(&path, b"hello world, not a header\n").unwrap();
+        assert!(!pidfile_target_ok(&bytes));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pidfile_temp_name_grows_shorter_by_level() {
+        let base = b"/tmp/p.pid";
+        let long = pidfile_temp_name(base, 0, 0x1234);
+        let short = pidfile_temp_name(base, pidfile_temp_levels() - 1, 0x1234);
+        assert!(long.len() > short.len());
+        assert!(long.starts_with(base));
+        assert!(short.starts_with(base));
+        // Every level has to be a different name, or the retry loop spins.
+        let mut seen = Vec::new();
+        for level in 0..pidfile_temp_levels() {
+            let n = pidfile_temp_name(base, level, 0xabcd);
+            assert!(!seen.contains(&n), "level {} repeats a name", level);
+            seen.push(n);
+        }
+    }
+}

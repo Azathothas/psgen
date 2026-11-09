@@ -35,6 +35,14 @@ sleep 1.2
 b=$(mask)
 [ "$a" = "$b" ] || { echo "seed is not deterministic" >&2; exit 1; }
 
+echo "== unit tests"
+if cargo --version >/dev/null 2>&1 && [ -f "$ROOT/Cargo.toml" ]; then
+    (cd "$ROOT" && cargo test --quiet --release) || {
+        echo "unit tests failed" >&2
+        exit 1
+    }
+fi
+
 echo "== invariants and injection"
 python3 "$ROOT/tests/invariants.py"
 

@@ -1000,3 +1000,97 @@ pub fn stub_name(cmd: &[u8]) -> &[u8] {
         str::basename(first)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn proc_of(rss: u32, vsz: u32) -> Proc {
+        Proc {
+            cmd: b"x".to_vec(),
+            tty: Vec::new(),
+            user: b"root".to_vec(),
+            uid: 0,
+            gid: 0,
+            vsz,
+            rss,
+            cpu: 0,
+            flags: 0,
+            age: 0,
+            pid: 0,
+            tmpl: 0,
+            parent: None,
+            stat_override: None,
+        }
+    }
+
+    #[test]
+    fn fit_lowers_a_row_the_host_cannot_hold() {
+        // 1 GiB host, two rows that each claim 2 GiB.
+        let mut rows = vec![proc_of(2_097_152, 4_194_304), proc_of(2_097_152, 4_194_304)];
+        let fit = Fit {
+            mem_kb: 1_048_576,
+            pid_max: 4_194_304,
+        };
+        fit_rows(&mut rows, &fit);
+        for p in &rows {
+            assert!(
+                (p.rss as u64) <= fit.mem_kb,
+                "rss {} above the 1 GiB host",
+                p.rss
+            );
+            assert!(p.vsz >= p.rss, "vsz {} below rss {}", p.vsz, p.rss);
+        }
+    }
+
+    #[test]
+    fn fit_leaves_a_host_that_fits_alone() {
+        let mut rows = vec![proc_of(1024, 4096)];
+        let fit = Fit {
+            mem_kb: 12 * 1024 * 1024,
+            pid_max: 4_194_304,
+        };
+        fit_rows(&mut rows, &fit);
+        assert_eq!(rows[0].rss, 1024);
+        assert_eq!(rows[0].vsz, 4096);
+    }
+
+    #[test]
+    fn pids_stay_below_pid_max() {
+        let mut rng = Rng::new(7);
+        let fit = Fit {
+            mem_kb: 0,
+            pid_max: 32768,
+        };
+        let mut pids = Pids::new(&mut rng, &fit);
+        for _ in 0..5000 {
+            let p = pids.step(&mut rng) as u64;
+            assert!(p < fit.pid_max, "pid {} at or above pid_max", p);
+            assert!(p > 1, "pid {} is reserved", p);
+        }
+    }
+
+    #[test]
+    fn only_a_varying_template_counts_as_repeatable_on_its_own() {
+        let sshd = corpus::CORPUS
+            .iter()
+            .find(|t| t.cmd.starts_with("sshd: {user} @") || t.cmd.starts_with("sshd: {user}@"))
+            .expect("the sshd pty row");
+        // `{user}` is the same for a whole run, so it is not a variant.
+        if !(sshd.flags & corpus::F_REPEAT != 0) {
+            assert!(!has_variants(sshd));
+        }
+        let init = corpus::CORPUS
+            .iter()
+            .find(|t| t.cmd == "/sbin/init")
+            .expect("/sbin/init");
+        assert!(!has_variants(init));
+        assert!(!repeatable(init));
+        let shim = corpus::CORPUS
+            .iter()
+            .find(|t| t.cmd.starts_with("containerd-shim-runc-v2"))
+            .expect("a shim");
+        assert!(has_variants(shim));
+        assert!(repeatable(shim));
+    }
+}
