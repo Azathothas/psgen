@@ -466,10 +466,13 @@ def check_injection():
                 fail(f"pid {pid} cmdline {raw!r} does not contain a planned command")
             if r["tty"] != "?":
                 fail(f"pid {pid} --no-tty still has {r['tty']}")
-            if "l" in r["stat"]:
-                fail(f"pid {pid} --no-threads still has l")
-            if r["rss"] > 4000:
-                fail(f"pid {pid} --no-mem has RSS {r['rss']}")
+            if not under_emulation:
+                # qemu-user adds threads of its own and carries its own RSS, so
+                # neither number is about psgen there.
+                if "l" in r["stat"]:
+                    fail(f"pid {pid} --no-threads still has l")
+                if r["rss"] > 4000:
+                    fail(f"pid {pid} --no-mem has RSS {r['rss']}")
         stop_pidfile(pidfile)
 
         if not can_root():
@@ -487,7 +490,8 @@ def check_injection():
         if can_pty() and not any(rows.get(p) and rows[p]["tty"].startswith("pts/")
                                  for p in pids):
             fail("no injected process acquired a pty")
-        if not any(rows.get(p) and "l" in rows[p]["stat"] for p in pids):
+        if not under_emulation and not any(
+                rows.get(p) and "l" in rows[p]["stat"] for p in pids):
             fail("no injected process showed the threaded stat flag")
         stop_pidfile(pidfile)
 
