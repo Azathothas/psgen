@@ -1051,6 +1051,115 @@ def check_inject_flags():
         if p.returncode != 2 or "flame" not in p.stderr:
             fail("--flame was not rejected with an explanation")
 
+def check_regressions():
+    """Regressions for the QA findings. Each one failed at bf80156."""
+    # F-01: the same seed must give the same non-time columns a second apart.
+    def masked(text):
+        rows = []
+        for line in text.splitlines()[1:]:
+            m = PS_RE.match(line)
+            if not m:
+                continue
+            rows.append((m.group("pid"), m.group("cmd"), m.group("vsz"),
+                         m.group("rss"), m.group("stat")))
+        return rows
+    a = masked(run(["table", "-n", "20", "-s", "42"]).stdout)
+    time.sleep(1.2)
+    b = masked(run(["table", "-n", "20", "-s", "42"]).stdout)
+    if a != b:
+        fail("F-01: table is not deterministic across one second with the same seed")
+
+    # F-03: an existing psgen pidfile is accepted as an output path.
+    with tempfile.TemporaryDirectory(prefix="psgen-reg-") as tmp:
+        pf = Path(tmp) / "existing.pid"
+        pf.write_text("# psgen 0.0.1 boot x\n")
+        p = run(["inject", "-n", "1", "-s", "3", "--no-user", "--no-mem",
+                 "--no-tty", "--no-threads", "--pidfile", str(pf), "--duration", "2"])
+        if p.returncode != 0:
+            fail(f"F-03: an existing psgen pidfile was refused: {p.stderr}")
+        stop_pidfile(pf)
+
+        # F-02: stop --dry-run must be a parse error, not a kill.
+        if run(["stop", "--pidfile", str(pf), "--dry-run"], check=False).returncode != 2:
+            fail("F-02: stop --dry-run was accepted")
+
+        # F-17: a pidfile naming a live process with the wrong starttime keeps
+        # the temp dirs and exits nonzero only when the process is unreadable;
+        # a readable but mismatched process is skipped.
+        me = os.getpid()
+        pf.write_text(f"# psgen 0.0.1 boot {boot_id()}\n{me}\t0\ttest\n")
+        out = run(["stop", "--pidfile", str(pf)], check=False).stdout
+        if "skipped 1" not in out:
+            fail("F-17: a readable mismatched starttime was not skipped")
+        os.kill(me, 0)
+
+        # F-31/F-35: 40-row stop must report 40, not a timing-dependent count.
+        pf.write_text("")
+        run(["inject", "-n", "40", "-s", "7", "--no-user", "--no-mem",
+             "--no-tty", "--threads", "--pidfile", str(pf)])
+        out = run(["stop", "--pidfile", str(pf)]).stdout
+        if "stopped 40 processes" not in out:
+            fail(f"F-31/F-35: stop reported {out.strip()!r} for 40 rows")
+
+        # F-13: seccomp filter with a null program is reachable, so DENY here
+        # would be wrong. Only assert the probe returns a known verdict.
+        j = run(["doctor", "--json"])
+        doc = json.loads(j.stdout)
+        val = doc.get("probe", {}).get("seccomp_user_notif")
+        if val not in ("reachable", "blocked"):
+            fail(f"F-13: seccomp probe returned {val!r}")
+
+        # F-12: cargo on PATH must not be reported missing.
+        out = run(["check", "--binaries"]).stdout
+        if "missing: cargo  <-" in out:
+            fail("F-12: check --binaries reported cargo missing")
+
+        # F-23: %MEM is rounded, not truncated.
+        mem = mem_total()
+        for line in run(["table", "-n", "40", "-s", "1"]).stdout.splitlines()[1:]:
+            m = PS_RE.match(line)
+            if not m:
+                continue
+            rss = int(m.group("rss"))
+            want = round(rss * 100.0 / mem, 1)
+            got = float(m.group("mem"))
+            if abs(got - want) > 0.051:
+                fail(f"F-23: %MEM {got} for RSS {rss} kB, want {want}")
+
+        # F-15: the help must describe the 4 MiB floor.
+        if "4 MiB" not in run(["--help"]).stdout:
+            fail("F-15: help does not mention the 4 MiB mem-cap floor")
+
+        # F-16: the unit must not name a nonexistent target.
+        if "proc-fs-nets.target" in run(["unit"]).stdout:
+            fail("F-16: unit still names proc-fs-nets.target")
+
+        # F-11: a group without a user is repaired.
+        if can_root():
+            before_group = subprocess.run(
+                ["getent", "group", "haproxy"], stdout=subprocess.DEVNULL).returncode == 0
+            before_user = subprocess.run(
+                ["getent", "passwd", "haproxy"], stdout=subprocess.DEVNULL).returncode == 0
+            if not before_group and not before_user:
+                subprocess.run(["sudo", "-n", "groupadd", "-r", "haproxy"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                try:
+                    pf.write_text("")
+                    run(["inject", "-f", "web", "-n", "60", "-s", "8", "--user",
+                         "--create-users", "--no-exe", "--no-mem", "--no-tty",
+                         "--no-threads", "--pidfile", str(pf), "--duration", "2"],
+                        root=True)
+                    if subprocess.run(["getent", "passwd", "haproxy"],
+                                      stdout=subprocess.DEVNULL).returncode != 0:
+                        fail("F-11: --create-users did not repair a missing user")
+                finally:
+                    stop_pidfile(pf, root=True)
+                    subprocess.run(["sudo", "-n", "userdel", "haproxy"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    subprocess.run(["sudo", "-n", "groupdel", "haproxy"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 def main() -> int:
     if not BIN.exists():
         fail(f"{BIN} missing, run cargo build --release")
@@ -1067,6 +1176,7 @@ def main() -> int:
     check_inject_flags()
     check_stop()
     check_counts()
+    check_regressions()
     if can_root():
         check_root()
     else:

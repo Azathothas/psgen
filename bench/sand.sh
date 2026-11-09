@@ -68,7 +68,7 @@ def section(name):
     return m.group(1) if m else None
 
 
-for name in ("ENV", "DOCTOR", "INJECT", "PS", "TOP", "COMM", "EXE",
+for name in ("ENV", "DOCTOR", "INJECT", "PIDS", "PS", "TOP", "COMM", "EXE",
              "HTOP", "BTOP", "STOP", "AFTER"):
     if section(name) is None:
         fail(f"missing section {name}")
