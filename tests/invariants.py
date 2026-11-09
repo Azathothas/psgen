@@ -531,12 +531,19 @@ def check_injection():
             parts = line.strip().split(None, 2)
             if len(parts) == 3:
                 rows.append((int(parts[0]), int(parts[1]), parts[2]))
+        # Under qemu-user `ps args` starts with `qemu-<arch> <binary>`, so the
+        # template command is a suffix of the row rather than its start.
+        def starts(args, prefixes):
+            if emulated():
+                return any(p in args for p in prefixes)
+            return args.startswith(prefixes)
+
         masters = {pid for pid, ppid, args in rows
-                   if args.startswith(("apache2 -DFOREGROUND", "nginx: master",
-                                       "php-fpm: master", "gunicorn: master"))}
+                   if starts(args, ("apache2 -DFOREGROUND", "nginx: master",
+                                    "php-fpm: master", "gunicorn: master"))}
         workers = [(pid, ppid, args) for pid, ppid, args in rows
-                   if args.startswith(("apache2 -k start", "nginx: worker",
-                                       "php-fpm: pool", "gunicorn: worker"))]
+                   if starts(args, ("apache2 -k start", "nginx: worker",
+                                    "php-fpm: pool", "gunicorn: worker"))]
         if not masters or not workers:
             fail("web family did not produce masters and workers")
         for pid, ppid, args in workers:
