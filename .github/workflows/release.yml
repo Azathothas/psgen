@@ -199,8 +199,8 @@ jobs:
           case "$TAG" in *-*) pre="--prerelease" ;; esac
           # The fixed notes are the boilerplate; the entries for this tag are
           # appended from CHANGELOG.md, so a release says what changed.
-          version=${TAG#v}
-          version=${version%%-*}
+          full=${TAG#v}
+          base=${full%%-*}
           section() {
             awk -v want="$1" '
               $0 == want { on = 1; next }
@@ -208,14 +208,26 @@ jobs:
               on { print }
             ' CHANGELOG.md
           }
-          unreleased=$(section "## Unreleased")
+          nonempty() {
+            printf '%s' "$1" | grep -q '[^[:space:]]'
+          }
+          # A final tag uses its exact section. A prerelease uses Unreleased
+          # while it is nonempty, then falls back to the base version.
+          notes=$(section "## $full")
+          if ! nonempty "$notes"; then
+            case "$full" in
+              *-*) notes=$(section "## Unreleased") ;;
+            esac
+          fi
+          if ! nonempty "$notes"; then
+            notes=$(section "## $base")
+          fi
+          if ! nonempty "$notes"; then
+            notes=$(section "## Unreleased")
+          fi
           {
             cat .github/release-notes.md
             echo
-            if printf '%s' "$unreleased" | grep -q '[^[:space:]]'; then
-              printf '%s\n' "$unreleased"
-            else
-              section "## $version"
-            fi
+            printf '%s\n' "$notes"
           } > /tmp/notes.md
           gh release create "$TAG" $pre --verify-tag --title "psgen $TAG" --notes-file /tmp/notes.md dist/*
