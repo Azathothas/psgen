@@ -399,23 +399,69 @@ fn env_nonce_line() -> Vec<u8> {
 /// Whether `path` is a shadow copy this run created: a `psgen-stub` inside a
 /// staging directory owned by the caller. Anything else must not be executed
 /// on the strength of a config file descriptor.
+/// Whether `path` is a shadow copy this run may execute.
+///
+/// The name and the parent directory are checked first, then the leaf itself.
+/// Metadata is not enough on its own: a filesystem can report a leaf as a
+/// regular file with any bytes behind it, and a hardlink is a regular file by
+/// every metadata measure. What is checked is the *opened* descriptor, so the
+/// object that is executed is the object that was checked:
+///
+/// 1. `O_NOFOLLOW` refuses a symlink at the leaf, including one swapped in
+///    between the check and the open.
+/// 2. `fstat` on that descriptor must say regular file, owned by this uid, with
+///    a link count of one: a hardlink adds a link, so it is refused, and the
+///    single link the injector made is what remains.
+/// 3. For a root run the descriptor's filesystem must not be FUSE or any other
+///    filesystem that forges ownership or link counts.
 fn safe_copy(path: &[u8]) -> bool {
     if path.is_empty() || crate::str::basename(path) != b"psgen-stub" {
         return false;
     }
-    // Reject a symlink or a directory: a caller who can replace the leaf must
-    // not turn the exec of a staging copy into the exec of another file.
-    if sys::geteuid() == 0 && sys::path_fs_type(path) == Some(sys::FUSE_SUPER_MAGIC) {
+    let parent_ok = match Path::new(OsStr::from_bytes(path)).parent() {
+        Some(p) => crate::inject::safe_temp_dir(p.as_os_str().as_bytes()),
+        None => return false,
+    };
+    if !parent_ok {
         return false;
     }
-    match std::fs::symlink_metadata(Path::new(OsStr::from_bytes(path))) {
-        Ok(m) if m.file_type().is_file() => {}
-        _ => return false,
+    let fd = sys::open(path, libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC, 0);
+    if fd < 0 {
+        return false;
     }
-    match Path::new(OsStr::from_bytes(path)).parent() {
-        Some(p) => crate::inject::safe_temp_dir(p.as_os_str().as_bytes()),
-        None => false,
+    let ok = leaf_ok(fd);
+    sys::close(fd);
+    ok
+}
+
+/// The metadata checks on an opened staging leaf.
+fn leaf_ok(fd: i32) -> bool {
+    let st = match sys::fd_stat(fd) {
+        Some(s) => s,
+        None => return false,
+    };
+    // A regular file with exactly the one link the injector created. A symlink
+    // cannot get here (O_NOFOLLOW), and a hardlink adds a second link.
+    if !st.is_reg() || st.nlink != 1 {
+        return false;
     }
+    // Owned by whoever is about to run it. A root run cannot be talked into
+    // executing another user's file, and an unprivileged run cannot be given a
+    // root-owned one.
+    if st.uid != sys::geteuid() {
+        return false;
+    }
+    // A FUSE (or other user-mountable) filesystem can lie about all of the
+    // above. Only a root run has anything to lose, and only a root run installs
+    // anything worth lying about, so the check is made there.
+    if sys::geteuid() == 0 {
+        if let Some(fs) = sys::fd_fs_type(fd) {
+            if fs == sys::FUSE_SUPER_MAGIC || fs == sys::OVERLAYFS_SUPER_MAGIC {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Whether `dir` is a staging directory this run may write into.
@@ -596,12 +642,53 @@ fn bind_path(target: &[u8]) -> bool {
     sys::mount(&self_exe, target, b"", sys::MS_BIND, b"")
 }
 
+/// Whether a bind target named by the config is one this stub may use.
+///
+/// The bound bytes are always this binary (`/proc/self/exe` is what is mounted
+/// there), so a hostile target is not code execution. It is still a write into
+/// a path the config chose, inside a private namespace, so the path is kept to
+/// the shape the injector produces: absolute, no `.`/`..` component, and — for a
+/// root run — not on a filesystem that forges metadata.
+fn target_ok(target: &[u8]) -> bool {
+    if target.is_empty() || target[0] != b'/' {
+        return false;
+    }
+    if target.iter().any(|b| *b < 0x20 || *b == 0x7f) {
+        return false;
+    }
+    for part in target.split(|b| *b == b'/') {
+        if part == b"." || part == b".." {
+            return false;
+        }
+    }
+    if sys::geteuid() == 0 {
+        if let Some(fs) = sys::path_fs_type(target) {
+            if fs == sys::FUSE_SUPER_MAGIC || fs == sys::OVERLAYFS_SUPER_MAGIC {
+                return false;
+            }
+        }
+        // The target can be created (a missing template path gets a staging
+        // binding), so check the nearest existing ancestor as well.
+        let mut p = Path::new(OsStr::from_bytes(target));
+        while let Some(parent) = p.parent() {
+            if let Some(fs) = sys::path_fs_type(parent.as_os_str().as_bytes()) {
+                if fs == sys::FUSE_SUPER_MAGIC || fs == sys::OVERLAYFS_SUPER_MAGIC {
+                    return false;
+                }
+                break;
+            }
+            p = parent;
+        }
+    }
+    true
+}
+
 fn setup_exe(cfg: &Config) -> bool {
-    if cfg.exe.is_empty() {
+    if cfg.exe.is_empty() || !target_ok(&cfg.exe) {
         return false;
     }
     let target = resolve_target(&cfg.exe);
-    if target.is_empty() {
+    if target.is_empty() || !target_ok(&target) {
         return false;
     }
     if !enter_mount_ns() {
@@ -902,23 +989,35 @@ fn write_disk(cfg: &Config) -> bool {
         return false;
     }
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     let dir = PathBuf::from(OsStr::from_bytes(&cfg.temp));
     let path = dir.join("data.bin");
     // `create` would follow a symlink a caller placed in the staging
     // directory, and the truncate would land on the target. O_NOFOLLOW makes
     // that an error instead.
-    let mut f = match std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o644)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&path)
-    {
-        Ok(f) => f,
-        Err(_) => return false,
+    let fd = sys::open(
+        path.as_os_str().as_bytes(),
+        sys::O_WRONLY | sys::O_CREAT | sys::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0o644,
+    );
+    if fd < 0 {
+        return false;
+    }
+    // `O_NOFOLLOW` refuses a symlink; a hardlink is still a regular file, so
+    // the opened descriptor's link count is the remaining signal. The injector
+    // creates `data.bin` for this run, so a second link means someone else
+    // made one.
+    let st = match sys::fd_stat(fd) {
+        Some(s) => s,
+        None => {
+            sys::close(fd);
+            return false;
+        }
     };
+    if !st.is_reg() || st.nlink != 1 || st.uid != sys::geteuid() {
+        sys::close(fd);
+        return false;
+    }
+    let mut f = unsafe { <std::fs::File as std::os::unix::io::FromRawFd>::from_raw_fd(fd) };
     let chunk = vec![0x5au8; 1024 * 1024];
     let mut left = cfg.disk_kb as u64 * 1024;
     while left > 0 {

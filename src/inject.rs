@@ -828,15 +828,19 @@ fn prune_root(root: &Path) -> usize {
             // The marker names the injector and its starttime, so a recycled
             // PID cannot keep a dead run's directory alive. A live injector of
             // another user is skipped here too: its starttime matches.
-            if live::read_starttime(owner) == Some(start) {
+            if live::same_process(owner, start) {
                 continue;
             }
         }
         match read_live_marker(&path) {
             Some(pids) => {
+                // A stub is still using this directory while it is alive. A
+                // zombie is not: it holds no files and runs no code, and a
+                // container whose PID 1 does not reap would otherwise keep
+                // every dead run's staging for ever.
                 if pids
                     .iter()
-                    .any(|(pid, start)| live::read_starttime(*pid) == Some(*start))
+                    .any(|(pid, start)| live::same_process(*pid, *start))
                 {
                     continue;
                 }
@@ -954,10 +958,11 @@ pub fn spawn(rows: &[Proc], args: &Args, prep: &Prep) -> Result<SpawnResult, Str
             if let Some(d) = &shadow_dir {
                 let _ = std::fs::remove_dir_all(d);
             }
+            let e = sys::errno();
             return Err(format!(
                 "cannot create the RSS arena ({} KiB): {}",
                 max_rss,
-                sys::last_error()
+                std::io::Error::from_raw_os_error(e)
             ));
         }
         let target = sys::dup2(fd, 4);
@@ -975,14 +980,14 @@ pub fn spawn(rows: &[Proc], args: &Args, prep: &Prep) -> Result<SpawnResult, Str
     }
 
     let mut pfd = [0i32; 2];
-    if !sys::pipe2(&mut pfd, sys::O_CLOEXEC) {
+    if let Err(e) = sys::pipe2_checked(&mut pfd, sys::O_CLOEXEC) {
         if arena_fd >= 0 {
             sys::close(arena_fd);
         }
         if let Some(d) = &shadow_dir {
             let _ = std::fs::remove_dir_all(d);
         }
-        return Err(format!("pipe2: {}", sys::last_error()));
+        return Err(format!("pipe2: {}", std::io::Error::from_raw_os_error(e)));
     }
     if pfd[0] == 5 {
         let n = sys::fcntl_dup(pfd[0], 6);
@@ -995,7 +1000,11 @@ pub fn spawn(rows: &[Proc], args: &Args, prep: &Prep) -> Result<SpawnResult, Str
             if let Some(d) = &shadow_dir {
                 let _ = std::fs::remove_dir_all(d);
             }
-            return Err(format!("fcntl(F_DUPFD,6): {}", sys::last_error()));
+            let e = sys::errno();
+            return Err(format!(
+                "fcntl(F_DUPFD,6): {}",
+                std::io::Error::from_raw_os_error(e)
+            ));
         }
         sys::close(pfd[0]);
         pfd[0] = n;
@@ -1013,21 +1022,21 @@ pub fn spawn(rows: &[Proc], args: &Args, prep: &Prep) -> Result<SpawnResult, Str
             if let Some(d) = &shadow_dir {
                 let _ = std::fs::remove_dir_all(d);
             }
-            return Err(format!("fcntl(F_DUPFD,6): {}", sys::last_error()));
+            let e = sys::errno();
+            return Err(format!(
+                "fcntl(F_DUPFD,6): {}",
+                std::io::Error::from_raw_os_error(e)
+            ));
         }
         sys::close(pfd[1]);
         pfd[1] = n;
     }
     if sys::dup2(pfd[1], 5) != 5 {
-        sys::close(pfd[0]);
-        sys::close(pfd[1]);
-        if arena_fd >= 0 {
-            sys::close(arena_fd);
-        }
-        if let Some(d) = &shadow_dir {
-            let _ = std::fs::remove_dir_all(d);
-        }
-        return Err(format!("dup2(status,5): {}", sys::last_error()));
+        let e = sys::errno();
+        return Err(format!(
+            "dup2(status,5): {}",
+            std::io::Error::from_raw_os_error(e)
+        ));
     }
     if pfd[1] != 5 {
         sys::close(pfd[1]);

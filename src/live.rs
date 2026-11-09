@@ -326,3 +326,13 @@ pub fn alive(pid: i32) -> bool {
         None => false,
     }
 }
+
+/// Whether `pid` is still the process that had `start` as its start time, and
+/// still alive.
+///
+/// The start time proves the PID was not recycled. The liveness check excludes
+/// a zombie, which keeps its `/proc` entry (and therefore its start time) after
+/// it has died whenever its parent does not reap it.
+pub fn same_process(pid: i32, start: u64) -> bool {
+    read_starttime(pid) == Some(start) && alive(pid)
+}

@@ -15,6 +15,7 @@ pub const O_CREAT: i32 = libc::O_CREAT;
 pub const O_EXCL: i32 = libc::O_EXCL;
 pub const O_NOCTTY: i32 = libc::O_NOCTTY;
 pub const O_NOFOLLOW: i32 = libc::O_NOFOLLOW;
+pub const O_TRUNC: i32 = libc::O_TRUNC;
 pub const O_CLOEXEC: i32 = libc::O_CLOEXEC;
 
 pub const W_OK: i32 = libc::W_OK;
@@ -87,6 +88,16 @@ pub fn exit(code: i32) -> ! {
 
 pub fn last_error() -> io::Error {
     io::Error::last_os_error()
+}
+
+/// The errno of the failure that just happened, captured immediately.
+///
+/// `last_error()` reads the thread's errno at the moment it is called, so any
+/// intervening call — a `close`, a `remove_dir_all`, a `format!` that allocates,
+/// or the `eprintln` cleanup in a caller — can replace it. A syscall wrapper
+/// that fails should return this, or nothing at all.
+pub fn errno() -> i32 {
+    io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
 
 pub fn read_file(path: &[u8], buf: &mut [u8]) -> Option<usize> {
@@ -243,6 +254,46 @@ fn seal_mask() -> i32 {
     libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL
 }
 
+/// Everything about one inode that the stub has to trust or not.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Stat {
+    pub dev: u64,
+    pub ino: u64,
+    pub mode: u32,
+    pub nlink: u64,
+    pub uid: u32,
+    pub size: u64,
+}
+
+impl Stat {
+    pub fn is_reg(&self) -> bool {
+        self.mode & libc::S_IFMT == libc::S_IFREG
+    }
+}
+
+// The field types are `dev_t`, `ino_t`, `nlink_t` and `uid_t`, whose widths
+// differ per target; the cast makes them one type for the comparison.
+#[allow(clippy::unnecessary_cast)]
+fn stat_to(st: &libc::stat) -> Stat {
+    Stat {
+        dev: st.st_dev as u64,
+        ino: st.st_ino as u64,
+        mode: st.st_mode,
+        nlink: st.st_nlink as u64,
+        uid: st.st_uid as u32,
+        size: st.st_size as u64,
+    }
+}
+
+/// `fstat` of an open descriptor.
+pub fn fd_stat(fd: i32) -> Option<Stat> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return None;
+    }
+    Some(stat_to(&st))
+}
+
 /// The filesystem type of the object a descriptor refers to, or None when
 /// fstatfs fails.
 pub fn fd_fs_type(fd: i32) -> Option<i64> {
@@ -267,6 +318,11 @@ pub fn path_fs_type(path: &[u8]) -> Option<i64> {
 /// count, so a config descriptor or staging path on one is never trusted by a
 /// root run.
 pub const FUSE_SUPER_MAGIC: i64 = 0x6573_5546;
+
+/// `OVERLAYFS_SUPER_MAGIC`: an overlay can present a merged view whose upper
+/// layer an unprivileged user controls, so it is treated like FUSE for a root
+/// staging leaf.
+pub const OVERLAYFS_SUPER_MAGIC: i64 = 0x794c_7630;
 
 /// The owner uid of the object a descriptor refers to, or None when fstat
 /// fails.
@@ -313,6 +369,15 @@ pub fn fcntl_dup(fd: i32, min: i32) -> i32 {
 
 pub fn pipe2(fds: &mut [i32; 2], flags: i32) -> bool {
     unsafe { libc::pipe2(fds.as_mut_ptr(), flags) == 0 }
+}
+
+/// Like `pipe2`, but returns the errno of the failure instead of a bool.
+pub fn pipe2_checked(fds: &mut [i32; 2], flags: i32) -> Result<(), i32> {
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), flags) } == 0 {
+        Ok(())
+    } else {
+        Err(errno())
+    }
 }
 
 pub fn fork() -> i32 {
