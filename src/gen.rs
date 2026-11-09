@@ -581,7 +581,6 @@ fn parent_index(idx: usize) -> Option<usize> {
 struct Pids {
     next: i64,
     max: i64,
-    base: i64,
     used: std::collections::BTreeSet<i32>,
 }
 
@@ -596,25 +595,26 @@ impl Pids {
         Pids {
             next: base,
             max,
-            base,
             used: std::collections::BTreeSet::new(),
         }
     }
 
     fn step(&mut self, rng: &mut Rng) -> i32 {
-        let delta = rng.range(1, 24) as i64;
+        let mut delta = rng.range(1, 24) as i64;
         // A `ps` snapshot has one row per PID. Keep stepping past a PID that
-        // has already been handed out, including after the sequence wraps.
+        // has already been handed out. After the first collision, step by one
+        // so a stride that shares a factor with the PID space cannot cycle
+        // forever while free PIDs remain.
         let tries = self.max.clamp(2, 1_000_000) as usize;
-        for _ in 0..tries {
+        for attempt in 0..tries {
+            if attempt > 0 {
+                delta = 1;
+            }
             self.next = self.next.saturating_add(delta);
             if self.next > self.max {
                 // Wrap to the low end rather than printing a PID the kernel
                 // cannot allocate.
-                self.next = self.base.max(2).saturating_add(delta);
-                if self.next > self.max {
-                    self.next = 2;
-                }
+                self.next = 2;
             }
             let pid = self.next as i32;
             if self.used.insert(pid) {
@@ -1124,9 +1124,12 @@ mod tests {
             pid_max: 100,
         };
         let mut pids = Pids::new(&mut rng, &fit);
-        for _ in 0..50 {
+        let mut seen = std::collections::BTreeSet::new();
+        // PIDs 2..99 are available, so 97 rows must all be distinct.
+        for _ in 0..97 {
             let p = pids.step(&mut rng) as u64;
             assert!(p < fit.pid_max, "pid {} at or above pid_max", p);
+            assert!(seen.insert(p), "pid {} repeated", p);
         }
     }
 
@@ -1134,8 +1137,8 @@ mod tests {
     fn boot_age_keeps_the_stream_at_low_uptime() {
         // The same seed must produce the same later values whether the host
         // has been up 10 or 11 seconds. Only the age itself may differ.
-        let mut a = Rng::new(99);
-        let mut b = Rng::new(99);
+        let mut a = Rng::new(165);
+        let mut b = Rng::new(165);
         let _ = boot_age(&mut a, 10);
         let _ = boot_age(&mut b, 11);
         for _ in 0..16 {
