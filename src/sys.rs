@@ -128,8 +128,9 @@ pub fn bpf_allowed() -> bool {
 /// Whether `SECCOMP_SET_MODE_FILTER` with `SECCOMP_FILTER_FLAG_NEW_LISTENER`
 /// is reachable.
 ///
-/// A null program is refused; the errno says whether the call was blocked
-/// before the argument was inspected.
+/// A null program is refused with `EFAULT` or `EINVAL` after the kernel has
+/// inspected the arguments, which means the operation is reachable. `EPERM`,
+/// `EACCES` and `ENOSYS` mean a policy or the kernel blocks it before that.
 pub fn seccomp_user_notif() -> bool {
     let r = unsafe {
         libc::syscall(
@@ -139,8 +140,13 @@ pub fn seccomp_user_notif() -> bool {
             core::ptr::null::<libc::c_void>(),
         )
     };
-    let err = last_error().raw_os_error();
-    r != -1 || !matches!(err, Some(libc::EPERM) | Some(libc::EFAULT))
+    if r != -1 {
+        return true;
+    }
+    !matches!(
+        last_error().raw_os_error(),
+        Some(libc::EPERM) | Some(libc::EACCES) | Some(libc::ENOSYS)
+    )
 }
 
 pub fn read_fd(fd: i32, buf: &mut [u8]) -> isize {

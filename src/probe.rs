@@ -77,40 +77,55 @@ where
 }
 
 fn check_pty() -> Check {
-    let fd = sys::open(b"/dev/ptmx", sys::O_RDWR | sys::O_NOCTTY | sys::O_CLOEXEC, 0);
-    if fd < 0 {
-        return Check::new("pty", false, errno(), b"/dev/ptmx open failed");
-    }
-    sys::close(fd);
-    let slave = sys::access(b"/dev/pts", sys::X_OK);
+    // A seccomp policy that returns KILL for an unexpected syscall must kill
+    // the probe child, not psgen. The parent then reports DENY.
+    let (ok, e) = in_child(|| {
+        let fd = sys::open(b"/dev/ptmx", sys::O_RDWR | sys::O_NOCTTY | sys::O_CLOEXEC, 0);
+        if fd < 0 {
+            return Err(errno());
+        }
+        sys::close(fd);
+        if sys::access(b"/dev/pts", sys::X_OK) {
+            Ok(())
+        } else {
+            Err(errno())
+        }
+    });
     Check::new(
         "pty",
-        slave,
-        if slave { 0 } else { errno() },
-        if slave {
+        ok,
+        e,
+        if ok {
             b"/dev/ptmx and /dev/pts"
         } else {
-            b"/dev/ptmx ok, /dev/pts unreachable"
+            b"/dev/ptmx or /dev/pts unavailable"
         },
     )
 }
 
 fn check_memfd() -> Check {
-    let fd = sys::memfd_create(b"psgen-probe", 0);
-    if fd < 0 {
-        return Check::new("memfd", false, errno(), b"memfd_create failed");
-    }
-    let sz = sys::ftruncate(fd, 4096);
-    let e = if sz { 0 } else { errno() };
-    sys::close(fd);
+    let (ok, e) = in_child(|| {
+        let fd = sys::memfd_create(b"psgen-probe", 0);
+        if fd < 0 {
+            return Err(errno());
+        }
+        let sz = sys::ftruncate(fd, 4096);
+        let e = if sz { 0 } else { errno() };
+        sys::close(fd);
+        if sz {
+            Ok(())
+        } else {
+            Err(e)
+        }
+    });
     Check::new(
         "memfd",
-        sz,
+        ok,
         e,
-        if sz {
+        if ok {
             b"memfd_create and ftruncate"
         } else {
-            b"memfd_create ok, ftruncate failed"
+            b"memfd_create or ftruncate unavailable"
         },
     )
 }
@@ -303,6 +318,25 @@ pub fn checks() -> Vec<Check> {
     v
 }
 
+/// Whether the `bpf` syscall is reachable, probed in a child so a seccomp
+/// KILL policy cannot take down the caller.
+pub fn bpf_allowed() -> bool {
+    in_child(|| if sys::bpf_allowed() { Ok(()) } else { Err(errno()) }).0
+}
+
+/// Whether `SECCOMP_SET_MODE_FILTER` is reachable, probed in a child for the
+/// same reason.
+pub fn seccomp_user_notif() -> bool {
+    in_child(|| {
+        if sys::seccomp_user_notif() {
+            Ok(())
+        } else {
+            Err(errno())
+        }
+    })
+    .0
+}
+
 /// The facts `inject` needs to choose its strategy, from one probe pass.
 pub struct Caps {
     pub root: bool,
@@ -363,7 +397,7 @@ pub fn pidfile_target_ok(path: &[u8]) -> bool {
     }
     let mut buf = [0u8; 16];
     match sys::read_file(path, &mut buf) {
-        Some(n) => n >= 9 && &buf[..9] == b"# psgen ",
+        Some(n) => n >= 8 && &buf[..8] == b"# psgen ",
         None => false,
     }
 }
@@ -399,25 +433,29 @@ pub fn pidfile_creatable(path: &[u8]) -> bool {
         return false;
     }
     let path = path.strip_suffix(&[0]).unwrap_or(path);
-    let parent = pidfile_parent(path);
-    let mut name = parent.to_vec();
-    if !name.ends_with(b"/") {
-        name.push(b'/');
-    }
-    let mut b = Buf::new();
-    b.push_str(".psgen-probe-");
-    b.push_u64(sys::getpid() as u64);
-    b.push(b'-');
-    b.push_u64(sys::monotonic_ns());
-    name.extend_from_slice(b.as_bytes());
     let flags = sys::O_WRONLY | sys::O_CREAT | sys::O_EXCL | sys::O_NOFOLLOW;
-    let fd = sys::open(&name, flags, 0o600);
-    if fd < 0 {
-        return false;
+    // Test the name `write_pidfile` will actually create, not a short probe
+    // name in the parent. A basename close to NAME_MAX passes a short probe
+    // and then fails after the stubs are spawned.
+    for _ in 0..8u64 {
+        let mut cand = path.to_vec();
+        let mut b = Buf::new();
+        b.push_str(".tmp.");
+        b.push_u64(sys::getpid() as u64);
+        b.push(b'.');
+        b.push_str(&format!("{:016x}", sys::monotonic_ns()));
+        cand.extend_from_slice(b.as_bytes());
+        let fd = sys::open(&cand, flags, 0o600);
+        if fd >= 0 {
+            sys::close(fd);
+            let _ = std::fs::remove_file(Path::new(OsStr::from_bytes(&cand)));
+            return true;
+        }
+        if sys::last_error().raw_os_error() != Some(libc::EEXIST) {
+            return false;
+        }
     }
-    sys::close(fd);
-    let _ = std::fs::remove_file(Path::new(OsStr::from_bytes(&name)));
-    true
+    false
 }
 
 /// Total and free bytes on the filesystem that holds `dir`.

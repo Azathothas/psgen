@@ -105,7 +105,7 @@ fn posture() -> Vec<(&'static str, Vec<u8>)> {
     ));
     v.push((
         "bpf",
-        if sys::bpf_allowed() {
+        if probe::bpf_allowed() {
             b"allowed".to_vec()
         } else {
             b"blocked".to_vec()
@@ -113,7 +113,7 @@ fn posture() -> Vec<(&'static str, Vec<u8>)> {
     ));
     v.push((
         "seccomp_user_notif",
-        if sys::seccomp_user_notif() {
+        if probe::seccomp_user_notif() {
             b"reachable".to_vec()
         } else {
             b"blocked".to_vec()
@@ -149,7 +149,7 @@ pub fn run(as_json: bool, pidfile: Option<&[u8]>) -> i32 {
             denied += 1;
         }
     }
-    let pidfile_ok = pidfile.map(|p| probe::pidfile_writable(p));
+    let pidfile_ok = pidfile.map(|p| probe::pidfile_creatable(p));
 
     // Doctor reports on everything but only fails when a capability that
     // injection cannot work without is missing. A non-root run always denies
