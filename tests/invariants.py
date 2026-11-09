@@ -408,10 +408,11 @@ def check_unit():
             fail("unit did not quote the stop executable path")
 
 
-def inject_and_check(args, tmp, want, root=False, read_root=None):
+def inject_and_check(args, tmp, want, root=False, read_root=None,
+                     expect_failure=False):
     pidfile = Path(tmp) / ("pids-" + str(int(time.time() * 1000)))
     args = list(args) + ["--pidfile", str(pidfile)]
-    p = run(args, root=root)
+    p = run(args, root=root, check=not expect_failure)
     if read_root is None:
         read_root = root
     pids = read_pids(pidfile, root=read_root)
@@ -505,9 +506,12 @@ def check_injection():
             fail("no injected process had a padded RSS")
         stop_pidfile(pidfile)
 
+        # --verify compares real VSZ/RSS with the plan. qemu-user adds its own
+        # mappings and resident pages to both, so the comparison is about the
+        # emulator there and the exit code is not psgen's.
         pidfile, pids, p = inject_and_check(
             ["inject", "-n", "16", "-s", "42", "--no-user", "--verify"],
-            tmp, 16)
+            tmp, 16, expect_failure=emulated())
         m = re.search(r"(\d+) outside 128 kB", p.stdout)
         if m and int(m.group(1)) != 0:
             fail(f"{m.group(1)} stubs outside 128 kB")
