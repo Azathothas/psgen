@@ -538,10 +538,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(".psgen-test-{}-a", sys::getpid()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("p.pid");
-        let body = format!(
-            "# psgen {} boot abc\n1\t2\tcomm\n",
-            crate::version::VERSION
-        );
+        let body = format!("# psgen {} boot abc\n1\t2\tcomm\n", crate::version::VERSION);
         std::fs::write(&path, body.as_bytes()).unwrap();
         let bytes = path.as_os_str().as_bytes().to_vec();
         assert!(pidfile_target_ok(&bytes));

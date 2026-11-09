@@ -1492,9 +1492,11 @@ def check_regressions2(tmp):
 
     # A newline in argv must not split a row.
     script = ("import subprocess,time,sys;"
-              "p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(8)',"
-              "'line1\\nline2','tab\\there']);time.sleep(1)")
-    helper = subprocess.Popen([sys.executable, "-c", script])
+              "p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)',"
+              "'line1\\nline2','tab\\there','','empty-argv']);print(p.pid,flush=True);"
+              "time.sleep(30)")
+    helper = subprocess.Popen([sys.executable, "-c", script],
+                              stdout=subprocess.PIPE, text=True)
     try:
         time.sleep(0.8)
         wide = run(["table", "--live"]).stdout
@@ -1508,9 +1510,28 @@ def check_regressions2(tmp):
         bad = [l for l in wide.splitlines() if l.startswith("line2")]
         if bad:
             fail("#3: a newline in argv split a live table row")
+        # The empty argv elements must survive as the extra spaces `ps` shows.
+        inner = int(helper.stdout.readline().strip())
+        mine = None
+        for line in wide.splitlines():
+            m = PS_RE.match(line)
+            if m and int(m.group("pid")) == inner:
+                mine = m.group("cmd")
+                break
+        ps_args = subprocess.run(["ps", "-o", "args=", "-p", str(inner)],
+                                 stdout=subprocess.PIPE, text=True,
+                                 timeout=30).stdout.strip()
+        if mine is None:
+            fail("#3: the empty-argv process is missing from the live table")
+        if mine != ps_args:
+            fail(f"#3: live cmd {mine!r} != ps {ps_args!r} for an empty argv element")
     finally:
         helper.kill()
         helper.wait()
+        try:
+            os.kill(inner, 9)
+        except (ProcessLookupError, UnboundLocalError, OSError):
+            pass
 
     # #9: an option that does not apply to the subcommand is an error.
     for args in (["stop", "-n", "40", "--pidfile", str(Path(tmp) / "x.pid")],

@@ -137,13 +137,9 @@ fn read_cmdline(pid: i32) -> Vec<u8> {
     let mut out = Vec::with_capacity(n);
     for b in &buf[..n] {
         match *b {
-            0 => {
-                // Runs of NUL (an empty argv element) collapse to one space,
-                // which is what `ps` shows.
-                if out.last() != Some(&b' ') {
-                    out.push(b' ');
-                }
-            }
+            // Every NUL is a separator, so an empty argv element shows up as an
+            // extra space, which is exactly what `ps` prints for one.
+            0 => out.push(b' '),
             // `ps` never writes a raw line break into COMMAND: it would split
             // the row and lose every column after it. Any other control byte
             // becomes `?`.
@@ -152,7 +148,12 @@ fn read_cmdline(pid: i32) -> Vec<u8> {
             _ => out.push(*b),
         }
     }
-    str::trim(&out).to_vec()
+    // `/proc/PID/cmdline` ends with a NUL, so the joined form ends with a
+    // space that `ps` does not print.
+    while out.last() == Some(&b' ') {
+        out.pop();
+    }
+    out
 }
 
 fn tty_name(tty_nr: i64) -> Vec<u8> {
