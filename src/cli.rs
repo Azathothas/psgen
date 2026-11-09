@@ -1287,7 +1287,7 @@ fn shortfall(family: Option<u8>, got: usize, want: usize, list: bool) {
     if list {
         out.push_str("; a list never repeats a command (use --no-uniq to pad)");
     } else {
-        out.push_str(" without repeating a command a host would not repeat");
+        out.push_str(" without putting one command in more than a small share of the rows");
     }
     out.push(b'\n');
     sys::err(out.as_bytes());
@@ -1810,16 +1810,28 @@ pub fn run() -> i32 {
             // pending rewrite would erase the only record of the old run, and
             // the old stubs would outlive `stop`.
             if let Some(p) = &args.pidfile {
-                if inject::live_pidfile_rows(p) > 0 {
-                    let mut out = Buf::new();
-                    out.push_str("psgen: the pidfile ");
-                    out.push_bytes(p);
-                    out.push_str(
-                        " records live processes; stop them first or choose another --pidfile",
-                    );
-                    out.push(b'\n');
-                    sys::err(out.as_bytes());
-                    return 2;
+                match inject::live_pidfile_rows(p) {
+                    Some(0) => {}
+                    Some(_) => {
+                        let mut out = Buf::new();
+                        out.push_str("psgen: the pidfile ");
+                        out.push_bytes(p);
+                        out.push_str(
+                            " records live processes; stop them first or choose another --pidfile",
+                        );
+                        out.push(b'\n');
+                        sys::err(out.as_bytes());
+                        return 2;
+                    }
+                    None => {
+                        let mut out = Buf::new();
+                        out.push_str("psgen: cannot read the existing pidfile ");
+                        out.push_bytes(p);
+                        out.push_str("; remove it or choose another --pidfile");
+                        out.push(b'\n');
+                        sys::err(out.as_bytes());
+                        return 2;
+                    }
                 }
             }
 

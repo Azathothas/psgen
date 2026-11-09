@@ -1317,6 +1317,11 @@ pub fn safe_temp_dir(t: &[u8]) -> bool {
     if !p.is_absolute() {
         return false;
     }
+    // A FUSE daemon can report any owner and file type. A root run must not
+    // write into or execute from a directory whose metadata it cannot trust.
+    if sys::geteuid() == 0 && sys::path_fs_type(t) == Some(sys::FUSE_SUPER_MAGIC) {
+        return false;
+    }
     let meta = match std::fs::symlink_metadata(p) {
         Ok(m) => m,
         Err(_) => return false,
@@ -1476,10 +1481,21 @@ fn parse_stop_line(line: &[u8]) -> Option<StopLine> {
 /// still exists. Re-injecting over a live pidfile used to orphan the first
 /// run's stubs: the second run rewrote the file and pruned the first run's
 /// staging directories, and `stop` then had no record of the old PIDs.
-pub fn live_pidfile_rows(path: &[u8]) -> usize {
+/// `None` means the file exists but could not be read, so the caller must not
+/// assume it is safe to overwrite.
+pub fn live_pidfile_rows(path: &[u8]) -> Option<usize> {
     let text = match sys::read_file_nofollow(path, 1 << 20) {
         Some(t) => t,
-        None => return 0,
+        None => {
+            // A file that exists but cannot be read or is too large must not
+            // be treated as empty: that would let a second run overwrite the
+            // only record of the first. Report the uncertainty to the caller.
+            return if Path::new(std::ffi::OsStr::from_bytes(path)).exists() {
+                None
+            } else {
+                Some(0)
+            };
+        }
     };
     let mut live_rows = 0usize;
     for raw in text.split(|b| *b == b'\n') {
@@ -1491,18 +1507,14 @@ pub fn live_pidfile_rows(path: &[u8]) -> usize {
             None => continue,
         };
         let alive = match line.start {
-            Some(start) => live::read_starttime(line.pid) == Some(start),
-            None => {
-                let mut procpath = b"/proc/".to_vec();
-                procpath.extend_from_slice(line.pid.to_string().as_bytes());
-                Path::new(std::ffi::OsStr::from_bytes(&procpath)).exists()
-            }
+            Some(start) => live::read_starttime(line.pid) == Some(start) && live::alive(line.pid),
+            None => live::alive(line.pid),
         };
         if alive {
             live_rows += 1;
         }
     }
-    live_rows
+    Some(live_rows)
 }
 
 /// How many pidfile rows lie between a row and the top of its tree.
@@ -1692,16 +1704,19 @@ pub fn stop(path: &[u8], force: bool, plan: bool, quiet: bool) -> i32 {
             // for a process the caller cannot stop.
             if !sys::kill(pid, 0) {
                 let err = sys::last_error().raw_os_error();
+                if err == Some(libc::ESRCH) {
+                    skipped += 1;
+                    note(quiet, b"skip", pid, Some(b"already gone"));
+                    continue;
+                }
                 if err == Some(libc::EPERM) {
                     failed += 1;
                     note(quiet, b"cannot signal", pid, Some(b"permission denied"));
                     continue;
                 }
-                if err != Some(libc::ESRCH) {
-                    failed += 1;
-                    note(quiet, b"cannot signal", pid, None);
-                    continue;
-                }
+                failed += 1;
+                note(quiet, b"cannot signal", pid, None);
+                continue;
             }
             if !quiet {
                 let comm = live::read_comm(pid).unwrap_or_default();
