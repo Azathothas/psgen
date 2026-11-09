@@ -149,7 +149,7 @@ pub fn render(rows: &[Proc], mem_total_kb: u64, offset_min: i64, local: bool, pa
         let mem = if mem_total_kb == 0 {
             0
         } else {
-            (rss * 1000 / mem_total_kb) as u32
+            ((rss * 1000 + mem_total_kb / 2) / mem_total_kb) as u32
         };
         out.push_tenths_width(mem, 4);
         out.push(b' ');

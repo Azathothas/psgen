@@ -162,8 +162,16 @@ fn tty_name(tty_nr: i64) -> Vec<u8> {
         b.v
     } else if major == 4 {
         let mut b = Buf::new();
-        b.push_str("tty");
-        b.push_u64(minor as u64);
+        // Minor 0..63 is ttyN. Minor 64.. are the serial ports, which
+        // Linux names ttyS0, ttyS1 and so on. Printing tty64 for 4:64
+        // named a device that does not exist.
+        if minor >= 64 {
+            b.push_str("ttyS");
+            b.push_u64((minor - 64) as u64);
+        } else {
+            b.push_str("tty");
+            b.push_u64(minor as u64);
+        }
         b.v
     } else {
         Vec::new()
