@@ -132,6 +132,11 @@ def read_pids(path, root=False):
     return pids
 
 
+def exe_known() -> bool:
+    """False when /proc/PID/exe would describe the emulator, not psgen."""
+    return not emulated()
+
+
 def read_exe(pid, root=False):
     if root:
         p = subprocess.run(["sudo", "-n", "readlink", f"/proc/{pid}/exe"],
@@ -574,12 +579,12 @@ def check_injection():
         checked = 0
         for pid in pids:
             raw = cmdline(pid)
-            got = read_exe(pid)
-            if emulated():
+            if not exe_known():
                 # qemu-user makes /proc/PID/exe the emulator, so the comparison
                 # is not about psgen at all.
                 checked += 1
                 continue
+            got = read_exe(pid)
             if Path(got).resolve() == BIN.resolve():
                 checked += 1
                 continue
@@ -599,7 +604,7 @@ def check_injection():
         pidfile, pids, _ = inject_and_check(
             ["inject", "-n", "4", "-s", "9", "--no-user", "--no-exe",
              "--no-mem", "--no-tty", "--no-threads"], tmp, 4)
-        if not emulated():
+        if exe_known():
             for pid in pids:
                 if Path(read_exe(pid)).resolve() != BIN.resolve():
                     fail(f"pid {pid} --no-exe exe is {read_exe(pid)}")
@@ -609,11 +614,9 @@ def check_injection():
             ["inject", "-f", "db", "-n", "6", "-s", "1", "--no-user",
              "--no-mem", "--no-tty", "--no-threads"], tmp, 6)
         for pid in pids:
-            exe = read_exe(pid)
-            # Under qemu-user /proc/PID/exe is the emulator, which says nothing
-            # about the exe tier.
-            if emulated():
+            if not exe_known():
                 continue
+            exe = read_exe(pid)
             if Path(exe).resolve() == BIN.resolve():
                 continue
             # A host that has the template binary binds it; the documented
@@ -1151,7 +1154,7 @@ def check_inject_flags():
              "--no-tty", "--no-threads"], tmp, 2)
         if "disables user switching" not in p.stderr:
             fail("--no-root did not explain itself")
-        if not emulated():
+        if exe_known():
             for pid in pids:
                 if Path(read_exe(pid)).resolve() != BIN.resolve():
                     fail(f"--no-root pid {pid} exe is {read_exe(pid)}")
@@ -1162,6 +1165,8 @@ def check_inject_flags():
             ["inject", "-n", "2", "-s", "3", "--no-root", "--no-mem",
              "--no-tty", "--no-threads", "--shadow-dir", str(shadow)], tmp, 2)
         for pid in pids:
+            if not exe_known():
+                continue
             exe = read_exe(pid)
             if not exe.startswith(str(shadow) + "/"):
                 fail(f"--shadow-dir pid {pid} exe is {exe}")
@@ -1172,7 +1177,7 @@ def check_inject_flags():
         pidfile, pids, _ = inject_and_check(
             ["inject", "-n", "2", "-s", "3", "--allow-proc-exe", "--no-user",
              "--no-mem", "--no-tty", "--no-threads"], tmp, 2)
-        if not emulated():
+        if exe_known():
             for pid in pids:
                 if Path(read_exe(pid)).resolve() != BIN.resolve():
                     fail(f"--allow-proc-exe pid {pid} exe is {read_exe(pid)}")
