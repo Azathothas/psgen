@@ -5,6 +5,7 @@ use crate::rng::Rng;
 use crate::str::{self, Buf};
 use crate::sys;
 use crate::util;
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -39,6 +40,84 @@ pub struct Opts {
 /// binary, its loader and one malloc arena sit below this; the synthetic RSS
 /// is clamped so that base plus RSS still fits the template's VSZ.
 pub const BASE_RESERVE_KB: u32 = 4096;
+
+/// Host limits a synthetic table has to respect. The corpus carries absolute
+/// sizes, so on a host smaller than the largest template the rows would claim
+/// more RSS than exists and a `%MEM` above 100.
+pub struct Fit {
+    /// The memory budget a row may claim, in kB. 0 means "unknown, do not fit".
+    pub mem_kb: u64,
+    /// `/proc/sys/kernel/pid_max`, or 0 when it cannot be read.
+    pub pid_max: u64,
+}
+
+impl Fit {
+    /// The limits of this host: MemTotal, lowered to the cgroup limit when
+    /// that is smaller, and pid_max.
+    pub fn host() -> Fit {
+        let mut mem = util::mem_total_kb();
+        let cg = util::cgroup_mem_limit_kb();
+        if cg > 0 && (mem == 0 || cg < mem) {
+            mem = cg;
+        }
+        Fit {
+            mem_kb: mem,
+            pid_max: util::pid_max(),
+        }
+    }
+
+    /// No fitting: used where the caller already planned sizes (inject).
+    pub fn none() -> Fit {
+        Fit {
+            mem_kb: 0,
+            pid_max: util::pid_max(),
+        }
+    }
+}
+
+/// How many times one template may contribute rows to a single population.
+///
+/// `inst` raises the bound for the daemons that really do run several
+/// instances. A table with one command 74 times, or two `cargo build` jobs
+/// per core, is not a table any host shows.
+fn repeat_cap(t: &Tmpl, _want: usize) -> usize {
+    let inst = if t.inst == 0 { 1 } else { t.inst as usize };
+    // A realistic table shows each fixed command a handful of times, not
+    // dozens. Spreading the repeats by the number of repeatable templates in
+    // scope (see `fill`) keeps a large request from collapsing onto one row.
+    (inst * 2).clamp(4, 16)
+}
+
+/// Whether a template may be picked more than once in one run.
+///
+/// `inst` says how many rows a template represents (six nginx workers), which
+/// is not the same question as "may this command appear twice". A template
+/// with a placeholder produces a different command line every time, so it may
+/// repeat; a fixed single-instance daemon may not. `F_REPEAT` marks the rows
+/// that legitimately appear more than once on a real host (builds, sessions,
+/// shims).
+/// `inst` says how many rows one draw emits, which is not the same question as
+/// "may this template be drawn again". Re-picking is allowed for the rows
+/// marked `F_REPEAT` and for a template whose placeholder changes the command
+/// line; anything else would put the same command in the table twice.
+pub fn repeatable(t: &Tmpl) -> bool {
+    t.flags & corpus::F_REPEAT != 0 || has_variants(t)
+}
+
+/// The placeholders that expand to a different value every time.
+///
+/// `{user}` and `{uid}` are fixed for a whole run, so a template whose only
+/// placeholder is one of those produces the same command line on every draw:
+/// it may appear once, and it cannot pad a large count.
+const VARIABLE_PLACEHOLDERS: &[&str] = &[
+    "{hex6}", "{hex8}", "{hex12}", "{hex64}", "{n}", "{n2}", "{pid}", "{port}", "{cport}", "{ip}",
+];
+
+/// Whether re-expanding this template can yield a different command line,
+/// which is what makes it usable as padding for a large count.
+pub fn has_variants(t: &Tmpl) -> bool {
+    VARIABLE_PLACEHOLDERS.iter().any(|p| t.cmd.contains(p))
+}
 
 const COMMON_PORTS: [u16; 14] = [
     80, 443, 3000, 5000, 5432, 6379, 8000, 8080, 8443, 9000, 9090, 11211, 27017, 9200,
@@ -150,6 +229,31 @@ fn weighted_index(rng: &mut Rng, weights: &[u16; 10], family: Option<u8>) -> usi
     0
 }
 
+/// Draw one index from `pool` with probability proportional to its template's
+/// weight, and return its position in `pool`.
+fn weighted_pick(pool: &[usize], rng: &mut Rng, weights: &[u16; 10]) -> usize {
+    let total: u64 = pool
+        .iter()
+        .map(|i| {
+            let t = &corpus::CORPUS[*i];
+            weights[t.fam as usize] as u64 * t.weight as u64
+        })
+        .sum();
+    if total == 0 {
+        return 0;
+    }
+    let mut n = rng.below(total);
+    for (pos, idx) in pool.iter().enumerate() {
+        let t = &corpus::CORPUS[*idx];
+        let w = weights[t.fam as usize] as u64 * t.weight as u64;
+        if n < w {
+            return pos;
+        }
+        n -= w;
+    }
+    0
+}
+
 /// Single-instance daemons are picked at most once, so a generated table does
 /// not show two sshd listeners or two PID-1 processes. Build tools and desktop
 /// applications are allowed to repeat.
@@ -158,9 +262,7 @@ fn pick_index(rng: &mut Rng, weights: &[u16; 10], family: Option<u8>, used: &[us
     for _ in 0..80 {
         let idx = weighted_index(rng, weights, family);
         let t = &corpus::CORPUS[idx];
-        let single = t.inst <= 1;
-        let unique_family = t.fam != corpus::FAM_DEV;
-        if single && unique_family && used.contains(&idx) {
+        if !repeatable(t) && used.contains(&idx) {
             fallback = idx;
             continue;
         }
@@ -210,33 +312,27 @@ fn make_proc(t: &Tmpl, tmpl: usize, rng: &mut Rng, opts: &Opts, uptime: u64) -> 
     if room > 0 && rss > room {
         rss = room;
     }
-    let mut cpu = t.cpu as i32 + rng.range(0, 4) as i32 - 2;
-    if cpu < 0 {
-        cpu = 0;
-    }
-    if cpu > 999 {
-        cpu = 999;
-    }
+    let cpu = (t.cpu as i32 + rng.range(0, 4) as i32 - 2).clamp(0, 999);
     let age = if t.flags & (corpus::F_LONG | corpus::F_SESSION) != 0 {
-        let base = uptime.saturating_sub(rng.range(0, 90));
+        // One draw with a fixed modulus: a second draw on a short-uptime
+        // host would move every later value in the stream and break the
+        // same-seed contract.
+        let base = uptime.saturating_sub(rng.fraction(90));
         if base == 0 {
-            rng.range(30, 600)
+            30 + rng.fraction(570)
         } else {
             base
         }
     } else if t.flags & (corpus::F_BUSY | corpus::F_SHORT) != 0 {
         rng.range(3, 1800)
     } else if t.flags & corpus::F_CHILD != 0 {
-        let up = uptime.max(60);
         // Pick a boot-relative start with a fixed-point draw. A plain
         // rng.range(5, up) reduces a fresh random word modulo `up`, and
         // `up` grows by one every second, so the same seed produced a
         // different age on every run. Scaling a 32-bit draw keeps the
         // start stable to within a second as uptime advances.
-        let span = up.saturating_sub(5).max(1);
-        let draw = rng.next_u64() >> 32;
-        let offset = span.saturating_mul(draw) / (1u64 << 32);
-        up.saturating_sub(offset)
+        let up = uptime.max(60);
+        up.saturating_sub(rng.fraction(up.saturating_sub(5).max(1)))
     } else if t.fam == corpus::FAM_DEV {
         rng.range(5, 6 * 3600)
     } else if t.fam == corpus::FAM_DESK {
@@ -325,19 +421,18 @@ pub fn all_commands(rng: &mut Rng, opts: &Opts) -> Vec<Vec<u8>> {
 }
 
 /// Generate `count` command lines (distinct unless `--no-uniq`). `count == 0`
-/// means one per template. Beyond the template count, placeholders are
-/// re-expanded to produce new variants.
+/// means one per template.
+///
+/// A theme is drawn first, so `-p` is honoured for the short and long cases
+/// alike: the list keeps the corpus order that `tests/invariants.py` and the
+/// README promise for the first row, but which templates are picked and how
+/// often is weighted by the profile.
 pub fn gen_list(rng: &mut Rng, opts: &Opts) -> Vec<Vec<u8>> {
     let mut out: Vec<Vec<u8>> = Vec::new();
-    let mut seen: Vec<Vec<u8>> = Vec::new();
+    // A BTreeSet keeps the duplicate check O(log n) per line: the linear scan
+    // over every line already kept made `list -n 2000` quadratic.
+    let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
     let uniq = opts.uniq;
-    let push = |cmd: Vec<u8>, out: &mut Vec<Vec<u8>>, seen: &mut Vec<Vec<u8>>| {
-        if !uniq || !seen.iter().any(|s| s == &cmd) {
-            seen.push(cmd.clone());
-            out.push(cmd);
-        }
-    };
-
     if opts.count == 0 {
         for t in corpus::CORPUS.iter() {
             if let Some(f) = opts.family {
@@ -345,47 +440,93 @@ pub fn gen_list(rng: &mut Rng, opts: &Opts) -> Vec<Vec<u8>> {
                     continue;
                 }
             }
-            push(expand(t.cmd, rng, &opts.self_user, None), &mut out, &mut seen);
+            out.push(expand(t.cmd, rng, &opts.self_user, None));
         }
         return out;
     }
 
     let weights = corpus::profile_weights(&opts.profile);
-    // The corpus can only produce so many distinct lines. Placeholder-bearing
-    // templates have many variants; fixed ones have exactly one. Capping here
-    // keeps memory bounded while duplicates are rejected.
     let target = opts.count.min(2000);
+    let push = |cmd: Vec<u8>, out: &mut Vec<Vec<u8>>, seen: &mut BTreeSet<Vec<u8>>| {
+        if !uniq || seen.insert(cmd.clone()) {
+            out.push(cmd);
+        }
+    };
+
+    // First pass: each in-scope template once. The first line is the first
+    // in-scope corpus row, which the README and tests/invariants.py promise;
+    // the rest are drawn by profile weight, so `-p` changes a short list too
+    // instead of only the rows above the template count.
     let mut fixed_used: Vec<usize> = Vec::new();
-    // First pass: the first `target` templates in corpus order.
+    let mut drawn: Vec<usize> = Vec::new();
     for (idx, t) in corpus::CORPUS.iter().enumerate() {
-        if out.len() >= target {
+        if opts.family.map(|f| f == t.fam).unwrap_or(true) {
+            drawn.push(idx);
+            push(
+                expand(t.cmd, rng, &opts.self_user, None),
+                &mut out,
+                &mut seen,
+            );
+            fixed_used.push(idx);
             break;
         }
+    }
+    let mut pool: Vec<usize> = Vec::new();
+    for (idx, t) in corpus::CORPUS.iter().enumerate() {
         if let Some(f) = opts.family {
             if t.fam != f {
                 continue;
             }
         }
-        push(expand(t.cmd, rng, &opts.self_user, None), &mut out, &mut seen);
-        if !t.cmd.contains('{') {
+        if !drawn.contains(&idx) {
+            pool.push(idx);
+        }
+    }
+    while out.len() < target && !pool.is_empty() {
+        let pick = weighted_pick(&pool, rng, &weights);
+        let idx = pool.swap_remove(pick);
+        let t = &corpus::CORPUS[idx];
+        push(
+            expand(t.cmd, rng, &opts.self_user, None),
+            &mut out,
+            &mut seen,
+        );
+        if !has_variants(t) {
             fixed_used.push(idx);
         }
     }
-    // Second pass: weighted variants until the requested count is reached.
+
+    // Second pass: weighted draws to fill the remainder. Only templates that
+    // can produce a new command line (placeholders) are useful here; a fixed
+    // command cannot add a distinct line, so retrying it is wasted work.
     let mut guard = 0usize;
-    while out.len() < target && guard < target * 40 + 1000 {
+    let limit = target.saturating_mul(40).saturating_add(1000);
+    while out.len() < target && guard < limit {
         let idx = weighted_index(rng, &weights, opts.family);
         let t = &corpus::CORPUS[idx];
-        if !t.cmd.contains('{') && fixed_used.contains(&idx) {
-            guard += 1;
+        guard += 1;
+        if !has_variants(t) {
+            if fixed_used.contains(&idx) {
+                continue;
+            }
+            fixed_used.push(idx);
+            push(
+                expand(t.cmd, rng, &opts.self_user, None),
+                &mut out,
+                &mut seen,
+            );
             continue;
         }
-        push(expand(t.cmd, rng, &opts.self_user, None), &mut out, &mut seen);
-        if !t.cmd.contains('{') {
-            fixed_used.push(idx);
-        }
-        guard += 1;
+        push(
+            expand(t.cmd, rng, &opts.self_user, None),
+            &mut out,
+            &mut seen,
+        );
     }
+
+    // The profile pass skipped the corpus-order prefix once the target was
+    // reached; a target above the template count has already been filled by
+    // the weighted loop above.
     out
 }
 
@@ -428,9 +569,48 @@ fn parent_index(idx: usize) -> Option<usize> {
     }
 }
 
+/// PIDs drawn for a synthetic table stay below `pid_max`, which is 32768 on
+/// some embedded and container-tuned kernels. The sequence wraps rather than
+/// running past it.
+struct Pids {
+    next: i64,
+    max: i64,
+    base: i64,
+}
+
+impl Pids {
+    fn new(rng: &mut Rng, fit: &Fit) -> Pids {
+        let max = if fit.pid_max >= 1024 {
+            fit.pid_max as i64 - 1
+        } else {
+            i64::MAX
+        };
+        let base = (rng.range(300, 2500) as i64).min(max.max(2));
+        Pids {
+            next: base,
+            max,
+            base,
+        }
+    }
+
+    fn step(&mut self, rng: &mut Rng) -> i32 {
+        let delta = rng.range(1, 24) as i64;
+        self.next = self.next.saturating_add(delta);
+        if self.next > self.max {
+            // Wrap to the low end rather than printing a PID the kernel
+            // cannot allocate.
+            self.next = self.base.max(2).saturating_add(delta);
+            if self.next > self.max {
+                self.next = 2;
+            }
+        }
+        self.next as i32
+    }
+}
+
 /// Generate a realistic `ps aux` population. PID 1 is init when the system
 /// family is in scope and the corpus contains it; daemons share the boot time.
-pub fn gen_table(rng: &mut Rng, opts: &Opts) -> Vec<Proc> {
+pub fn gen_table(rng: &mut Rng, opts: &Opts, fit: &Fit) -> Vec<Proc> {
     let weights = corpus::profile_weights(&opts.profile);
     let uptime = util::uptime_secs();
     let mut rows: Vec<Proc> = Vec::new();
@@ -448,23 +628,25 @@ pub fn gen_table(rng: &mut Rng, opts: &Opts) -> Vec<Proc> {
         }
     }
 
-    let mut pid = rng.range(300, 2500) as i32;
+    let mut pids = Pids::new(rng, fit);
     let mut guard = 0usize;
-    while rows.len() < want && guard < want * 40 + 1000 {
+    let limit = want.saturating_mul(40).saturating_add(1000);
+    let mut counts = vec![0usize; corpus::CORPUS.len()];
+    while rows.len() < want && guard < limit {
         let idx = pick_index(rng, &weights, opts.family, &used);
-        if corpus::CORPUS[idx].inst <= 1
-            && corpus::CORPUS[idx].fam != corpus::FAM_DEV
-            && used.contains(&idx)
+        guard += 1;
+        if counts[idx] > 0
+            && (!repeatable(&corpus::CORPUS[idx])
+                || counts[idx] >= repeat_cap(&corpus::CORPUS[idx], want))
         {
-            guard += 1;
             continue;
         }
+        counts[idx] += 1;
         if let Some(pidx) = parent_index(idx) {
             if pidx != idx && !used.contains(&pidx) && rows.len() < want {
                 let parent = &corpus::CORPUS[pidx];
                 let mut pp = make_proc(parent, pidx, rng, opts, uptime);
-                pid += rng.range(1, 24) as i32;
-                pp.pid = pid;
+                pp.pid = pids.step(rng);
                 rows.push(pp);
                 used.push(pidx);
             }
@@ -475,38 +657,144 @@ pub fn gen_table(rng: &mut Rng, opts: &Opts) -> Vec<Proc> {
         let take = instances.min(want - rows.len());
         for _ in 0..take {
             let mut p = make_proc(t, idx, rng, opts, uptime);
-            pid += rng.range(1, 24) as i32;
-            p.pid = pid;
+            p.pid = pids.step(rng);
             rows.push(p);
         }
-        guard += 1;
+    }
+    // Fill a large request from templates that produce a different command
+    // line every time. A fixed command is never repeated: `sys -n 200` used to
+    // come back as 120 copies of `sshd: user [priv]`, which is not a table a
+    // host could produce.
+    let mut pending: Vec<Proc> = Vec::new();
+    fill(
+        rng,
+        opts,
+        &weights,
+        &mut pending,
+        want.saturating_sub(rows.len()),
+        &mut counts,
+        uptime,
+    );
+    for mut p in pending {
+        p.pid = pids.step(rng);
+        rows.push(p);
     }
     rows.sort_unstable_by_key(|p| p.pid);
+    fit_rows(&mut rows, fit);
     rows
+}
+
+/// Fill a population up to `want` with rows the corpus can legitimately
+/// supply more than once.
+///
+/// `-n` is honoured (the tests and the README promise the count), but reaching
+/// a large count must not come from one command repeated without limit
+/// (`sys -n 200` used to be 120 copies of `sshd: user [priv]`). The remainder
+/// is handed out as a *quota* to the templates that may repeat, proportional to
+/// their weight, and each template then generates up to its quota. A template
+/// whose placeholder changes the command line is also allowed to repeat, so a
+/// quota never has to become duplicates of one string.
+fn fill(
+    rng: &mut Rng,
+    opts: &Opts,
+    weights: &[u16; 10],
+    out: &mut Vec<Proc>,
+    want: usize,
+    counts: &mut [usize],
+    uptime: u64,
+) {
+    if want == 0 {
+        return;
+    }
+    let mut candidates: Vec<usize> = Vec::new();
+    let mut total_w = 0u64;
+    for (idx, t) in corpus::CORPUS.iter().enumerate() {
+        if opts.family.map(|f| f != t.fam).unwrap_or(false) {
+            continue;
+        }
+        if t.cmd == "/sbin/init" {
+            continue;
+        }
+        if corpus::F_REPEAT & t.flags == 0 && !has_variants(t) {
+            continue;
+        }
+        // A worker added without its master would show PPID 1, which is the
+        // shape this fill pass exists to avoid; the main pass links them.
+        if parent_index(idx).map(|p| p != idx).unwrap_or(false) {
+            continue;
+        }
+        candidates.push(idx);
+        total_w += weights[t.fam as usize] as u64 * t.weight as u64;
+    }
+    if candidates.is_empty() || total_w == 0 {
+        return;
+    }
+    // Quota per candidate, in proportion to weight, at least one each.
+    let mut quota: Vec<usize> = Vec::with_capacity(candidates.len());
+    for idx in &candidates {
+        let t = &corpus::CORPUS[*idx];
+        let w = weights[t.fam as usize] as u64 * t.weight as u64;
+        quota.push((want as u64 * w / total_w) as usize);
+    }
+    // No single command may take more than a small share of the table: a host
+    // with 5000 processes has a handful of `cargo build` jobs, not a hundred.
+    let cap = (want / 50).max(4);
+    for q in quota.iter_mut() {
+        if *q > cap {
+            *q = cap;
+        }
+    }
+    let mut extra = want.saturating_sub(quota.iter().sum::<usize>());
+    // Any leftover goes round-robin, so it is spread instead of accumulating
+    // on the first candidate.
+    let mut pos = 0usize;
+    while extra > 0 {
+        quota[pos % candidates.len()] += 1;
+        pos += 1;
+        extra -= 1;
+    }
+    for (pos, idx) in candidates.iter().enumerate() {
+        let t = &corpus::CORPUS[*idx];
+        let mut made = 0usize;
+        let mut guard = 0usize;
+        while made < quota[pos] && guard < quota[pos].saturating_mul(8) + 16 {
+            guard += 1;
+            counts[*idx] += 1;
+            let mut p = make_proc(t, *idx, rng, opts, uptime);
+            p.parent = None;
+            out.push(p);
+            made += 1;
+        }
+    }
 }
 
 /// Generate processes for injection. The same population as `gen_table`, but
 /// no synthetic PIDs: the kernel assigns real ones.
-pub fn gen_inject(rng: &mut Rng, opts: &Opts) -> Vec<Proc> {
+pub fn gen_inject(rng: &mut Rng, opts: &Opts, fit: &Fit) -> Vec<Proc> {
     let weights = corpus::profile_weights(&opts.profile);
     let uptime = util::uptime_secs();
     let want = if opts.count == 0 { 12 } else { opts.count };
     let mut rows: Vec<Proc> = Vec::new();
     let mut used: Vec<usize> = Vec::new();
     let mut guard = 0usize;
-    while rows.len() < want && guard < want * 40 + 1000 {
+    let limit = want.saturating_mul(40).saturating_add(1000);
+    let mut counts = vec![0usize; corpus::CORPUS.len()];
+    while rows.len() < want && guard < limit {
         let idx = pick_index(rng, &weights, opts.family, &used);
+        guard += 1;
         if corpus::CORPUS[idx].cmd == "/sbin/init" {
-            guard += 1;
             continue;
         }
-        if corpus::CORPUS[idx].inst <= 1
-            && corpus::CORPUS[idx].fam != corpus::FAM_DEV
-            && used.contains(&idx)
+        // The first appearance of a template is always allowed; a second one
+        // needs a template that may repeat (`F_REPEAT`, or a placeholder that
+        // changes the command line) and room under its bound.
+        if counts[idx] > 0
+            && (!repeatable(&corpus::CORPUS[idx])
+                || counts[idx] >= repeat_cap(&corpus::CORPUS[idx], want))
         {
-            guard += 1;
             continue;
         }
+        counts[idx] += 1;
         let parent_row = if let Some(pidx) = parent_index(idx) {
             if pidx != idx && !used.contains(&pidx) && rows.len() < want {
                 let mut pp = make_proc(&corpus::CORPUS[pidx], pidx, rng, opts, uptime);
@@ -529,9 +817,66 @@ pub fn gen_inject(rng: &mut Rng, opts: &Opts) -> Vec<Proc> {
             p.parent = parent_row;
             rows.push(p);
         }
-        guard += 1;
     }
+    // See pad_table: only a template with a placeholder can add a row without
+    // repeating a command line.
+    let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
+    let mut pad_guard = 0usize;
+    let pad_limit = want.saturating_mul(40).saturating_add(1000);
+    while rows.len() < want && pad_guard < pad_limit {
+        pad_guard += 1;
+        let idx = weighted_index(rng, &weights, opts.family);
+        if counts[idx] >= repeat_cap(&corpus::CORPUS[idx], want) {
+            continue;
+        }
+        counts[idx] += 1;
+        let mut p = make_proc(&corpus::CORPUS[idx], idx, rng, opts, uptime);
+        if !seen.insert(p.cmd.clone()) {
+            continue;
+        }
+        p.parent = None;
+        rows.push(p);
+    }
+    fit_rows(&mut rows, fit);
     rows
+}
+
+/// Lower any planned size a row cannot physically have on this host.
+///
+/// The corpus carries absolute VSZ/RSS values, so on a container smaller than
+/// the largest template the table would claim more RSS than exists and a
+/// `%MEM` above 100. The relative shape is kept: every scale is applied to the
+/// whole population, never to one row.
+pub fn fit_rows(rows: &mut [Proc], fit: &Fit) {
+    if fit.mem_kb == 0 || rows.is_empty() {
+        return;
+    }
+    let page = sys::page_kb().max(1);
+    let budget = fit.mem_kb.saturating_sub(fit.mem_kb / 20).max(page);
+    let total: u64 = rows.iter().map(|p| p.rss as u64).sum();
+    if total > budget {
+        // The sum of every RSS is the strictest reading: a real host can hold
+        // them all resident at once. Scale every row by the same factor, with
+        // one page as the floor so a tiny template is not reduced to nothing.
+        let factor = budget as f64 / total as f64;
+        for p in rows.iter_mut() {
+            let v = ((p.rss as f64) * factor).max(page as f64);
+            p.rss = crate::table::round_up(v as u64, page).min(u32::MAX as u64) as u32;
+            if p.vsz < p.rss {
+                p.vsz = p.rss;
+            }
+        }
+    }
+    // A single row still cannot exceed the host, whatever the sum says.
+    for p in rows.iter_mut() {
+        let cap = budget.min(u32::MAX as u64);
+        if p.rss as u64 > cap {
+            p.rss = crate::table::round_up(cap, page).min(u32::MAX as u64) as u32;
+        }
+        if p.vsz < p.rss {
+            p.vsz = p.rss;
+        }
+    }
 }
 
 fn is_file(path: &[u8]) -> bool {

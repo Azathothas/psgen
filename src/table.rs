@@ -44,8 +44,8 @@ fn start_field(out: &mut Buf, age: u64, offset_min: i64, local: bool) {
                 push_two(out, tm.tm_min as u64);
             } else if delta < 365 * 86400 {
                 const NAMES: [&str; 12] = [
-                    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct",
-                    "Nov", "Dec",
+                    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov",
+                    "Dec",
                 ];
                 out.push_str(NAMES[(tm.tm_mon.clamp(0, 11)) as usize]);
                 if tm.tm_mday < 10 {
@@ -134,10 +134,40 @@ pub fn round_up(v: u64, page_kb: u64) -> u64 {
     v.div_ceil(page_kb) * page_kb
 }
 
+/// The memory `%MEM` is a percentage of: MemTotal, lowered to the cgroup
+/// limit when that is smaller. A container with a 1 GiB limit reports `%MEM`
+/// against 1 GiB, which is what `ps` does there too.
+pub fn mem_budget_kb() -> u64 {
+    let mut mem = crate::util::mem_total_kb();
+    let cg = crate::util::cgroup_mem_limit_kb();
+    if cg > 0 && (mem == 0 || cg < mem) {
+        mem = cg;
+    }
+    mem
+}
+
+/// Header column offsets, from the header printed below. A numeric field that
+/// overflows its slot eats the padding after it, the way procps does, instead
+/// of pushing STAT, START, TIME and COMMAND to the right.
+const STAT_COL: usize = 49;
+const START_COL: usize = 54;
+const TIME_COL: usize = 62;
+
+fn pad_to(out: &mut Buf, row_start: usize, col: usize) {
+    if out.v.len() - row_start < col {
+        while out.v.len() - row_start < col {
+            out.push(b' ');
+        }
+    } else {
+        out.push(b' ');
+    }
+}
+
 pub fn render(rows: &[Proc], mem_total_kb: u64, offset_min: i64, local: bool, page_kb: u64) -> Buf {
     let mut out = Buf::with_capacity(rows.len() * 120 + 128);
     out.push_str("USER         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND\n");
     for p in rows {
+        let row_start = out.v.len();
         let vsz = round_up(p.vsz as u64, page_kb);
         let rss = round_up(p.rss as u64, page_kb);
         user_field(&mut out, &p.user);
@@ -146,39 +176,35 @@ pub fn render(rows: &[Proc], mem_total_kb: u64, offset_min: i64, local: bool, pa
         out.push(b' ');
         out.push_tenths_width(p.cpu as u32, 4);
         out.push(b' ');
-        let mem = if mem_total_kb == 0 {
-            0
-        } else {
-            ((rss * 1000 + mem_total_kb / 2) / mem_total_kb) as u32
-        };
+        // One process cannot use more than the whole machine, and the field is
+        // four characters wide: 100.0 would shift every column after it.
+        let mem = (rss * 1000 + mem_total_kb / 2)
+            .checked_div(mem_total_kb)
+            .unwrap_or(0)
+            .min(999) as u32;
         out.push_tenths_width(mem, 4);
         out.push(b' ');
         out.push_u64_width(vsz, 6);
         out.push(b' ');
         out.push_u64_width(rss, 5);
         out.push(b' ');
-        let tty_start = out.v.len();
         tty_field(&mut out, p);
-        let tty_len = out.v.len() - tty_start;
-        let mut pad = 8usize.saturating_sub(tty_len);
-        while pad > 0 {
-            out.push(b' ');
-            pad -= 1;
-        }
-        out.push(b' ');
+        pad_to(&mut out, row_start, STAT_COL);
         stat_field(&mut out, p);
-        out.push(b' ');
+        pad_to(&mut out, row_start, START_COL);
         start_field(&mut out, p.age, offset_min, local);
-        out.push(b' ');
+        // TIME is right-aligned in its six columns and COMMAND follows one
+        // space later, so COMMAND starts at the header offset whatever the
+        // time is.
+        pad_to(&mut out, row_start, TIME_COL - 2);
         let time_secs = p.age.saturating_mul(p.cpu as u64) / 1000;
         let time_start = out.v.len();
         out.push_time(time_secs);
         let time_len = out.v.len() - time_start;
         if time_len < 6 {
-            let mut pad = 6 - time_len;
-            while pad > 0 {
+            let pad = 6 - time_len;
+            for _ in 0..pad {
                 out.v.insert(time_start, b' ');
-                pad -= 1;
             }
         }
         out.push(b' ');

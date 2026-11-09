@@ -14,6 +14,13 @@ use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::vec::Vec;
 
+/// Largest `--lines` a single run may ask for. The buffer holds a burst of
+/// rows per event, so this is a bound on memory, not on usefulness.
+pub const MAX_LOG_LINES: usize = 200_000;
+
+/// Flush the log buffer at this size when there is no `--delay`.
+const FLUSH_BYTES: usize = 64 * 1024;
+
 pub const MODULES: &[&str] = &[
     "weblog",
     "bootlog",
@@ -85,7 +92,9 @@ fn web_record(rng: &mut Rng) -> WebRecord {
     WebRecord {
         ip: loggen::rand_ip(rng),
         method: if rng.below(12) == 0 { "POST" } else { "GET" },
-        path: PATHS[rng.below(PATHS.len() as u64) as usize].as_bytes().to_vec(),
+        path: PATHS[rng.below(PATHS.len() as u64) as usize]
+            .as_bytes()
+            .to_vec(),
         status: loggen::pick_status(rng),
         bytes: if rng.below(5) == 0 {
             rng.range(0, 400)
@@ -127,8 +136,10 @@ fn bootlog(rng: &mut Rng, now: u64) -> Vec<u8> {
     let minor = rng.range(1, 18);
     let patch = rng.range(1, 120);
     let cpu = ["GenuineIntel", "AuthenticAMD"][rng.below(2) as usize];
-    let model = ["Intel(R) Xeon(R) Gold 6338 CPU @ 2.00GHz", "AMD EPYC 7B13 64-Core Processor"]
-        [rng.below(2) as usize];
+    let model = [
+        "Intel(R) Xeon(R) Gold 6338 CPU @ 2.00GHz",
+        "AMD EPYC 7B13 64-Core Processor",
+    ][rng.below(2) as usize];
     b.push_str("[    0.000000] Linux version ");
     b.push_u64(major);
     b.push(b'.');
@@ -208,7 +219,13 @@ fn cc(rng: &mut Rng) -> Vec<u8> {
 }
 
 fn download(rng: &mut Rng) -> Vec<u8> {
-    let names = ["pkgforge", "toolchain", "nightly", "vendored-src", "data-dump"];
+    let names = [
+        "pkgforge",
+        "toolchain",
+        "nightly",
+        "vendored-src",
+        "data-dump",
+    ];
     let mut b = Buf::new();
     b.push_str("  % Total    % Received % Xferd  Average Speed\n");
     b.push_str("100 ");
@@ -391,9 +408,7 @@ fn julia(rng: &mut Rng) -> Vec<u8> {
 
 fn page(rng: &mut Rng, fmt: Format, module: &[u8], now: u64) -> Option<Vec<u8>> {
     let out = match module {
-        b"weblog" | b"access" | b"apache" | b"nginx" | b"web" | b"flog" => {
-            weblog(rng, fmt, now)
-        }
+        b"weblog" | b"access" | b"apache" | b"nginx" | b"web" | b"flog" => weblog(rng, fmt, now),
         b"bootlog" | b"boot" | b"dmesg" => bootlog(rng, now),
         b"cargo" | b"rustc" => cargo(rng),
         b"cc" | b"gcc" | b"make" => cc(rng),
@@ -478,9 +493,37 @@ fn module_known(module: &[u8]) -> bool {
     )
 }
 
+/// The aliases `module_known()` accepts for a canonical module name.
+fn aliases_for(module: &[u8]) -> Vec<&'static str> {
+    let table: &[(&[u8], &[&str])] = &[
+        (b"weblog", &["access", "apache", "nginx", "web", "flog"]),
+        (b"bootlog", &["boot", "dmesg"]),
+        (b"cargo", &["rustc"]),
+        (b"cc", &["gcc", "make"]),
+        (b"download", &["wget", "curl"]),
+        (b"docker_build", &["docker", "dockerbuild"]),
+        (b"docker_rmi", &["docker_rm", "dockerrmi"]),
+        (b"terraform", &["tf"]),
+        (b"ansible", &["playbook"]),
+        (b"kernel_compile", &["kernel"]),
+        (b"mkinitcpio", &[]),
+        (b"uv", &["pip"]),
+        (b"composer", &["php"]),
+        (b"julia", &[]),
+    ];
+    for (name, aliases) in table {
+        if *name == module {
+            return aliases.to_vec();
+        }
+    }
+    Vec::new()
+}
+
 pub fn run_log(args: &Args) -> i32 {
     let module = args.log_module.as_slice();
     if module == b"list" || module == b"modules" || module == b"help" {
+        // Every alias `module_known()` accepts is listed here, so the names
+        // that work are the names that are documented.
         let mut out = Buf::new();
         out.push_str("modules:");
         for m in MODULES {
@@ -488,6 +531,17 @@ pub fn run_log(args: &Args) -> i32 {
             out.push_str(m);
         }
         out.push(b'\n');
+        for m in MODULES {
+            let aliases = aliases_for(m.as_bytes());
+            if aliases.is_empty() {
+                continue;
+            }
+            out.push_str("  ");
+            out.push_str(m);
+            out.push_str(" (");
+            out.push_str(&aliases.join(", "));
+            out.push_str(")\n");
+        }
         sys::out(out.as_bytes());
         return 0;
     }
@@ -520,7 +574,17 @@ pub fn run_log(args: &Args) -> i32 {
         None => Rng::from_entropy(),
     };
     let now = sys::now_secs();
-    let lines = args.log_lines;
+    // A log generator has no reason to produce an unbounded amount of output,
+    // and with --delay 0 the buffer below holds a burst before it is written.
+    let hard = args.log_lines.min(MAX_LOG_LINES);
+    if args.log_lines > MAX_LOG_LINES {
+        let mut out = Buf::new();
+        out.push_str("psgen: log lines capped at ");
+        out.push_u64(MAX_LOG_LINES as u64);
+        out.push(b'\n');
+        sys::err(out.as_bytes());
+    }
+    let lines = hard;
     let mut emitted = Buf::new();
     for i in 0..lines {
         let chunk = match page(&mut rng, fmt, module, now + i as u64) {
@@ -563,13 +627,26 @@ pub fn run_log(args: &Args) -> i32 {
             emitted.push_bytes(&chunk);
         }
         if args.log_delay_ms > 0 && i + 1 < lines {
-            sys::out(emitted.as_bytes());
+            if !sys::out_checked(emitted.as_bytes()) {
+                // The reader is gone. EPIPE is not an error.
+                return 0;
+            }
             emitted = Buf::new();
             let ms = args.log_delay_ms / args.speed.max(1);
             sys::nanosleep(ms / 1000, (ms % 1000) * 1_000_000);
+        } else if emitted.v.len() >= FLUSH_BYTES {
+            // With no delay the buffer used to grow to the whole output before
+            // a single write. Flush on a bound, and stop when the reader has
+            // gone even if there is no delay to slow the loop down.
+            if !sys::out_checked(emitted.as_bytes()) {
+                return 0;
+            }
+            emitted = Buf::new();
         }
     }
-    sys::out(emitted.as_bytes());
+    if !sys::out_checked(emitted.as_bytes()) {
+        return 0;
+    }
     0
 }
 
@@ -628,8 +705,7 @@ pub fn run_load(args: &Args) -> i32 {
     let deadline = if secs == 0 {
         u64::MAX
     } else {
-        sys::monotonic_ns()
-            .saturating_add(secs.saturating_mul(1_000_000_000))
+        sys::monotonic_ns().saturating_add(secs.saturating_mul(1_000_000_000))
     };
 
     let mut note = Buf::new();
@@ -645,6 +721,23 @@ pub fn run_load(args: &Args) -> i32 {
             return 1;
         }
         let mem_kb = total * mem_pct as u64 / 100;
+        // MemTotal is the wrong denominator for "make the host look busy": on a
+        // host that is already half full, 95% of total is more than exists
+        // free, and the touch loop then invokes the OOM killer against its own
+        // caller. Refuse unless the caller says it means it.
+        let avail = util::mem_available_kb();
+        if avail > 0 && mem_kb > avail && !args.force {
+            let mut out = Buf::new();
+            out.push_str("psgen: --mem-util ");
+            out.push_u64(mem_pct as u64);
+            out.push_str("% of MemTotal is ");
+            out.push_u64(mem_kb / 1024);
+            out.push_str(" MiB, above the ");
+            out.push_u64(avail / 1024);
+            out.push_str(" MiB MemAvailable; use --force to attempt it anyway\n");
+            sys::err(out.as_bytes());
+            return 2;
+        }
         let want = mem_kb.saturating_mul(1024);
         let len = want.min(usize::MAX as u64) as usize;
         if want > len as u64 {
@@ -755,7 +848,11 @@ pub fn run_load(args: &Args) -> i32 {
         note.push_str("s");
     }
     note.push(b'\n');
-    sys::err(note.as_bytes());
+    // The summary is information, not a diagnostic: it goes to stdout so
+    // `psgen load ... | tee` shows it, and `-q` suppresses it.
+    if !args.quiet {
+        let _ = sys::out_checked(note.as_bytes());
+    }
 
     burn(cpu_pct, deadline);
 
@@ -778,9 +875,7 @@ fn make_load_file(dir: &std::path::Path) -> Option<std::fs::File> {
             .open(&path)
         {
             Ok(f) => {
-                if std::fs::remove_file(&path).is_err()
-                    && std::fs::remove_file(&path).is_err()
-                {
+                if std::fs::remove_file(&path).is_err() && std::fs::remove_file(&path).is_err() {
                     drop(f);
                     return None;
                 }

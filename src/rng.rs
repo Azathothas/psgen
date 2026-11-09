@@ -64,6 +64,19 @@ impl Rng {
         }
     }
 
+    /// Uniform in `[0, n)` from one 32-bit draw scaled to the range.
+    ///
+    /// Unlike `range(0, n)` the modulus does not depend on `n`, so a caller
+    /// whose `n` grows with the wall clock (an uptime-sized age) gets the same
+    /// value for the same seed a second later.
+    pub fn fraction(&mut self, n: u64) -> u64 {
+        if n == 0 {
+            return 0;
+        }
+        let draw = (self.next_u64() >> 32) as u128;
+        ((n as u128 * draw) >> 32) as u64
+    }
+
     pub fn range(&mut self, lo: u64, hi: u64) -> u64 {
         if hi <= lo {
             lo

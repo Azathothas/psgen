@@ -123,6 +123,13 @@ jobs:
         run: docker run --privileged --rm tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0 --install "${{ matrix.qemu }}"
       - name: version
         run: "target/${{ matrix.target }}/release/psgen --version"
+      - name: smoke (cross, under binfmt)
+        if: matrix.qemu != ''
+        run: |
+          set -eu
+          mkdir -p target/release
+          cp "target/${{ matrix.target }}/release/psgen" target/release/psgen
+          sh tests/smoke.sh
       - name: package
         run: |
           set -eu
@@ -166,6 +173,21 @@ jobs:
       - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: dist/*
+      - name: publish-crate
+        # A large part of the point of the release is that `cargo install
+        # psgen` gets the real tool instead of the 0.0.0 reservation. The
+        # job only runs for a final tag, and only when the token is present;
+        # a fork without the secret skips it rather than failing the release.
+        if: ${{ !contains(github.ref_name, '-') }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -eu
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "CARGO_REGISTRY_TOKEN is not set; skipping cargo publish"
+            exit 0
+          fi
+          cargo publish --locked
       - name: publish
         env:
           GH_TOKEN: ${{ github.token }}

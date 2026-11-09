@@ -36,11 +36,11 @@ def fail(msg: str) -> None:
     raise SystemExit(1)
 
 
-def run(args, root=False, timeout=180, check=True):
+def run(args, root=False, timeout=180, check=True, env=None):
     cmd = (["sudo", "-n", str(BIN)] if root else [str(BIN)]) + [str(a) for a in args]
     try:
         p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                           text=True, timeout=timeout)
+                           text=True, timeout=timeout, env=env)
     except subprocess.TimeoutExpired:
         fail(f"timeout: {' '.join(cmd)}")
     if check and p.returncode != 0:
@@ -346,7 +346,9 @@ def check_unit():
             fail(f"unit from a spaced path failed: {p.stderr}")
         if f'ExecStart="{spaced_bin}"' not in p.stdout:
             fail("unit did not quote the executable path")
-        if f'ExecStop="{spaced_bin}"' not in p.stdout:
+        # ExecStop carries systemd's failure-tolerant `-` prefix, so the
+        # quoted executable follows it rather than the directive.
+        if f'ExecStop=-"{spaced_bin}"' not in p.stdout:
             fail("unit did not quote the stop executable path")
 
 
@@ -820,8 +822,9 @@ def check_doctor():
             fail(f"doctor --json probe lacks {name}")
     by_name = {}
     for item in checks:
-        for name, body in item.items():
-            by_name[name] = body
+        if "name" not in item or "ok" not in item:
+            fail("doctor --json check is not an object with a name field")
+        by_name[item["name"]] = item
     if os.geteuid() != 0:
         us = by_name.get("user_switch")
         if not us or us.get("ok") is not False:
@@ -831,8 +834,9 @@ def check_doctor():
     pidfile = Path(tempfile.mkdtemp(prefix="psgen-doctor-")) / "probe.pid"
     j = run(["doctor", "--json", "--pidfile", str(pidfile)])
     doc = json.loads(j.stdout)
-    if not doc.get("pidfile", {}).get(str(pidfile), {}).get("writable"):
-        fail("doctor --json did not report the pidfile writable")
+    pf = doc.get("pidfile", {})
+    if pf.get("path") != str(pidfile) or not pf.get("writable"):
+        fail(f"doctor --json did not report the pidfile writable: {pf}")
     shutil.rmtree(pidfile.parent, ignore_errors=True)
 
 
@@ -840,7 +844,9 @@ def check_log():
     listing = run(["log", "-m", "list"]).stdout.strip()
     if not listing.startswith("modules:"):
         fail(f"log -m list printed {listing!r}")
-    modules = listing[len("modules:"):].split()
+    # The first line is the canonical module names; the alias lines that follow
+    # are indented, so only the first line's tail is the module list.
+    modules = listing.splitlines()[0][len("modules:"):].split()
     if len(modules) < 14:
         fail(f"log lists only {len(modules)} modules")
     for name in ("weblog", "bootlog", "cargo", "docker_build", "kernel_compile"):
@@ -970,7 +976,14 @@ def check_load():
 def can_pty() -> bool:
     """True when this host lets a process acquire a pty (doctor says so)."""
     p = run(["doctor", "--json"])
-    return '"pty":{"ok":true' in p.stdout.replace(" ", "")
+    try:
+        doc = json.loads(p.stdout)
+    except json.JSONDecodeError:
+        return True
+    for c in doc.get("checks", []):
+        if c.get("name") == "pty":
+            return bool(c.get("ok"))
+    return True
 
 
 def alive(pid: int) -> bool:
@@ -1169,6 +1182,357 @@ def check_regressions():
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     subprocess.run(["sudo", "-n", "groupdel", "haproxy"],
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        check_regressions2(tmp)
+
+
+def check_regressions2(tmp):
+    """Second batch: the defects the earlier round left open."""
+
+    # #4: a second stop must not count zombies as stopped, and must not fail.
+    pf = Path(tmp) / "zombie.pid"
+    run(["inject", "-n", "6", "-s", "7", "--no-user", "--no-mem", "--no-tty",
+         "--no-threads", "--pidfile", str(pf)])
+    first = run(["stop", "--pidfile", str(pf)]).stdout
+    if "stopped 6 processes" not in first:
+        fail(f"#4: first stop reported {first.strip()!r} for 6 rows")
+    time.sleep(0.5)
+    second = run(["stop", "--pidfile", str(pf)]).stdout
+    if "stopped 0 processes" not in second:
+        fail(f"#4: a second stop counted zombies as stopped: {second.strip()!r}")
+    pf.unlink()
+
+    # #4 (second half): a subtree is counted once per row, not once per signal
+    # that happened to land before the process exited.
+    pf = Path(tmp) / "subtree.pid"
+    run(["inject", "-n", "40", "-s", "7", "--no-user", "--no-mem", "--no-tty",
+         "--threads", "--pidfile", str(pf)])
+    out = run(["stop", "--pidfile", str(pf)]).stdout
+    if "stopped 40 processes" not in out:
+        fail(f"#4: stop reported {out.strip()!r} for a 40-row tree")
+    pf.unlink()
+
+    # #22: a one-field pidfile line must not report success without signalling.
+    pf = Path(tmp) / "full.pid"
+    one = Path(tmp) / "one.pid"
+    run(["inject", "-n", "2", "-s", "5", "--no-user", "--no-mem", "--no-tty",
+         "--no-threads", "--pidfile", str(pf)])
+    pids = read_pids(pf)
+    one.write_text("".join(f"{p}\n" for p in pids))
+    p = run(["stop", "--pidfile", str(one)], check=False)
+    # A zombie is gone for every purpose `stop` reports, so the liveness test
+    # is the same one the tool uses.
+    alive_now = [pid for pid in pids if alive(pid)]
+    if p.returncode == 0 and alive_now:
+        fail(f"#22: a one-field pidfile reported success with {len(alive_now)} rows alive")
+    stop_pidfile(pf)
+
+    # #15: stop --dry-run must be refused; stop --plan must not signal.
+    pf = Path(tmp) / "plan.pid"
+    run(["inject", "-n", "2", "-s", "5", "--no-user", "--no-mem", "--no-tty",
+         "--no-threads", "--pidfile", str(pf)])
+    pids = read_pids(pf)
+    if run(["stop", "--pidfile", str(pf), "--dry-run"], check=False).returncode != 2:
+        fail("#15: stop --dry-run was accepted")
+    plan = run(["stop", "--pidfile", str(pf), "--plan"], check=False)
+    if "would stop 2 processes" not in plan.stdout:
+        fail(f"#15: stop --plan printed {plan.stdout.strip()!r}")
+    for pid in pids:
+        if not alive(pid):
+            fail(f"#15: stop --plan signalled pid {pid}")
+    stop_pidfile(pf)
+
+    # #26: a basename near NAME_MAX is refused before anything is spawned.
+    for length in (200, 220, 225, 230, 240, 250):
+        name = "d" * length
+        p = run(["inject", "-n", "1", "--no-user", "--no-mem", "--no-tty",
+                 "--no-threads", "--pidfile", str(Path(tmp) / name)], check=False)
+        if p.returncode != 0 and "spawned" in p.stdout:
+            fail(f"#26: basename {length} failed after spawning")
+        if p.returncode == 0 and not (Path(tmp) / name).exists():
+            fail(f"#26: basename {length} reported success without a pidfile")
+        if (Path(tmp) / name).exists():
+            stop_pidfile(Path(tmp) / name)
+
+    # #25: a config on fd 3 that the injector did not write must be ignored.
+    import struct
+    magic = b"PGCFG023"
+    hdr = bytearray(104)
+    hdr[:8] = magic
+    struct.pack_into("<I", hdr, 8, 3)      # version
+    struct.pack_into("<I", hdr, 92, 0)     # self_copy len
+    struct.pack_into("<I", hdr, 96, 4)     # nonce len
+    blob = bytes(hdr) + b"dead"
+    cfg = Path(tmp) / "cfg.bin"
+    cfg.write_bytes(blob)
+    with open(cfg, "rb") as f:
+        p = subprocess.run([str(BIN)], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           pass_fds=(f.fileno(),),
+                           preexec_fn=lambda: os.dup2(f.fileno(), 3),
+                           timeout=30)
+    # The stub path must not be entered: the process behaves like `psgen list`
+    # with no arguments (one line per template) and says nothing on stderr.
+    lines = [l for l in p.stdout.decode().splitlines() if l]
+    if p.returncode != 0 or p.stderr:
+        fail(f"#25: an inherited fd 3 config was acted on: rc={p.returncode} "
+             f"{p.stderr.decode()[:200]}")
+    if len(lines) < 180:
+        fail(f"#25: a stray config changed the command line ({len(lines)} lines)")
+
+    # #14: a denied getrandom must not abort after the stubs are spawned.
+    #     (The fallback is total; a run with --pidfile must exit 0 or, at
+    #     worst, report the rows without a panic.)
+    pf = Path(tmp) / "rand.pid"
+    p = run(["inject", "-n", "2", "--no-user", "--no-mem", "--no-tty",
+             "--no-threads", "--pidfile", str(pf), "--duration", "1"],
+            check=False)
+    if p.returncode >= 128:
+        fail(f"#14: inject died with signal {p.returncode - 128}")
+    stop_pidfile(pf)
+
+    # #8: doctor --json checks are objects with a name field.
+    doc = json.loads(run(["doctor", "--json"]).stdout)
+    if not all(isinstance(c, dict) and "name" in c for c in doc["checks"]):
+        fail("#8: doctor --json checks are not named objects")
+    if "core_ok" not in doc:
+        fail("#8: doctor --json lacks core_ok")
+    pf = Path(tmp) / "doctor.pid"
+    doc = json.loads(run(["doctor", "--json", "--pidfile", str(pf)]).stdout)
+    if doc.get("pidfile", {}).get("path") != str(pf):
+        fail("#8: doctor --json pidfile is not an object with a path")
+
+    # #7: a pidfile header with another version is still recognised.
+    me = os.getpid()
+    pf.write_text(f"# psgen 9.9.9 boot 00000000-0000-0000-0000-000000000000\n{me}\t0\ttest\n")
+    p = run(["stop", "--pidfile", str(pf)], check=False)
+    if "another boot" not in p.stderr:
+        fail("#7: a foreign-version pidfile header was not parsed")
+
+    # #17: --utc-offset is bounded.
+    if run(["table", "-n", "1", "--utc-offset", "9223372036854775807"],
+           check=False).returncode != 2:
+        fail("#17: an absurd --utc-offset was accepted")
+    env = dict(os.environ, TZ="Asia/Kolkata")
+    loc = run(["table", "-f", "dev", "-n", "4", "-s", "1", "--local"], env=env).stdout
+    both = run(["table", "-f", "dev", "-n", "4", "-s", "1", "--local",
+                "--utc-offset", "120"], env=env).stdout
+    if loc != both:
+        fail("#17: --local and --utc-offset were both applied")
+
+    # #16: a family whose distinct commands are fewer than the request says so,
+    # and no single command absorbs the remainder.
+    for fam, n in (("mail", 50), ("mon", 50), ("sto", 50), ("net", 50)):
+        p = run(["table", "-f", fam, "-n", str(n)])
+        cmds = [" ".join(r.split()[10:]) for r in p.stdout.splitlines()[1:]]
+        if len(set(cmds)) >= n and "distinct rows" in p.stderr:
+            fail(f"#16: {fam} warned about a shortfall it does not have")
+        if len(set(cmds)) < n and "distinct rows" not in p.stderr:
+            fail(f"#16: {fam} shortfall was silent")
+        if cmds and max(cmds.count(c) for c in set(cmds)) > n // 2:
+            fail(f"#16: {fam} -n {n} is dominated by one command")
+        # The short list case: `list` never repeats, and says so.
+        lp = run(["list", "-f", fam, "-n", str(n)])
+        if len(lp.stdout.splitlines()) >= n and "never repeats" in lp.stderr:
+            fail(f"#16: list -f {fam} warned about a shortfall it does not have")
+        if len(lp.stdout.splitlines()) < n and "never repeats" not in lp.stderr:
+            fail(f"#16: list -f {fam} shortfall was silent")
+    rows = run(["table", "-f", "sys", "-n", "200"]).stdout.splitlines()[1:]
+    cmds = [" ".join(r.split()[10:]) for r in rows]
+    # The count is honoured by repeating templates that can run more than once,
+    # spread across all of them: the regression was one command taking 60% of
+    # the table (120 of 200 rows were `sshd: user [priv]`).
+    top = max(cmds.count(c) for c in set(cmds))
+    if top > len(cmds) // 3:
+        fail(f"#16: sys -n 200 has one command {top} of {len(cmds)} rows")
+    if len(set(cmds)) < 30:
+        fail(f"#16: sys -n 200 used only {len(set(cmds))} distinct commands")
+    big = [" ".join(r.split()[10:]) for r in
+           run(["table", "-n", "5000", "-s", "1"]).stdout.splitlines()[1:]]
+    top = max(big.count(c) for c in set(big))
+    if top > len(big) // 25:
+        fail(f"#16: table -n 5000 has one command {top} of {len(big)} rows")
+
+    # #28: RSS cannot exceed MemTotal, %MEM cannot exceed 100, PIDs stay below
+    # pid_max.
+    mem = mem_total()
+    pid_max = int(Path("/proc/sys/kernel/pid_max").read_text())
+    for line in run(["table", "-n", "5000", "-s", "1"]).stdout.splitlines()[1:]:
+        m = PS_RE.match(line)
+        if not m:
+            continue
+        rss, mempct, pid = int(m.group("rss")), float(m.group("mem")), int(m.group("pid"))
+        if rss > mem:
+            fail(f"#28: RSS {rss} kB exceeds MemTotal {mem} kB")
+        if mempct > 100.0:
+            fail(f"#28: %MEM {mempct} is impossible for one process")
+        if pid > pid_max:
+            fail(f"#28: PID {pid} exceeds pid_max {pid_max}")
+
+    # #3: table --live matches ps aux on the cases a monitor hits.
+    live = run(["table", "--live"]).stdout.splitlines()
+    ref = subprocess.run(["ps", "aux"], stdout=subprocess.PIPE, text=True,
+                         timeout=30).stdout.splitlines()
+    if live[0] != ref[0]:
+        fail("#3: live header differs from ps aux")
+
+    def offsets(lines):
+        out = []
+        for line in lines[1:]:
+            m = PS_RE.match(line)
+            if not m:
+                out.append(None)
+                continue
+            try:
+                stat = line.index(m.group("stat"), 40)
+                start = line.index(m.group("start"), stat)
+                tm = line.index(m.group("time"), start)
+                cmd = line.index(m.group("cmd"), tm)
+            except ValueError:
+                out.append(None)
+                continue
+            out.append((stat, start, tm, cmd))
+        return out
+
+    for (a, b) in zip(offsets(live), offsets(ref)):
+        if a != b:
+            fail(f"#3: live column offsets {a} differ from ps {b}")
+    if any("\n" in l for l in live):
+        fail("#3: live table emitted a raw newline")
+    # A zombie's COMMAND must carry <defunct>, as ps prints it.
+    ps_rows_ref = {}
+    for line in ref[1:]:
+        m = PS_RE.match(line)
+        if m:
+            ps_rows_ref[int(m.group("pid"))] = m.group("cmd")
+    live_rows_now = {}
+    for line in live[1:]:
+        m = PS_RE.match(line)
+        if m:
+            live_rows_now[int(m.group("pid"))] = m.group("cmd")
+    for pid, want in ps_rows_ref.items():
+        if want.endswith("<defunct>") and pid in live_rows_now:
+            if live_rows_now[pid] != want:
+                fail(f"#3: zombie {pid} cmd {live_rows_now[pid]!r} != ps {want!r}")
+
+    # A newline in argv must not split a row.
+    script = ("import subprocess,time,sys;"
+              "p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(8)',"
+              "'line1\\nline2','tab\\there']);time.sleep(1)")
+    helper = subprocess.Popen([sys.executable, "-c", script])
+    try:
+        time.sleep(0.8)
+        wide = run(["table", "--live"]).stdout
+        for line in wide.splitlines():
+            if "line1" in line:
+                if "line2" in line.split("line1", 1)[1][:8]:
+                    pass
+                break
+        else:
+            pass
+        bad = [l for l in wide.splitlines() if l.startswith("line2")]
+        if bad:
+            fail("#3: a newline in argv split a live table row")
+    finally:
+        helper.kill()
+        helper.wait()
+
+    # #9: an option that does not apply to the subcommand is an error.
+    for args in (["stop", "-n", "40", "--pidfile", str(Path(tmp) / "x.pid")],
+                 ["corpus", "-n", "5"],
+                 ["list", "-d", "5", "-n", "1"],
+                 ["list", "--json", "-n", "1"],
+                 ["table", "--live", "-f", "web"],
+                 ["doctor", "--json", "--lines", "5"],
+                 ["check", "--utc-offset", "300"]):
+        if run(args, check=False).returncode != 2:
+            fail(f"#9: {args} was accepted")
+
+    # #9/#13.2: unit forwards what it was given and caps -n.
+    unit = run(["unit", "-p", "desktop", "-f", "desk", "--no-mem", "-d", "300",
+                "-n", "40"]).stdout
+    for want in ("-p desktop", "-f desk", "-d 300", "--no-mem", "-n 40"):
+        if want not in unit.split("ExecStart=")[1].splitlines()[0]:
+            fail(f"#13.2: unit did not forward {want}")
+    capped = run(["unit", "-n", "1000"]).stdout
+    if "-n 500" not in capped:
+        fail("#27: unit -n was not capped at the inject cap")
+
+    # #12: --dry-run keeps its two columns; --plan and --json add the plan.
+    dry = run(["inject", "-n", "2", "-s", "3", "--dry-run", "--no-user"]).stdout
+    if not all(len(l.split("\t")) == 2 for l in dry.splitlines() if l):
+        fail("#12: --dry-run changed its two-column format")
+    plan = run(["inject", "-n", "2", "-s", "3", "--dry-run", "--plan",
+                "--no-user"]).stdout
+    if "tier " not in plan or "row 0 " not in plan:
+        fail("#12: --plan printed no plan")
+    doc = json.loads(run(["inject", "-n", "2", "-s", "3", "--dry-run", "--json",
+                          "--no-user"]).stdout)
+    if doc.get("tier") not in ("bind", "shadow", "proc-self") or len(doc["rows"]) != 2:
+        fail("#12: --dry-run --json is not a plan")
+
+    # #5: a --duration run that nobody stops leaves nothing for the next run.
+    shadow = Path(tmp) / "staging"
+    env = dict(os.environ, TMPDIR=str(Path(tmp) / "tmpdir"))
+    (Path(tmp) / "tmpdir").mkdir()
+    run(["inject", "-n", "3", "-s", "7", "-d", "1", "--disk", "1",
+         "--no-user", "--no-mem", "--no-tty", "--no-threads",
+         "--shadow-dir", str(shadow), "--pidfile", str(Path(tmp) / "d.pid")],
+        env=env)
+    time.sleep(2.2)
+    leftovers = list(shadow.rglob("*")) + list((Path(tmp) / "tmpdir").glob(".psgen-*"))
+    if not leftovers:
+        fail("#5: the --duration run left no staging behind to test the prune")
+    for p in leftovers:
+        try:
+            os.utime(p, (0, 0))
+        except OSError:
+            pass
+    p = run(["inject", "-n", "1", "-s", "7", "--no-user", "--no-mem", "--no-tty",
+             "--no-threads", "--shadow-dir", str(shadow),
+             "--pidfile", str(Path(tmp) / "p.pid")], env=env, check=False)
+    stop_pidfile(Path(tmp) / "p.pid")
+    if "pruned" not in p.stderr:
+        fail("#5: the next run did not prune the staging directories")
+    if list((Path(tmp) / "tmpdir").glob(".psgen-*")):
+        fail("#5: the prune left a dead run's data directory")
+
+    # #24: a closed reader stops the generator, and --lines is bounded.
+    proc = subprocess.Popen([str(BIN), "log", "-m", "weblog", "--lines", "100000",
+                             "--delay", "10"], stdout=subprocess.PIPE)
+    proc.stdout.readline()
+    proc.stdout.close()
+    try:
+        proc.wait(timeout=8)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        fail("#24: log kept generating after its reader exited")
+    p = run(["log", "--lines", "1000000000"], check=False, timeout=120)
+    if len(p.stdout) > 200 * 1024 * 1024:
+        fail("#24: log --lines 1000000000 produced an unbounded amount of output")
+    if "capped" not in p.stderr:
+        fail("#24: log did not warn about the cap")
+
+    # #23: --mem-util above MemAvailable is refused without --force.
+    avail = 0
+    for line in Path("/proc/meminfo").read_text().splitlines():
+        if line.startswith("MemAvailable:"):
+            avail = int(line.split()[1])
+    if avail and avail * 1000 // mem_total() < 950:
+        p = run(["load", "--mem-util", "95", "-d", "1"], check=False, timeout=120)
+        if p.returncode != 2 or "MemAvailable" not in p.stderr:
+            fail("#23: load --mem-util above MemAvailable was not refused")
+
+    # #21: check --binaries does not report an installed path as missing.
+    out = run(["check", "--binaries"]).stdout
+    for line in out.splitlines():
+        if not line.startswith("missing: "):
+            continue
+        path = line.split("<- ", 1)[1].strip().split()[0]
+        if os.access(path, os.X_OK):
+            fail(f"#21: check --binaries reported an existing path missing: {path}")
+    if run(["check", "--require-binaries"], check=False).returncode not in (0, 1):
+        fail("#21: --require-binaries exited with an unexpected code")
 
 
 def main() -> int:

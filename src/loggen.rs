@@ -56,7 +56,14 @@ pub fn civil(ts: u64) -> (u64, u64, u64, u64, u64, u64) {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if m <= 2 { y + 1 } else { y };
-    (year as u64, m, d, secs / 3600, (secs % 3600) / 60, secs % 60)
+    (
+        year as u64,
+        m,
+        d,
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60,
+    )
 }
 
 fn month(ts: u64) -> &'static str {

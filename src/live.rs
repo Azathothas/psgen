@@ -136,12 +136,20 @@ fn read_cmdline(pid: i32) -> Vec<u8> {
     };
     let mut out = Vec::with_capacity(n);
     for b in &buf[..n] {
-        if *b == 0 {
-            if out.last() != Some(&b' ') {
-                out.push(b' ');
+        match *b {
+            0 => {
+                // Runs of NUL (an empty argv element) collapse to one space,
+                // which is what `ps` shows.
+                if out.last() != Some(&b' ') {
+                    out.push(b' ');
+                }
             }
-        } else {
-            out.push(*b);
+            // `ps` never writes a raw line break into COMMAND: it would split
+            // the row and lose every column after it. Any other control byte
+            // becomes `?`.
+            b'\n' | b'\r' | 0x0b | 0x0c => out.push(b' '),
+            0x01..=0x1f | 0x7f => out.push(b'?'),
+            _ => out.push(*b),
         }
     }
     str::trim(&out).to_vec()
@@ -191,10 +199,14 @@ fn user_name(uid: u32) -> Vec<u8> {
 pub fn read_pid(pid: i32, btime: u64, hz: u64, now: u64, mem_total: u64) -> Option<Proc> {
     let stat = read_stat(pid)?;
     let uid = status_uid(pid).unwrap_or(0);
-    let vsz = status_value(pid, b"VmSize:").unwrap_or(0).min(u32::MAX as u64) as u32;
-    let rss = status_value(pid, b"VmRSS:").unwrap_or(0).min(u32::MAX as u64) as u32;
+    let vsz = status_value(pid, b"VmSize:")
+        .unwrap_or(0)
+        .min(u32::MAX as u64) as u32;
+    let rss = status_value(pid, b"VmRSS:")
+        .unwrap_or(0)
+        .min(u32::MAX as u64) as u32;
     let cmd = read_cmdline(pid);
-    let cmd = if cmd.is_empty() {
+    let mut cmd = if cmd.is_empty() {
         let mut b = Buf::new();
         b.push(b'[');
         b.push_bytes(&stat.comm);
@@ -203,17 +215,22 @@ pub fn read_pid(pid: i32, btime: u64, hz: u64, now: u64, mem_total: u64) -> Opti
     } else {
         cmd
     };
+    if stat.state == b'Z' {
+        // `ps` marks a zombie's COMMAND; a container whose PID 1 does not reap
+        // is full of them, and a table without the marker does not match.
+        cmd.extend_from_slice(b" <defunct>");
+    }
     let start_epoch = btime.saturating_add(stat.starttime / hz.max(1));
     let age = now.saturating_sub(start_epoch);
     let now_ticks = now.saturating_mul(hz);
     let start_ticks = btime.saturating_mul(hz).saturating_add(stat.starttime);
     let elapsed_ticks = now_ticks.saturating_sub(start_ticks);
     let ticks = stat.utime.saturating_add(stat.stime);
-    let cpu = if elapsed_ticks == 0 {
-        0
-    } else {
-        ((ticks.saturating_mul(1000) / elapsed_ticks).min(65535)) as u16
-    };
+    // %CPU is thousandths of a core, capped well below u16.
+    let cpu = (ticks.saturating_mul(1000))
+        .checked_div(elapsed_ticks)
+        .unwrap_or(0)
+        .min(65535) as u16;
     let mut st = Vec::with_capacity(4);
     st.push(stat.state);
     if stat.pid as i64 == stat.session {
@@ -282,12 +299,27 @@ pub fn read_pids(pids: &[i32]) -> Vec<Proc> {
     let hz = sys::hz();
     let now = sys::now_secs();
     let btime = boot_time(now);
-    let mem_total = util::mem_total_kb();
+    let mem_total = crate::table::mem_budget_kb();
     let mut rows = Vec::with_capacity(pids.len());
     for pid in pids {
         if let Some(p) = read_pid(*pid, btime, hz, now, mem_total) {
             rows.push(p);
         }
     }
+    // `ps aux` is PID-ordered, so a caller that diffs or greps by position
+    // needs the same order even when the input list is not sorted.
+    rows.sort_unstable_by_key(|p| p.pid);
     rows
+}
+
+/// Whether a PID is a live process.
+///
+/// A zombie is already dead: its `/proc` entry outlives it whenever its parent
+/// does not reap, and signalling it succeeds and does nothing. Everything that
+/// reports "stopped" has to use this rather than `/proc/<pid>` existing.
+pub fn alive(pid: i32) -> bool {
+    match read_stat(pid) {
+        Some(s) => s.state != b'Z',
+        None => false,
+    }
 }

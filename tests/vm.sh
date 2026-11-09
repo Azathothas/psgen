@@ -62,7 +62,7 @@ timeout 120 "$QEMU" -enable-kvm -m 2048 -smp 2 -kernel "$KERNEL" \
     -nographic -no-reboot > "$TMP/out" 2>&1 || true
 
 cat "$TMP/out"
-grep -q 'psgen 0.0.1' "$TMP/out" || { echo "vm: version missing" >&2; exit 1; }
+grep -q '^psgen 0\.' "$TMP/out" || { echo "vm: version missing" >&2; exit 1; }
 grep -q 'spawned 6' "$TMP/out" || { echo "vm: inject did not spawn 6" >&2; exit 1; }
 grep -q '/usr/sbin/nginx' "$TMP/out" || { echo "vm: nginx exe missing" >&2; exit 1; }
 grep -q '/usr/bin/flanneld' "$TMP/out" || { echo "vm: flanneld exe missing" >&2; exit 1; }

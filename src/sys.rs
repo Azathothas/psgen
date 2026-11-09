@@ -31,19 +31,24 @@ pub const MAP_NORESERVE: i32 = libc::MAP_NORESERVE;
 
 pub const MADV_DONTNEED: i32 = libc::MADV_DONTNEED;
 
-
 pub const SIGKILL: i32 = libc::SIGKILL;
 
 pub const CLONE_NEWNS: i32 = libc::CLONE_NEWNS;
 pub const CLONE_NEWUSER: i32 = libc::CLONE_NEWUSER;
 
-pub const MS_BIND: u64 = libc::MS_BIND as u64;
-pub const MS_REC: u64 = libc::MS_REC as u64;
-pub const MS_PRIVATE: u64 = libc::MS_PRIVATE as u64;
+// These constants are `c_ulong` on some targets and already `u64` on others,
+// so the cast is required on the first kind and redundant on the second.
+#[allow(clippy::unnecessary_cast)]
+mod consts {
+    pub const MS_BIND: u64 = libc::MS_BIND as u64;
+    pub const MS_REC: u64 = libc::MS_REC as u64;
+    pub const MS_PRIVATE: u64 = libc::MS_PRIVATE as u64;
+    pub const TIOCSPTLCK: u64 = libc::TIOCSPTLCK as u64;
+    pub const TIOCGPTN: u64 = libc::TIOCGPTN as u64;
+    pub const TIOCSCTTY: u64 = libc::TIOCSCTTY as u64;
+}
 
-pub const TIOCSPTLCK: u64 = libc::TIOCSPTLCK as u64;
-pub const TIOCGPTN: u64 = libc::TIOCGPTN as u64;
-pub const TIOCSCTTY: u64 = libc::TIOCSCTTY as u64;
+pub use consts::{MS_BIND, MS_PRIVATE, MS_REC, TIOCGPTN, TIOCSCTTY, TIOCSPTLCK};
 
 pub fn cstr(path: &[u8]) -> Option<CString> {
     let body = path.strip_suffix(&[0]).unwrap_or(path);
@@ -56,6 +61,20 @@ fn path_of(path: &[u8]) -> &Path {
 
 pub fn out(buf: &[u8]) {
     let _ = io::stdout().write_all(buf);
+}
+
+/// Write to stdout, reporting whether the reader is still there.
+///
+/// A generator that keeps formatting after its reader exited (a `| head`, a
+/// closed pipe) is wasted work; `EPIPE` is the signal to stop.
+pub fn out_checked(buf: &[u8]) -> bool {
+    match io::stdout().write_all(buf) {
+        Ok(()) => true,
+        Err(e) => {
+            let _ = io::stdout().flush();
+            e.kind() != io::ErrorKind::BrokenPipe
+        }
+    }
 }
 
 pub fn err(buf: &[u8]) {
@@ -199,6 +218,48 @@ pub fn open(path: &[u8], flags: i32, mode: u32) -> i32 {
         None => return -1,
     };
     unsafe { libc::open(p.as_ptr(), flags, mode as libc::c_uint) }
+}
+
+/// `st_nlink` of the object a descriptor refers to, or None when fstat fails.
+///
+/// A memfd and an unlinked temporary file both report 0, which is how the stub
+/// tells "this file has no name anyone else can open" from a named file handed
+/// in by a supervisor.
+pub fn fd_nlink(fd: i32) -> Option<u64> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return None;
+    }
+    Some(st.st_nlink as u64)
+}
+
+/// The seals the stub requires: the size cannot change and no further seals
+/// can be added or removed.
+///
+/// `F_SEAL_WRITE` is deliberately not used: the stub writes its progress
+/// marker into the config after it starts, and a write seal would make that
+/// fail on every row.
+fn seal_mask() -> i32 {
+    libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL
+}
+
+/// Whether a descriptor carries the seals the stub requires.
+pub fn fd_sealed(fd: i32) -> bool {
+    let r = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
+    if r < 0 {
+        return false;
+    }
+    r & seal_mask() == seal_mask()
+}
+
+/// Apply the size seals to a memfd created with `MFD_ALLOW_SEALING`.
+pub fn fd_add_seals(fd: i32) -> bool {
+    unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, seal_mask()) == 0 }
+}
+
+/// Flush a file descriptor to stable storage, reporting failure.
+pub fn fsync_fd(fd: i32) -> bool {
+    unsafe { libc::fsync(fd) == 0 }
 }
 
 pub fn close(fd: i32) {
@@ -421,6 +482,24 @@ pub fn madvise(ptr: *mut u8, len: usize, advice: i32) -> bool {
     unsafe { libc::madvise(ptr as *mut libc::c_void, len, advice) == 0 }
 }
 
+/// An anonymous file of `size` bytes that can still be sealed later, or -1.
+///
+/// Only a memfd can be sealed; the caller falls back to an unlinked temporary
+/// file, which has no name to reopen but cannot be sealed either. The seals
+/// are added after the contents are written, because `F_SEAL_WRITE` makes the
+/// file unwritable from that point on.
+pub fn anon_sealable_file(name: &[u8], size: u64) -> i32 {
+    let fd = memfd_create(name, libc::MFD_ALLOW_SEALING);
+    if fd < 0 {
+        return -1;
+    }
+    if !ftruncate(fd, size) {
+        close(fd);
+        return -1;
+    }
+    fd
+}
+
 pub fn memfd_create(name: &[u8], flags: u32) -> i32 {
     let n = match cstr(name) {
         Some(n) => n,
@@ -449,11 +528,12 @@ pub fn anon_file(name: &[u8], size: u64) -> i32 {
         }
         close(fd);
     }
-    let mut bases: Vec<PathBuf> = Vec::with_capacity(4);
-    bases.push(std::env::temp_dir());
-    bases.push(PathBuf::from("/tmp"));
-    bases.push(PathBuf::from("/dev/shm"));
-    bases.push(PathBuf::from("."));
+    let bases: Vec<PathBuf> = vec![
+        std::env::temp_dir(),
+        PathBuf::from("/tmp"),
+        PathBuf::from("/dev/shm"),
+        PathBuf::from("."),
+    ];
     for base in bases {
         if let Some(fd) = temp_anon_fd(&base, size) {
             return fd;
@@ -489,12 +569,20 @@ pub fn unshare(flags: i32) -> bool {
 }
 
 pub fn mount(source: &[u8], target: &[u8], fstype: &[u8], flags: u64, data: &[u8]) -> bool {
-    let s = if source.is_empty() { None } else { cstr(source) };
+    let s = if source.is_empty() {
+        None
+    } else {
+        cstr(source)
+    };
     let t = match cstr(target) {
         Some(t) => t,
         None => return false,
     };
-    let f = if fstype.is_empty() { None } else { cstr(fstype) };
+    let f = if fstype.is_empty() {
+        None
+    } else {
+        cstr(fstype)
+    };
     let d = if data.is_empty() { None } else { cstr(data) };
     let sp = s.as_ref().map(|x| x.as_ptr()).unwrap_or(std::ptr::null());
     let fp = f.as_ref().map(|x| x.as_ptr()).unwrap_or(std::ptr::null());
@@ -584,7 +672,11 @@ pub fn statvfs(path: &[u8]) -> Option<(u64, u64)> {
         return None;
     }
     // The statvfs fields are u64 on 64-bit targets and u32 on 32-bit ones.
-    let unit = if st.f_frsize > 0 { st.f_frsize } else { st.f_bsize } as u64;
+    let unit = if st.f_frsize > 0 {
+        st.f_frsize
+    } else {
+        st.f_bsize
+    } as u64;
     let free = (st.f_bavail as u64).saturating_mul(unit);
     let total = (st.f_blocks as u64).saturating_mul(unit);
     Some((free, total))

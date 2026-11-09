@@ -79,8 +79,11 @@ pub fn current() -> User {
     if let Some((name, gid)) = lookup_uid(uid) {
         return User { name, uid, gid };
     }
+    // `ps` prints the numeric uid when it cannot resolve one, and the injected
+    // stub keeps the caller's uid, so the synthetic table has to agree with
+    // the `ps` output the same rows produce.
     User {
-        name: b"user".to_vec(),
+        name: uid.to_string().into_bytes(),
         uid,
         gid: sys::getgid(),
     }
@@ -116,7 +119,10 @@ pub fn ensure(name: &[u8], create: bool) -> (Option<(u32, u32)>, bool, Option<St
         Ok(s) => s,
         Err(_) => return (None, false, Some("invalid user name".to_string())),
     };
-    let attempts: [&[&str]; 3] = [
+    // Ordered from most to least specific. Every attempt is tried, and the
+    // first error is the one reported: the later attempts fail for the same
+    // reason, and repeating the last message made the cause unreadable.
+    let attempts: [&[&str]; 4] = [
         &[
             "--system",
             "--badname",
@@ -150,7 +156,19 @@ pub fn ensure(name: &[u8], create: bool) -> (Option<(u32, u32)>, bool, Option<St
             "--gid",
             name_str,
         ],
+        // busybox's useradd shim wants -G for the group and no --badname.
+        &[
+            "-S",
+            "-H",
+            "-h",
+            "/nonexistent",
+            "-s",
+            "/usr/sbin/nologin",
+            "-G",
+            name_str,
+        ],
     ];
+    let mut first_error = String::new();
     let mut last_error = String::new();
     for opts in attempts.iter() {
         let mut cmd = std::process::Command::new("useradd");
@@ -164,23 +182,38 @@ pub fn ensure(name: &[u8], create: bool) -> (Option<(u32, u32)>, bool, Option<St
                     if let Some((uid, gid)) = lookup_name(name) {
                         return (Some((uid, gid)), true, None);
                     }
-                    last_error = "useradd succeeded but the user is not visible".to_string();
-                } else {
-                    last_error = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    // The account now exists but NSS cannot see it. Retrying
+                    // the create would only fail with "already exists" and
+                    // replace the real explanation.
+                    return (
+                        None,
+                        true,
+                        Some(
+                            "useradd succeeded but the account is not visible through NSS"
+                                .to_string(),
+                        ),
+                    );
                 }
+                let e = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                if first_error.is_empty() && !e.is_empty() {
+                    first_error = e.clone();
+                }
+                last_error = e;
             }
             Err(e) => {
+                if first_error.is_empty() {
+                    first_error = e.to_string();
+                }
                 last_error = e.to_string();
             }
         }
     }
-    (
-        None,
-        false,
-        Some(if last_error.is_empty() {
-            "useradd failed".to_string()
-        } else {
-            last_error
-        }),
-    )
+    let msg = if !first_error.is_empty() {
+        first_error
+    } else if !last_error.is_empty() {
+        last_error
+    } else {
+        "useradd failed".to_string()
+    };
+    (None, false, Some(msg))
 }

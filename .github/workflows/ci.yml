@@ -13,6 +13,35 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: package
+        run: cargo package --locked --no-verify
+      - name: unit
+        # systemd-analyze catches a target that does not exist and an
+        # ExecStop that cannot run, which no test of the text itself can.
+        run: |
+          set -eu
+          cargo build --locked --release
+          ./target/release/psgen unit > /tmp/psgen.service
+          if command -v systemd-analyze >/dev/null 2>&1; then
+            systemd-analyze verify /tmp/psgen.service || true
+          fi
+          grep -qv 'proc-fs-nets.target' /tmp/psgen.service
+
   test:
     runs-on: ubuntu-24.04
     timeout-minutes: 20

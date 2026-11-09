@@ -29,16 +29,38 @@ fn json_number(out: &mut Buf, n: u64) {
     out.push_u64(n);
 }
 
-fn environment() -> Vec<(&'static str, Vec<u8>)> {    let mut v: Vec<(&'static str, Vec<u8>)> = Vec::new();
-    v.push(("uid", sys::getuid().to_string().into_bytes()));
-    v.push(("euid", sys::geteuid().to_string().into_bytes()));
-    v.push(("mem_total_kb", util::mem_total_kb().to_string().into_bytes()));
-    v.push((
-        "cgroup_mem_limit_kb",
-        util::cgroup_mem_limit_kb().to_string().into_bytes(),
-    ));
-    v.push(("page_kb", sys::page_kb().to_string().into_bytes()));
-    v.push(("hz", sys::hz().to_string().into_bytes()));
+/// Whether an environment key is a number. Deciding by "every byte is a digit"
+/// made a cwd of `/1234` a string and a cwd of `1234` a number.
+fn env_is_number(key: &str) -> bool {
+    matches!(
+        key,
+        "uid" | "euid" | "mem_total_kb" | "cgroup_mem_limit_kb" | "page_kb" | "hz"
+    )
+}
+
+fn bool_txt(v: bool) -> &'static str {
+    if v {
+        "true"
+    } else {
+        "false"
+    }
+}
+
+fn environment() -> Vec<(&'static str, Vec<u8>)> {
+    let mut v: Vec<(&'static str, Vec<u8>)> = vec![
+        ("uid", sys::getuid().to_string().into_bytes()),
+        ("euid", sys::geteuid().to_string().into_bytes()),
+        (
+            "mem_total_kb",
+            util::mem_total_kb().to_string().into_bytes(),
+        ),
+        (
+            "cgroup_mem_limit_kb",
+            util::cgroup_mem_limit_kb().to_string().into_bytes(),
+        ),
+        ("page_kb", sys::page_kb().to_string().into_bytes()),
+        ("hz", sys::hz().to_string().into_bytes()),
+    ];
     let mut cwd = [0u8; 4096];
     let c = match sys::getcwd(&mut cwd) {
         Some(n) => cwd[..n].to_vec(),
@@ -149,7 +171,7 @@ pub fn run(as_json: bool, pidfile: Option<&[u8]>) -> i32 {
             denied += 1;
         }
     }
-    let pidfile_ok = pidfile.map(|p| probe::pidfile_creatable(p));
+    let pidfile_ok = pidfile.map(probe::pidfile_creatable);
 
     // Doctor reports on everything but only fails when a capability that
     // injection cannot work without is missing. A non-root run always denies
@@ -162,16 +184,27 @@ pub fn run(as_json: bool, pidfile: Option<&[u8]>) -> i32 {
     if as_json {
         let mut out = Buf::new();
         out.push(b'{');
-        out.push_str("\"version\":\"0.0.1\",\"ok\":");
-        out.push_str(if core_ok { "true" } else { "false" });
-        out.push_str(",\"env\":{");
+        out.push_str("\"version\":\"");
+        out.push_str(crate::version::VERSION);
+        out.push_str("\",\"ok\":");
+        out.push_str(bool_txt(core_ok));
+        out.push_str(",\"core_ok\":");
+        out.push_str(bool_txt(core_ok));
+        out.push_str(",\"core\":[");
+        for (i, name) in core.iter().enumerate() {
+            if i > 0 {
+                out.push(b',');
+            }
+            json_string(&mut out, name.as_bytes());
+        }
+        out.push_str("],\"env\":{");
         for (i, (k, v)) in env.iter().enumerate() {
             if i > 0 {
                 out.push(b',');
             }
             json_string(&mut out, k.as_bytes());
             out.push(b':');
-            let numeric = !v.is_empty() && v.iter().all(|b| b.is_ascii_digit());
+            let numeric = env_is_number(k) && !v.is_empty() && v.iter().all(|b| b.is_ascii_digit());
             if numeric {
                 out.push_bytes(v);
             } else {
@@ -184,8 +217,9 @@ pub fn run(as_json: bool, pidfile: Option<&[u8]>) -> i32 {
                 out.push(b',');
             }
             out.push(b'{');
+            out.push_str("\"name\":");
             json_string(&mut out, c.name.as_bytes());
-            out.push_str(":{\"ok\":");
+            out.push_str(",\"ok\":");
             out.push_str(if c.ok { "true" } else { "false" });
             out.push_str(",\"detail\":");
             json_string(&mut out, &c.detail);
@@ -193,7 +227,6 @@ pub fn run(as_json: bool, pidfile: Option<&[u8]>) -> i32 {
                 out.push_str(",\"errno\":");
                 json_number(&mut out, c.errno.max(0) as u64);
             }
-            out.push(b'}');
             out.push(b'}');
         }
         out.push(b']');
@@ -208,18 +241,20 @@ pub fn run(as_json: bool, pidfile: Option<&[u8]>) -> i32 {
         }
         out.push(b'}');
         if let Some(p) = pidfile_ok {
-            out.push_str(",\"pidfile\":{");
+            // A path is not a JSON key: it may not be valid UTF-8, and a
+            // consumer cannot read it back as a field. The path is a value.
+            out.push_str(",\"pidfile\":{\"path\":");
             json_string(&mut out, pidfile.unwrap_or(b""));
-            out.push_str(":{\"writable\":");
+            out.push_str(",\"writable\":");
             out.push_str(if p { "true" } else { "false" });
-            out.push(b'}');
             out.push(b'}');
         }
         out.push_str("}\n");
         sys::out(out.as_bytes());
     } else {
         let mut out = Buf::new();
-        out.push_str("psgen 0.0.1 doctor\n");
+        out.push_bytes(crate::version::BARE);
+        out.push_str(" doctor\n");
         out.push_str("env\n");
         for (k, v) in &env {
             out.push_str("  ");

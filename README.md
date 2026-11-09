@@ -71,18 +71,35 @@ psgen load --cpu-util 50 -d 10
 
 `list` prints one line per template when `-n` is omitted; `table` defaults to
 30 rows and `inject` to 12. `list` caps at 2000 rows, `table` at 5000 and
-`inject` at 500. Common options are `-n/--count`, `-s/--seed`, `-p/--profile`
-(`server`, `dev`, `desktop`), `-f/--family` (`sys`, `web`, `db`, `ctr`, `dev`,
-`mon`, `sto`, `mail`, `desk`, `net`), `--utc-offset`, `--local`,
-`--sort/--no-sort` and `--uniq/--no-uniq`.
+`inject` at 500. A count includes the synthetic PID 1 row when `sys` is in
+scope, and `table --live` defaults to every process on the host.
 
-`stop` takes `--force`; `doctor` takes `--json`; `log` takes `-m/--module`,
-`--lines`, `--delay`, `--speed` and `--log-fmt`; `load` takes `--cpu-util`,
-`--mem-util`, `--disk-util` and `-d`; `check` takes `--binaries`; `unit` takes
-`-n`, `-s`, `--pidfile` and `--create-users`. The corpus contains 181
-templates across ten families; `psgen corpus` dumps it and `psgen check`
-rejects placeholders, control bytes and a denylist of crypto, botnet and
-attack terms.
+`-n` is a request, not a promise of distinct lines. A template with a
+placeholder that changes the command line (`{hex64}`, `{cport}`, `{ip}`, …) may
+appear more than once, and so may the rows marked `F_REPEAT` in the corpus:
+login sessions, build jobs, per-connection shims. Nothing else is repeated, so
+a family whose distinct rows are fewer than the request prints a shortfall
+warning and the repeats are spread evenly instead of landing on one command.
+`list` never repeats a command; `list --no-uniq` pads a list if that is what you
+want.
+
+The options a command honours are the options it accepts: an option that does
+not apply to the chosen subcommand is a usage error (exit 2), not a silent
+no-op. Common options are `-n/--count`, `-s/--seed`, `-p/--profile`
+(`server`, `dev`, `desktop`), `-f/--family` (`sys`, `web`, `db`, `ctr`, `dev`,
+`mon`, `sto`, `mail`, `desk`, `net`), `--utc-offset` (minutes, ±1440),
+`--local`, `--sort/--no-sort` and `--uniq/--no-uniq`.
+
+`stop` takes `--force`, `--plan` and `-q`; `doctor` takes `--json` and
+`--pidfile`; `log` takes `-m/--module`, `--lines` (at most 200000), `--delay`,
+`--speed` and `--log-fmt`; `load` takes `--cpu-util`, `--mem-util`,
+`--disk-util`, `-d` and `--force`; `check` takes `--binaries` and
+`--require-binaries`; `unit` takes the inject options listed below and forwards
+them. The corpus contains 181 templates across ten families; `psgen corpus`
+dumps it (with `@self` for a template that runs as the invoking user, which
+`list`, `table` and `inject` replace with the user's name or decimal uid) and
+`psgen check` rejects placeholders, control bytes and a denylist of crypto,
+botnet and attack terms.
 
 ## Injection model
 
@@ -137,8 +154,12 @@ physical cost (largest RSS, page tables and base RSS); the default is a quarter
 of RAM or half the cgroup limit. `--disk MiB` writes that much temp data per
 stub. `RLIMIT_FSIZE` is checked before the arena is sized; targets above it are
 lowered, and padding is disabled with a warning if the limit is too small.
-`--verify` compares real VSZ and RSS with the plan within 128 kB and requires
-`--mem`.
+`--verify` compares real VSZ and RSS with the plan within 128 kB and has no
+effect with `--no-mem` (it warns). `--dry-run` prints the two columns it always
+printed; `--dry-run --plan` prints the resolved plan instead (tier, per-row
+user, VSZ, RSS, CPU, tty, threads, exe, parent, temp directories and the
+physical estimate) and `--dry-run --json` prints the same plan as one JSON
+object.
 
 ### Pidfile and stop
 
@@ -150,20 +171,43 @@ lowered, and padding is disabled with a warning if the limit is too small.
 <pid>\t<starttime>\t<comm>
 ```
 
-The file is written through `<path>.tmp.<pid>.<16-hex>` with `O_EXCL` and
-renamed into place. An existing target must be absent, empty or a psgen
-pidfile; a device, FIFO, socket or symlink is refused. The path is checked
-before spawning; a preflight failure exits 2.
+The header is parsed without interpreting the version, so a pidfile written by
+another release is still recognised. A header-only file is written before the
+first stub is forked: if that write fails, nothing is spawned, and if it
+succeeds, a later failure still leaves a valid pidfile behind. The write goes
+through `<path>.tmp.<pid>.<nonce>` with `O_EXCL` and is renamed into place; the
+temporary suffix shrinks in three steps so a target basename near `NAME_MAX`
+still works, and the preflight tests exactly the name the writer will use. An
+existing target must be absent, empty or a psgen pidfile; a device, FIFO,
+socket or symlink is refused. A preflight failure exits 2.
 
 `stop --pidfile FILE` checks the boot id, then each line's identity before
 signalling. A three-field line checks starttime and comm, a two-field line
-checks starttime, and a one-field line checks the exe. PID 1 is never
-signalled. A leader's process group is killed first, so children that never
-reported are reached; the PID itself is signalled through a pidfd when
-available, or after a check-then-kill. `--force` ignores only the boot id. The
-`# temp` directories are removed only when the path is absolute, is a real
-directory, is owned by the caller, has a basename matching
-`.psgen-<digits>-<digits>-<digits>`, and every signal succeeded.
+checks starttime, and a one-field line checks the exe: that form only
+identifies a proc-self row, or a shadow copy inside a staging directory the
+caller owns. A one-field line naming a bind-tier row is an error rather than a
+silent skip, because accepting the template path would also accept the host's
+real daemon. PID 1 is never signalled. Lines are processed deepest PID first,
+a leader's process group is killed so children that never reported are
+reached, and the PID itself is signalled through a pidfd when available, or
+after a check-then-kill.
+
+A zombie is skipped, not counted: it is already dead, and a signal to one
+succeeds and does nothing. After signalling, `stop` waits (bounded at two
+seconds) until every signalled PID is gone or a zombie, so `stopped N` is true
+when it is printed. A second `stop` on the same pidfile therefore reports
+`stopped 0 processes, skipped N`. `--plan` prints what would be signalled and
+signals nothing. `--force` ignores only the boot id. The `# temp` directories
+are removed only when the path is absolute, is a real directory, is owned by
+the caller, has a basename matching `.psgen-<digits>-<digits>-<digits>`, and
+every signal succeeded.
+
+A run that ends by `--duration` alone leaves its staging directories, because
+the injector is gone by then. The next `inject` reclaims them: a directory
+whose owner marker names an injector that is no longer running (same PID and
+same starttime) is removed before anything is spawned. A directory created
+less than a minute ago and not yet marked is left alone, so a concurrent run is
+never touched.
 
 `--wait` requires a non-zero `--duration` (exit 2 otherwise, except with
 `--dry-run`). It blocks for the duration, then kills each root's process group
@@ -186,7 +230,21 @@ the musl binary at `target/release/psgen` (copy it from
 `target/x86_64-unknown-linux-musl/release/psgen`), then run `sh tests/smoke.sh`.
 
 The root section of `tests/invariants.py` runs only with passwordless `sudo`;
-it is skipped otherwise. `python3` is required.
+it is skipped otherwise. So are the checks that depend on a capability the host
+lacks: a pty (doctor says so), a reaping PID 1, and a hard `RLIMIT_FSIZE` large
+enough to exercise the free-space guard. A host that cannot run a check prints
+why and continues; it never aborts the suite. `python3` is required.
+
+Besides the behavioural checks, `tests/invariants.py` carries a regression for
+every defect the beta-test rounds filed, each of which failed before the fix:
+the pidfile reuse rule, a second `stop`, `stop --plan`, the seed across one
+second, the family shortfall and the repeat spread, the host-fitted sizes, the
+`pid_max` bound, the live table's column offsets and `<defunct>` marker, the
+`doctor --json` shape, the pidfile header with a foreign version, the
+`--utc-offset` bound, `--local` with `--utc-offset`, the name-length preflight,
+an inherited fd 3, the staging prune, a closed log reader, `--mem-util` above
+`MemAvailable`, `check --binaries` on an installed path, and the `NAME_MAX`
+boundary.
 
 ## Benchmarks
 
@@ -211,15 +269,35 @@ cage image from `tests/sand/Containerfile`.
 - The pidfile is trusted input: the boot id, starttime and comm are visible in
   `/proc`, so a forged pidfile can name a process the caller may signal, and
   can point the `# temp` cleanup at a matching directory owned by the caller.
-  Run `stop` only on a pidfile you control.
+  Run `stop` only on a pidfile you control. `stop` does not unlink the pidfile,
+  which is why re-running `inject` against the same path works.
+- The stub refuses to run from a setuid installation, and only honours a
+  config descriptor that carries the per-run nonce in its environment and is a
+  sealed memfd or an unlinked file. It also only writes into, and only execs
+  from, a staging directory that passes the same ownership and name rule
+  `stop` uses before removing one. Do not install it setuid.
+- The nonce protects a descriptor that a supervisor or a `sudo` rule hands in;
+  it does not protect a caller who can also set the environment of a
+  privileged process, because that caller could pass a matching nonce.
 - Release artifacts are static musl only; no GNU/glibc artifacts are published.
-- The crates.io names `psgen` and `psinject` are reserved; no functional crate
-  is published. Install from GitHub Releases or build from source.
+  A `cargo install` builds whatever target your host defaults to, which is
+  normally glibc; use `cargo install psgen --target x86_64-unknown-linux-musl`
+  if you want the static binary the releases ship.
+- The crate is published from the release workflow for a final (non-prerelease)
+  tag, so `cargo install psgen` installs the real tool rather than the `0.0.0`
+  placeholders the `psgen` and `psinject` names were reserved with.
 - Cross targets are built in CI; `make build` and `scripts/build-all.sh` build
   only `x86_64-unknown-linux-musl`.
 - A non-root `--tty` row that calls `setsid` and never reports is outside the
   per-PID and root-group kill paths: it has no status record, so it is not in
   the pidfile, and it has left the root's process group.
+
+## Security
+
+This tool deliberately spoofs process state. Read `SECURITY.md` before handing a
+pidfile from someone else to `stop`, or installing it anywhere a supervisor can
+pass it file descriptors. It must not be installed setuid; the stub refuses to
+run in that case.
 
 ## License
 

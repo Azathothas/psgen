@@ -4,7 +4,6 @@
 //! before it promises anything. Every check that would change process state
 //! runs in a forked child, so probing never modifies the caller.
 
-use crate::str::Buf;
 use crate::sys;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
@@ -80,7 +79,11 @@ fn check_pty() -> Check {
     // A seccomp policy that returns KILL for an unexpected syscall must kill
     // the probe child, not psgen. The parent then reports DENY.
     let (ok, e) = in_child(|| {
-        let fd = sys::open(b"/dev/ptmx", sys::O_RDWR | sys::O_NOCTTY | sys::O_CLOEXEC, 0);
+        let fd = sys::open(
+            b"/dev/ptmx",
+            sys::O_RDWR | sys::O_NOCTTY | sys::O_CLOEXEC,
+            0,
+        );
         if fd < 0 {
             return Err(errno());
         }
@@ -247,7 +250,16 @@ fn check_user_switch() -> Check {
 
 fn check_fork() -> Check {
     let (ok, e) = in_child(|| Ok(()));
-    Check::new("fork", ok, e, if ok { b"child exited 0" } else { b"fork failed" })
+    Check::new(
+        "fork",
+        ok,
+        e,
+        if ok {
+            b"child exited 0"
+        } else {
+            b"fork failed"
+        },
+    )
 }
 
 fn check_prctl() -> Check {
@@ -262,7 +274,11 @@ fn check_prctl() -> Check {
         "prctl_name",
         ok,
         e,
-        if ok { b"PR_SET_NAME" } else { b"PR_SET_NAME denied" },
+        if ok {
+            b"PR_SET_NAME"
+        } else {
+            b"PR_SET_NAME denied"
+        },
     )
 }
 
@@ -284,7 +300,11 @@ fn check_cwd() -> Check {
                 "cwd",
                 ok,
                 if ok { 0 } else { errno() },
-                if ok { b"cwd writable" } else { b"cwd not writable" },
+                if ok {
+                    b"cwd writable"
+                } else {
+                    b"cwd not writable"
+                },
             )
         }
         None => Check::new("cwd", false, errno(), b"getcwd failed"),
@@ -297,7 +317,11 @@ fn check_proc_stat() -> Check {
         "proc_stat",
         ok,
         if ok { 0 } else { errno() },
-        if ok { b"/proc/PID/stat readable" } else { b"/proc/PID/stat unreadable" },
+        if ok {
+            b"/proc/PID/stat readable"
+        } else {
+            b"/proc/PID/stat unreadable"
+        },
     )
 }
 
@@ -321,7 +345,14 @@ pub fn checks() -> Vec<Check> {
 /// Whether the `bpf` syscall is reachable, probed in a child so a seccomp
 /// KILL policy cannot take down the caller.
 pub fn bpf_allowed() -> bool {
-    in_child(|| if sys::bpf_allowed() { Ok(()) } else { Err(errno()) }).0
+    in_child(|| {
+        if sys::bpf_allowed() {
+            Ok(())
+        } else {
+            Err(errno())
+        }
+    })
+    .0
 }
 
 /// Whether `SECCOMP_SET_MODE_FILTER` is reachable, probed in a child for the
@@ -375,6 +406,30 @@ fn pidfile_parent(path: &[u8]) -> &[u8] {
     }
 }
 
+/// How many temporary-name shapes `write_pidfile` will try. The first is the
+/// most collision-resistant; the later ones are shorter, so a pidfile whose
+/// basename is close to `NAME_MAX` still has somewhere to go.
+pub fn pidfile_temp_levels() -> usize {
+    4
+}
+
+/// The temporary name `write_pidfile` creates for `path` at `level`.
+///
+/// `pidfile_creatable` and `write_pidfile` both call this, so the preflight
+/// can never test a different name from the one the writer uses.
+pub fn pidfile_temp_name(path: &[u8], level: usize, nonce: u64) -> Vec<u8> {
+    let mut cand = path.to_vec();
+    cand.push(b'.');
+    match level {
+        0 => cand.extend_from_slice(format!("tmp.{}.{:016x}", sys::getpid(), nonce).as_bytes()),
+        1 => cand.extend_from_slice(format!("tmp.{}", sys::getpid()).as_bytes()),
+        2 => cand
+            .extend_from_slice(format!("t{}{:06x}", sys::getpid(), nonce & 0xff_ffff).as_bytes()),
+        _ => cand.extend_from_slice(format!("t{}", sys::getpid()).as_bytes()),
+    }
+    cand
+}
+
 /// Whether a pidfile may replace the object at `path`.
 ///
 /// `write_pidfile` renames a temporary file over the target, so a device, a
@@ -425,33 +480,42 @@ pub fn pidfile_writable(path: &[u8]) -> bool {
 /// Whether `inject` can create and replace a pidfile at `path`.
 ///
 /// `access(W_OK)` succeeds for root on a read-only filesystem and on /proc, so
-/// this creates a uniquely named file in the parent and removes it again. The
-/// write itself creates a unique temporary file beside the path with `O_EXCL`
-/// and renames it into place.
+/// this creates the same temporary file `write_pidfile` will create and
+/// removes it again. Testing the real name matters: a short probe name in the
+/// parent passes for a basename that is close to `NAME_MAX` and then fails
+/// after the stubs are spawned.
 pub fn pidfile_creatable(path: &[u8]) -> bool {
     if !pidfile_writable(path) {
         return false;
     }
     let path = path.strip_suffix(&[0]).unwrap_or(path);
     let flags = sys::O_WRONLY | sys::O_CREAT | sys::O_EXCL | sys::O_NOFOLLOW;
-    // Test the name `write_pidfile` will actually create, not a short probe
-    // name in the parent. A basename close to NAME_MAX passes a short probe
-    // and then fails after the stubs are spawned.
-    for _ in 0..8u64 {
-        let mut cand = path.to_vec();
-        let mut b = Buf::new();
-        b.push_str(".tmp.");
-        b.push_u64(sys::getpid() as u64);
-        b.push(b'.');
-        b.push_str(&format!("{:016x}", sys::monotonic_ns()));
-        cand.extend_from_slice(b.as_bytes());
-        let fd = sys::open(&cand, flags, 0o600);
-        if fd >= 0 {
+    for level in 0..pidfile_temp_levels() {
+        let mut made = false;
+        let mut too_long = false;
+        for retry in 0..8u64 {
+            let nonce = sys::monotonic_ns() ^ retry.wrapping_mul(0x9e3779b97f4a7c15);
+            let name = pidfile_temp_name(path, level, nonce);
+            let fd = sys::open(&name, flags, 0o600);
+            if fd < 0 {
+                match sys::last_error().raw_os_error() {
+                    Some(libc::EEXIST) => continue,
+                    Some(libc::ENAMETOOLONG) => {
+                        too_long = true;
+                        break;
+                    }
+                    _ => return false,
+                }
+            }
             sys::close(fd);
-            let _ = std::fs::remove_file(Path::new(OsStr::from_bytes(&cand)));
+            let _ = std::fs::remove_file(Path::new(OsStr::from_bytes(&name)));
+            made = true;
+            break;
+        }
+        if made {
             return true;
         }
-        if sys::last_error().raw_os_error() != Some(libc::EEXIST) {
+        if !too_long {
             return false;
         }
     }

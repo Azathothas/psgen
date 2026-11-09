@@ -175,7 +175,7 @@ fn exists(name: &[u8]) -> bool {
     false
 }
 
-pub fn run(rng: &mut Rng, opts: &Opts, binaries: bool) -> i32 {
+pub fn run(rng: &mut Rng, opts: &Opts, binaries: bool, require_binaries: bool) -> i32 {
     let cmds = gen::all_commands(rng, opts);
     let mut deny_hits = 0usize;
     let mut placeholder_hits = 0usize;
@@ -230,6 +230,13 @@ pub fn run(rng: &mut Rng, opts: &Opts, binaries: bool) -> i32 {
     let mut out = Buf::new();
     out.push_str("templates: ");
     out.push_u64(corpus::CORPUS.len() as u64);
+    if let Some(f) = opts.family {
+        out.push_str(" (");
+        out.push_u64(cmds.len() as u64);
+        out.push_str(" in family ");
+        out.push_str(corpus::family_name(f));
+        out.push(b')');
+    }
     out.push_str("\nexpanded:  ");
     out.push_u64(cmds.len() as u64);
     out.push_str("\ndeny hits: ");
@@ -251,7 +258,12 @@ pub fn run(rng: &mut Rng, opts: &Opts, binaries: bool) -> i32 {
     if !report.as_bytes().is_empty() {
         sys::out(report.as_bytes());
     }
-    if deny_hits + placeholder_hits + control_hits + empty_hits > 0 {
+    // A missing executable is a fact about the host, not about the corpus, so
+    // `--binaries` reports and `--require-binaries` fails. Exiting 0 with 148
+    // of 181 missing made the flag useless as a CI step.
+    let corpus_bad = deny_hits + placeholder_hits + control_hits + empty_hits > 0;
+    let host_bad = require_binaries && missing > 0;
+    if corpus_bad || host_bad {
         1
     } else {
         0

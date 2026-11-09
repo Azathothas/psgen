@@ -137,6 +137,10 @@ pub fn prepare(rows: &mut [Proc], args: &Args, create_users: bool) -> Prep {
         warnings.push("--create-users has no effect with --no-root".to_string());
     } else if args.create_users && !args.user {
         warnings.push("--create-users has no effect with --no-user".to_string());
+    } else if args.create_users && !root {
+        // `useradd` needs root as well, so saying only "user switching needs
+        // root" leaves the caller thinking sudo would fix both.
+        warnings.push("--create-users needs root; no accounts were created".to_string());
     }
     if !args.mem && args.mem_cap_mb > 0 {
         warnings.push("--mem-cap has no effect with --no-mem".to_string());
@@ -298,9 +302,7 @@ pub fn prepare(rows: &mut [Proc], args: &Args, create_users: bool) -> Prep {
             phys_scale = scale_rss(rows, budget, base_kb, page);
             let sum2: u64 = rows.iter().map(|p| p.rss as u64).sum();
             let max2 = rows.iter().map(|p| p.rss as u64).max().unwrap_or(0);
-            phys_estimate_kb = max2
-                .saturating_add(sum2 / 512)
-                .saturating_add(base_kb);
+            phys_estimate_kb = max2.saturating_add(sum2 / 512).saturating_add(base_kb);
         }
         if budget > 0 && phys_estimate_kb > budget {
             warnings.push(format!(
@@ -453,6 +455,15 @@ fn duration_for(p: &Proc, args: &Args) -> u32 {
     }
 }
 
+/// The two secrets/paths a config carries that are the same for every row of
+/// one run.
+struct RunPaths<'a> {
+    bind: bool,
+    self_copy: &'a [u8],
+    nonce: &'a [u8],
+}
+
+#[allow(clippy::too_many_arguments)]
 fn make_config(
     row: usize,
     rows: &[Proc],
@@ -460,9 +471,9 @@ fn make_config(
     fd_of: &[i32],
     args: &Args,
     temp: &[u8],
-    bind: bool,
-    self_copy: &[u8],
+    run: &RunPaths,
 ) -> stub::Config {
+    let bind = run.bind;
     let p = &rows[row];
     let mut keep = Vec::new();
     descendants(row, children, &mut keep);
@@ -508,7 +519,8 @@ fn make_config(
         user: p.user.clone(),
         temp: temp.to_vec(),
         disk_kb,
-        self_copy: self_copy.to_vec(),
+        self_copy: run.self_copy.to_vec(),
+        nonce: run.nonce.to_vec(),
         child_fds,
         keep_fds,
         max_fd,
@@ -559,30 +571,42 @@ fn read_status_records(fd: i32, want: usize, timeout_ms: u64) -> Vec<(i32, i32, 
     out
 }
 
-fn random_hex16() -> [u8; 16] {
-    let mut raw = [0u8; 8];
+/// Hex characters for a temporary name. A `getrandom` denial must not be able
+/// to panic after the stubs are already running, so every fallback path is
+/// total and the whole buffer is filled.
+fn random_hex(bytes: usize) -> Vec<u8> {
+    let mut raw = vec![0u8; bytes];
     if !sys::getrandom(&mut raw) {
-        raw[..4].copy_from_slice(&sys::getpid().to_le_bytes());
-        // The buffer is 8 bytes and the tail is 4, so copy four bytes of
-        // the clock rather than the whole u64.
-        raw[4..].copy_from_slice(&sys::monotonic_ns().to_le_bytes()[..4]);
+        // Mix the pid and the clock, which is all this needs to be unique
+        // inside one directory.
+        let mut x =
+            (sys::getpid() as u64).rotate_left(17) ^ sys::monotonic_ns() ^ (sys::now_secs() << 20);
+        for chunk in raw.chunks_mut(8) {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let b = x.to_le_bytes();
+            let n = chunk.len();
+            chunk.copy_from_slice(&b[..n]);
+        }
     }
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = [0u8; 16];
-    for (i, b) in raw.iter().enumerate() {
-        out[i * 2] = HEX[(b >> 4) as usize];
-        out[i * 2 + 1] = HEX[(b & 0x0f) as usize];
+    let mut out = Vec::with_capacity(bytes * 2);
+    for b in &raw {
+        out.push(HEX[(b >> 4) as usize]);
+        out.push(HEX[(b & 0x0f) as usize]);
     }
     out
 }
 
-fn write_pidfile(path: &[u8], pids: &[i32], temps: &[std::path::PathBuf]) -> bool {
-    if !probe::pidfile_target_ok(path) {
-        return false;
-    }
+/// Build the pidfile contents: header, `# temp` lines, then one identity line
+/// per PID.
+fn pidfile_body(pids: &[i32], temps: &[std::path::PathBuf]) -> Buf {
     let boot = util::boot_id();
     let mut buf = Buf::new();
-    buf.push_str("# psgen 0.0.1 boot ");
+    buf.push_bytes(crate::version::PIDFILE_PREFIX);
+    buf.push_str(crate::version::VERSION);
+    buf.push_str(" boot ");
     buf.push_bytes(&boot);
     buf.push(b'\n');
     for t in temps {
@@ -592,6 +616,7 @@ fn write_pidfile(path: &[u8], pids: &[i32], temps: &[std::path::PathBuf]) -> boo
     }
     let mut sorted = pids.to_vec();
     sorted.sort_unstable();
+    sorted.dedup();
     for pid in &sorted {
         let st = live::read_starttime(*pid).unwrap_or(0);
         let comm = live::read_comm(*pid).unwrap_or_default();
@@ -602,47 +627,63 @@ fn write_pidfile(path: &[u8], pids: &[i32], temps: &[std::path::PathBuf]) -> boo
         buf.push_bytes(&comm);
         buf.push(b'\n');
     }
-    let flags = sys::O_WRONLY | sys::O_CREAT | sys::O_EXCL | sys::O_NOFOLLOW;
-    let mut tmp = Vec::new();
-    let mut fd = -1;
-    for _ in 0..100u64 {
-        let suffix = random_hex16();
-        let mut cand = path.to_vec();
-        let mut b = Buf::new();
-        b.push_str(".tmp.");
-        b.push_u64(sys::getpid() as u64);
-        b.push(b'.');
-        b.push_bytes(&suffix);
-        cand.extend_from_slice(b.as_bytes());
-        let f = sys::open(&cand, flags, 0o600);
-        if f >= 0 {
-            fd = f;
-            tmp = cand;
-            break;
-        }
-        if sys::last_error().raw_os_error() != Some(libc::EEXIST) {
-            return false;
-        }
-    }
-    if fd < 0 {
-        return false;
-    }
-    let ok = sys::write_fd(fd, buf.as_bytes());
-    sys::close(fd);
-    if !ok {
-        let _ = std::fs::remove_file(Path::new(std::ffi::OsStr::from_bytes(&tmp)));
-        return false;
-    }
-    let renamed = std::fs::rename(
-        Path::new(std::ffi::OsStr::from_bytes(&tmp)),
-        Path::new(std::ffi::OsStr::from_bytes(path)),
-    )
-    .is_ok();
-    if !renamed {
-        let _ = std::fs::remove_file(Path::new(std::ffi::OsStr::from_bytes(&tmp)));
-    }
-    renamed
+    buf
 }
+
+/// Write a header-only pidfile before anything is spawned.
+///
+/// `spawn()` cannot write the PIDs until it has them, and a write that fails
+/// after the fork leaves live stubs with no record. Proving the write works
+/// first, and leaving a valid psgen pidfile behind, makes the later rewrite an
+/// overwrite of a file the caller already has.
+pub fn write_pending_pidfile(path: &[u8]) -> bool {
+    write_pidfile(path, &[], &[])
+}
+
+/// Write the pidfile, falling back to shorter temporary names when the target
+/// basename is close to `NAME_MAX`.
+fn write_pidfile(path: &[u8], pids: &[i32], temps: &[std::path::PathBuf]) -> bool {
+    if !probe::pidfile_target_ok(path) {
+        return false;
+    }
+    let buf = pidfile_body(pids, temps);
+    let flags = sys::O_WRONLY | sys::O_CREAT | sys::O_EXCL | sys::O_NOFOLLOW;
+    for level in 0..probe::pidfile_temp_levels() {
+        for retry in 0..16u64 {
+            let nonce = sys::monotonic_ns()
+                ^ ((sys::getpid() as u64) << 32)
+                ^ retry.wrapping_mul(0x9e3779b97f4a7c15);
+            let tmp = probe::pidfile_temp_name(path, level, nonce);
+            let fd = sys::open(&tmp, flags, 0o600);
+            if fd < 0 {
+                match sys::last_error().raw_os_error() {
+                    Some(libc::EEXIST) => continue,
+                    Some(libc::ENAMETOOLONG) => break,
+                    _ => return false,
+                }
+            }
+            let ok = sys::write_fd(fd, buf.as_bytes()) && sys::fsync_fd(fd);
+            sys::close(fd);
+            if !ok {
+                let _ = std::fs::remove_file(Path::new(std::ffi::OsStr::from_bytes(&tmp)));
+                return false;
+            }
+            let renamed = std::fs::rename(
+                Path::new(std::ffi::OsStr::from_bytes(&tmp)),
+                Path::new(std::ffi::OsStr::from_bytes(path)),
+            )
+            .is_ok();
+            if !renamed {
+                let _ = std::fs::remove_file(Path::new(std::ffi::OsStr::from_bytes(&tmp)));
+                return false;
+            }
+            return true;
+        }
+    }
+    false
+}
+
+const OWNER_FILE: &[u8] = b".psgen-owner";
 
 fn make_temp_dir(idx: usize) -> Option<std::path::PathBuf> {
     make_temp_dir_in(&std::env::temp_dir(), idx)
@@ -661,9 +702,122 @@ fn make_temp_dir_in(base: &Path, idx: usize) -> Option<std::path::PathBuf> {
             let _ = std::fs::remove_dir(&p);
             continue;
         }
+        // Record who owns this directory, with the owner's starttime, so a
+        // later prune can tell a live run from a recycled PID.
+        let start = live::read_starttime(sys::getpid()).unwrap_or(0);
+        let owner = format!("{} {}\n", sys::getpid(), start);
+        let _ = std::fs::write(
+            p.join(std::ffi::OsStr::from_bytes(OWNER_FILE)),
+            owner.as_bytes(),
+        );
         return Some(std::fs::canonicalize(&p).unwrap_or(p));
     }
     None
+}
+
+/// The injector PID encoded in a staging directory name, if the name matches
+/// `.psgen-<pid>-<idx>-<n>`.
+fn staging_pid(name: &[u8]) -> Option<i32> {
+    let rest = name.strip_prefix(b".psgen-")?;
+    let parts: Vec<&[u8]> = rest.split(|b| *b == b'-').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    if !parts
+        .iter()
+        .all(|p| !p.is_empty() && p.iter().all(|b| b.is_ascii_digit()))
+    {
+        return None;
+    }
+    str::parse_u64(parts[0]).and_then(|v| i32::try_from(v).ok())
+}
+
+fn read_owner_marker(dir: &Path) -> Option<(i32, u64)> {
+    let text = std::fs::read(dir.join(std::ffi::OsStr::from_bytes(OWNER_FILE))).ok()?;
+    let mut it = text.split(|b| *b == b' ' || *b == b'\n');
+    let pid = str::parse_u64(it.next()?)?;
+    let start = str::parse_u64(it.next().unwrap_or(b""))?;
+    Some((i32::try_from(pid).ok()?, start))
+}
+
+/// Remove the staging directories of runs whose injector is gone.
+///
+/// A `--duration` run that nobody stops leaves its shadow copy and `--disk`
+/// data behind: the injector exits, the stub dies on its alarm, and nothing
+/// else knows the directory exists. The directory name already carries the
+/// injector PID, and the owner marker carries its starttime, so a recycled PID
+/// cannot keep a dead run's directory alive. Directories newer than a minute
+/// are left alone, which covers a concurrent run that has created the
+/// directory but not yet written its marker.
+pub fn prune_staging(prep: &Prep) -> usize {
+    let mut roots: Vec<std::path::PathBuf> = vec![std::env::temp_dir()];
+    if let Some(d) = &prep.shadow_root {
+        let p = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(d));
+        if p != std::env::temp_dir() {
+            roots.push(p);
+        }
+    }
+    let mut removed = 0usize;
+    for root in roots {
+        removed += prune_root(&root);
+    }
+    removed
+}
+
+fn prune_root(root: &Path) -> usize {
+    use std::os::unix::fs::MetadataExt;
+    let me = sys::geteuid();
+    let now = sys::now_secs();
+    let rd = match std::fs::read_dir(root) {
+        Ok(rd) => rd,
+        Err(_) => return 0,
+    };
+    let mut removed = 0usize;
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let nameb = name.as_os_str().as_bytes();
+        let pid = match staging_pid(nameb) {
+            Some(p) => p,
+            None => continue,
+        };
+        let path = e.path();
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        // Only a real directory (not a symlink) owned by the caller.
+        if !meta.file_type().is_dir() || meta.uid() != me {
+            continue;
+        }
+        match read_owner_marker(&path) {
+            Some((owner, start)) => {
+                // The marker names the injector and its starttime, so a
+                // recycled PID cannot keep a dead run's directory alive. A
+                // live injector of another user is skipped here too: its
+                // starttime matches.
+                if live::read_starttime(owner) == Some(start) {
+                    continue;
+                }
+            }
+            None => {
+                // A directory a run has created but not yet marked is left
+                // alone for a minute; after that only a PID that is entirely
+                // gone is safe to reclaim.
+                if now.saturating_sub(meta.mtime().max(0) as u64) < 60 {
+                    continue;
+                }
+                let mut procpath = b"/proc/".to_vec();
+                procpath.extend_from_slice(pid.to_string().as_bytes());
+                if Path::new(std::ffi::OsStr::from_bytes(&procpath)).exists() {
+                    continue;
+                }
+            }
+        }
+        if std::fs::remove_dir_all(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 fn redirect_stdio() {
@@ -708,8 +862,8 @@ pub fn spawn(rows: &[Proc], args: &Args, prep: &Prep) -> Result<SpawnResult, Str
             .shadow_root
             .as_ref()
             .expect("an exe tier of shadow needs a shadow root");
-        let made = make_temp_dir_in(Path::new(std::ffi::OsStr::from_bytes(dir)), 9_000)
-            .ok_or_else(|| {
+        let made =
+            make_temp_dir_in(Path::new(std::ffi::OsStr::from_bytes(dir)), 9_000).ok_or_else(|| {
                 format!(
                     "cannot create a directory in {} for --shadow-dir",
                     String::from_utf8_lossy(dir)
@@ -850,6 +1004,10 @@ pub fn spawn(rows: &[Proc], args: &Args, prep: &Prep) -> Result<SpawnResult, Str
     sys::set_child_subreaper();
     let mut root_pids: Vec<(i32, u64)> = Vec::new();
     let mut all_temps: Vec<std::path::PathBuf> = Vec::new();
+    // The secret that ties a config descriptor to this run. It goes in the
+    // environment, not argv: argv is what `ps aux` renders, and the template
+    // command line has to stay byte-exact.
+    let nonce = random_hex(8);
 
     for root in roots {
         let mut nodes = Vec::new();
@@ -858,8 +1016,15 @@ pub fn spawn(rows: &[Proc], args: &Args, prep: &Prep) -> Result<SpawnResult, Str
         let mut cfg_fds: Vec<(usize, i32)> = Vec::with_capacity(nodes.len());
         let mut failed = false;
         for node in &nodes {
-            // write_config_fd ftruncates and pwrites, so the file starts empty.
-            let fd = sys::anon_file(b"cfg", 0);
+            // The config is a memfd that is sealed after it is written, so the
+            // stub can prove nothing rewrote it after its check; the unlinked
+            // temp file is the fallback, and has no name to reopen either.
+            let fd = sys::anon_sealable_file(b"cfg", 0);
+            let fd = if fd >= 0 {
+                fd
+            } else {
+                sys::anon_file(b"cfg", 0)
+            };
             if fd < 0 {
                 failed = true;
                 break;
@@ -917,13 +1082,19 @@ pub fn spawn(rows: &[Proc], args: &Args, prep: &Prep) -> Result<SpawnResult, Str
                 &fd_of,
                 args,
                 &temp,
-                bind,
-                &self_copy,
+                &RunPaths {
+                    bind,
+                    self_copy: &self_copy,
+                    nonce: &nonce,
+                },
             );
             if !write_config_fd(*fd, &cfg) {
                 failed = true;
                 break;
             }
+            // Best effort: a kernel that refuses the seals still leaves a
+            // memfd, which has no name for anyone else to open.
+            sys::fd_add_seals(*fd);
         }
         if failed {
             for (_, fd) in &cfg_fds {
@@ -946,8 +1117,12 @@ pub fn spawn(rows: &[Proc], args: &Args, prep: &Prep) -> Result<SpawnResult, Str
                 sys::close(root_cfg_fd);
             }
             redirect_stdio();
+            // The nonce goes in the environment, not argv: argv is what
+            // `ps aux` renders and the template command line has to stay
+            // byte-exact.
+            let nonce_line = stub::nonce_env_line(&nonce);
+            let env = stub::envp_with(&nonce_line);
             let (buf, argv) = stub::build_argv(&rows[root].cmd);
-            let env = stub::envp();
             // /proc/self/exe still resolves after the binary is replaced or
             // deleted; the stored path is only the fallback.
             if sys::execve(b"/proc/self/exe", &argv, &env) < 0 {
@@ -1097,26 +1272,7 @@ fn current_exe_bytes() -> Vec<u8> {
         .unwrap_or_default()
 }
 
-fn exe_matches(pid: i32, me: &[u8]) -> bool {
-    let mut path = b"/proc/".to_vec();
-    let mut b = Buf::new();
-    b.push_u64(pid as u64);
-    path.extend_from_slice(b.as_bytes());
-    path.extend_from_slice(b"/exe");
-    let got = match sys::read_link(&path) {
-        Some(g) => g,
-        None => return false,
-    };
-    if got == me {
-        return true;
-    }
-    let deleted = b" (deleted)";
-    got.len() > deleted.len()
-        && &got[got.len() - deleted.len()..] == deleted
-        && &got[..got.len() - deleted.len()] == me
-}
-
-fn safe_temp_dir(t: &[u8]) -> bool {
+pub fn safe_temp_dir(t: &[u8]) -> bool {
     let p = Path::new(std::ffi::OsStr::from_bytes(t));
     if !p.is_absolute() {
         return false;
@@ -1147,7 +1303,137 @@ fn safe_temp_dir(t: &[u8]) -> bool {
             .all(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
 }
 
-pub fn stop(path: &[u8], force: bool) -> i32 {
+/// How `/proc/PID/exe` identifies a stub.
+enum ExeKind {
+    /// The psgen binary itself, i.e. a proc-self row.
+    Psgen,
+    /// A shadow copy inside a staging directory owned by the caller.
+    Shadow,
+    /// Something else. Bind-tier rows land here with the template path.
+    Other(Vec<u8>),
+}
+
+fn exe_identity(pid: i32, me: &[u8]) -> ExeKind {
+    let mut path = b"/proc/".to_vec();
+    let mut b = Buf::new();
+    b.push_u64(pid as u64);
+    path.extend_from_slice(b.as_bytes());
+    path.extend_from_slice(b"/exe");
+    let got = match sys::read_link(&path) {
+        Some(g) => g,
+        None => return ExeKind::Other(Vec::new()),
+    };
+    // A deleted executable is still the same file, which is what the link
+    // would have said before the unlink.
+    let deleted = b" (deleted)";
+    let real = if got.len() > deleted.len() && got.ends_with(deleted) {
+        got[..got.len() - deleted.len()].to_vec()
+    } else {
+        got.clone()
+    };
+    if real == me {
+        return ExeKind::Psgen;
+    }
+    // A shadow copy is `<staging dir>/psgen-stub`, and the staging directory
+    // name is checked by the same predicate `stop` uses before removing one.
+    if str::basename(&real) == b"psgen-stub" {
+        if let Some(parent) = Path::new(std::ffi::OsStr::from_bytes(&real)).parent() {
+            if safe_temp_dir(parent.as_os_str().as_bytes()) {
+                return ExeKind::Shadow;
+            }
+        }
+    }
+    ExeKind::Other(real)
+}
+
+/// Whether a command line looks like one the corpus would produce.
+///
+/// Used only to recognise a bind-tier row that a one-field pidfile line cannot
+/// identify, so `stop` can say so instead of reporting success.
+fn corpus_command(cmdline: &[u8], exe: &[u8]) -> bool {
+    if cmdline.is_empty() {
+        return false;
+    }
+    for t in corpus::CORPUS.iter() {
+        let tmpl = t.cmd.as_bytes();
+        let prefix = match tmpl.iter().position(|b| *b == b'{') {
+            Some(p) => &tmpl[..p],
+            None => tmpl,
+        };
+        if !str::starts_with(cmdline, prefix) {
+            continue;
+        }
+        if prefix.len() == tmpl.len() && cmdline != tmpl {
+            continue;
+        }
+        let want = gen::template_exe(t);
+        if exe.is_empty() || want.is_empty() || want == exe {
+            return true;
+        }
+    }
+    false
+}
+
+fn read_cmdline_text(pid: i32) -> Vec<u8> {
+    let mut path = b"/proc/".to_vec();
+    path.extend_from_slice(pid.to_string().as_bytes());
+    path.extend_from_slice(b"/cmdline");
+    let mut buf = [0u8; 8192];
+    let n = match sys::read_file(&path, &mut buf) {
+        Some(n) => n,
+        None => return Vec::new(),
+    };
+    let mut out = Vec::with_capacity(n);
+    for b in &buf[..n] {
+        if *b == 0 {
+            if out.last() != Some(&b' ') {
+                out.push(b' ');
+            }
+        } else if *b < 0x20 || *b == 0x7f {
+            out.push(b'?');
+        } else {
+            out.push(*b);
+        }
+    }
+    str::trim(&out).to_vec()
+}
+
+struct StopLine {
+    pid: i32,
+    start: Option<u64>,
+    comm: Vec<u8>,
+}
+
+fn parse_stop_line(line: &[u8]) -> Option<StopLine> {
+    let fields: Vec<&[u8]> = line.splitn(3, |b| *b == b'\t').collect();
+    let pid = str::parse_i64(fields[0])?;
+    if pid <= 0 || pid > i32::MAX as i64 {
+        return None;
+    }
+    let start = if fields.len() >= 2 {
+        str::parse_u64(fields[1])
+    } else {
+        None
+    };
+    let comm = if fields.len() == 3 {
+        fields[2].to_vec()
+    } else {
+        Vec::new()
+    };
+    Some(StopLine {
+        pid: pid as i32,
+        start,
+        comm,
+    })
+}
+
+/// Stop (or, with `plan`, describe) every process a pidfile names.
+///
+/// A line counts as stopped only once the process is gone or a zombie. A
+/// zombie is already dead and a signal to it succeeds and does nothing, so
+/// counting signals would report a second stop as having stopped the same
+/// processes again.
+pub fn stop(path: &[u8], force: bool, plan: bool, quiet: bool) -> i32 {
     let text = match sys::read_file_nofollow(path, 1 << 20) {
         Some(t) => t,
         None => {
@@ -1157,21 +1443,31 @@ pub fn stop(path: &[u8], force: bool) -> i32 {
     };
     let mut header_boot: Option<Vec<u8>> = None;
     let mut temp_dirs: Vec<Vec<u8>> = Vec::new();
-    let mut lines: Vec<&[u8]> = text.split(|b| *b == b'\n').collect();
-    for line in &lines {
-        if let Some(rest) = line.strip_prefix(b"# psgen 0.0.1 boot ") {
-            let boot = str::trim(rest).to_vec();
-            if let Some(prev) = &header_boot {
-                if *prev != boot {
-                    sys::err(b"psgen: pidfile has conflicting boot ids\n");
-                    return 1;
-                }
-            } else {
-                header_boot = Some(boot);
-            }
+    let mut lines: Vec<StopLine> = Vec::new();
+    let mut malformed = 0usize;
+    for raw in text.split(|b| *b == b'\n') {
+        if raw.is_empty() {
+            continue;
         }
-        if let Some(rest) = line.strip_prefix(b"# temp ") {
-            temp_dirs.push(str::trim(rest).to_vec());
+        if raw[0] == b'#' {
+            if let Some(boot) = crate::version::pidfile_boot_id(raw) {
+                if let Some(prev) = &header_boot {
+                    if *prev != boot {
+                        sys::err(b"psgen: pidfile has conflicting boot ids\n");
+                        return 1;
+                    }
+                } else {
+                    header_boot = Some(boot);
+                }
+            }
+            if let Some(rest) = raw.strip_prefix(b"# temp ") {
+                temp_dirs.push(str::trim(rest).to_vec());
+            }
+            continue;
+        }
+        match parse_stop_line(raw) {
+            Some(l) => lines.push(l),
+            None => malformed += 1,
         }
     }
     if let Some(hb) = &header_boot {
@@ -1182,163 +1478,192 @@ pub fn stop(path: &[u8], force: bool) -> i32 {
         }
     }
     let me = current_exe_bytes();
-    let identity_matches = |pid: i32, fields: &[&[u8]]| -> bool {
-        if fields.len() >= 2 {
-            let want_start = str::parse_u64(fields[1]).unwrap_or(0);
-            let want_comm = if fields.len() == 3 { fields[2] } else { b"" };
-            let cur_start = live::read_starttime(pid);
-            let cur_comm = live::read_comm(pid);
-            cur_start == Some(want_start)
-                && (want_comm.is_empty() || cur_comm.as_deref() == Some(want_comm))
-        } else {
-            // A one-field line carries no starttime, so the exe check
-            // is the only identity guard. --force covers the boot id only.
-            exe_matches(pid, &me)
-        }
-    };
-    let mut count = 0usize;
+    // Children before roots: a root's process-group kill reaches every child
+    // that stayed in the group, and those children are then already gone when
+    // their own lines are reached. Deepest PID first gives every line its own
+    // signal, which makes the count stable.
+    lines.sort_unstable_by_key(|l| std::cmp::Reverse(l.pid));
+
+    let mut signalled: Vec<(i32, u64)> = Vec::new();
+    let mut planned = 0usize;
     let mut skipped = 0usize;
     let mut failed = 0usize;
-    // Children before roots. A root's process group kill reaches every child
-    // that stayed in the group, and those children are reaped before their own
-    // pidfile lines are reached, which made the "stopped" count depend on
-    // timing. Signalling the deepest PIDs first gives each line its own
-    // signal, and the root's group kill then only catches stragglers that
-    // never reported.
-    lines.reverse();
-
-    for line in &mut lines {
-        if line.is_empty() || line[0] == b'#' {
-            continue;
+    let note = |quiet: bool, what: &[u8], pid: i32, why: Option<&[u8]>| {
+        if quiet {
+            return;
         }
-        let fields: Vec<&[u8]> = line.splitn(3, |b| *b == b'\t').collect();
-        let pid = match str::parse_i64(fields[0]) {
-            Some(p) if p > 0 && p <= i32::MAX as i64 => p as i32,
-            _ => {
-                skipped += 1;
-                continue;
-            }
-        };
-        // PID 1 is never a psgen stub, whatever the pidfile says.
+        let mut out = Buf::new();
+        out.push_str("psgen: ");
+        out.push_bytes(what);
+        out.push(b' ');
+        out.push_u64(pid as u64);
+        if let Some(w) = why {
+            out.push_str(" (");
+            out.push_bytes(w);
+            out.push(b')');
+        }
+        out.push(b'\n');
+        sys::err(out.as_bytes());
+    };
+
+    for line in &lines {
+        let pid = line.pid;
         if pid == 1 {
             skipped += 1;
+            note(quiet, b"skip", pid, Some(b"PID 1 is never a psgen stub"));
             continue;
         }
         if pid == sys::getpid() {
+            skipped += 1;
             continue;
         }
-        let pfd = sys::pidfd_open(pid);
-        if pfd < 0 {
-            let open_err = sys::last_error().raw_os_error();
-            if open_err == Some(libc::ESRCH) {
-                skipped += 1;
-                continue;
-            }
-            // No pidfd: check the identity and kill by PID. Only a group
-            // leader owns a process group whose ID is its PID. A stale group
-            // with that ID can exist after PID reuse, so do not signal it for
-            // a non-leader.
-            if !identity_matches(pid, &fields) {
-                // EPERM or EACCES means the PID exists but the caller may not
-                // inspect it (for example /proc mounted with hidepid=2).
-                // That is not the same as a gone PID.
-                if matches!(open_err, Some(libc::EPERM) | Some(libc::EACCES))
-                    || live::read_starttime(pid).is_none()
-                {
-                    failed += 1;
-                } else {
-                    skipped += 1;
-                }
-                continue;
-            }
-            let leader = live::read_stat(pid)
-                .map(|s| s.pgrp == pid as i64)
-                .unwrap_or(false);
-            if leader {
-                if sys::kill(-pid, sys::SIGKILL) {
-                    count += 1;
-                    continue;
-                }
-                if sys::last_error().raw_os_error() != Some(libc::ESRCH) {
-                    failed += 1;
-                    continue;
-                }
-            }
-            if sys::kill(pid, sys::SIGKILL) {
-                count += 1;
-            } else if sys::last_error().raw_os_error() == Some(libc::ESRCH) {
-                skipped += 1;
-            } else {
-                failed += 1;
-            }
-            continue;
-        }
-        // The pidfd pins the process, so the identity read below and the
-        // signal that follows cannot land on a reused PID. Read stat once:
-        // its starttime and pgrp are both needed, and a second read here
-        // gives the already killed children time to be reaped before their
-        // pidfile lines are reached.
         let info = live::read_stat(pid);
         let cur_start = info.as_ref().map(|s| s.starttime);
-        let cur_comm = live::read_comm(pid);
-        let matches = if fields.len() >= 2 {
-            let want_start = str::parse_u64(fields[1]).unwrap_or(0);
-            let want_comm = if fields.len() == 3 { fields[2] } else { b"" };
-            cur_start == Some(want_start)
-                && (want_comm.is_empty() || cur_comm.as_deref() == Some(want_comm))
-        } else {
-            exe_matches(pid, &me)
-        };
-        if !matches {
-            // The pidfd proves the PID exists. If the identity cannot be read,
-            // the process is unreadable, not gone; keep the temp dirs and
-            // return nonzero.
-            if cur_start.is_none() {
+        let cur_state = info.as_ref().map(|s| s.state).unwrap_or(0);
+        if info.is_none() {
+            // Gone, or unreadable. A PID that still has a /proc entry but
+            // cannot be inspected is a failure, not a successful stop.
+            let mut procpath = b"/proc/".to_vec();
+            procpath.extend_from_slice(pid.to_string().as_bytes());
+            if Path::new(std::ffi::OsStr::from_bytes(&procpath)).exists() {
                 failed += 1;
+                note(quiet, b"cannot read", pid, Some(b"/proc entry unreadable"));
             } else {
                 skipped += 1;
+                note(quiet, b"skip", pid, Some(b"already gone"));
             }
-            sys::close(pfd);
             continue;
         }
-        // A leader's PID is its PGID. Kill the group so children that never
-        // wrote a status record are reached. For a non-leader, skip the group
-        // signal: a stale group with this ID can exist after PID reuse.
-        let leader = info
-            .map(|s| s.pgrp == pid as i64)
-            .unwrap_or(false);
-        if leader && sys::kill(-pid, sys::SIGKILL) {
-            count += 1;
-            sys::close(pfd);
+        if cur_state == b'Z' {
+            // Already dead. Its /proc entry outlives it while an init that does
+            // not reap holds it, and a signal to a zombie is a no-op.
+            skipped += 1;
+            note(quiet, b"skip", pid, Some(b"already a zombie"));
             continue;
         }
-        if leader && sys::last_error().raw_os_error() != Some(libc::ESRCH) {
-            failed += 1;
-            sys::close(pfd);
+        // Identity: three fields check starttime and comm, two check
+        // starttime, one can only check the executable.
+        let identical = if line.start.is_some() {
+            cur_start == line.start
+                && (line.comm.is_empty() || live::read_comm(pid).as_deref() == Some(&line.comm))
+        } else {
+            match exe_identity(pid, &me) {
+                ExeKind::Psgen | ExeKind::Shadow => true,
+                ExeKind::Other(exe) => {
+                    let cmd = read_cmdline_text(pid);
+                    if corpus_command(&cmd, &exe) {
+                        // This is a bind-tier row under a template path. A
+                        // one-field line cannot prove the identity without
+                        // also accepting the host's real daemon, so this is an
+                        // error, not a silent skip.
+                        failed += 1;
+                        let mut why = Buf::new();
+                        why.push_str(
+                            "a one-field line cannot identify a bind-tier row whose exe is ",
+                        );
+                        why.push_bytes(&exe);
+                        why.push_str("; use the three-field form");
+                        note(quiet, b"cannot identify", pid, Some(why.as_bytes()));
+                        continue;
+                    }
+                    false
+                }
+            }
+        };
+        if !identical {
+            skipped += 1;
+            note(quiet, b"skip", pid, Some(b"identity does not match"));
             continue;
         }
-        if sys::pidfd_send_signal(pfd, sys::SIGKILL) {
-            count += 1;
+        if plan {
+            let comm = live::read_comm(pid).unwrap_or_default();
+            let mut out = Buf::new();
+            out.push_str("would signal ");
+            out.push_u64(pid as u64);
+            out.push_str(" (");
+            out.push_bytes(&comm);
+            out.push_str(")\n");
+            sys::out(out.as_bytes());
+            planned += 1;
+            continue;
+        }
+        // A leader's PID is its PGID, so its group kill reaches children that
+        // never wrote a status record. For a non-leader the group signal would
+        // address a stale group, so signal the process itself.
+        let leader = info.as_ref().map(|s| s.pgrp == pid as i64).unwrap_or(false);
+        let mut delivered = false;
+        if leader {
+            if sys::kill(-pid, sys::SIGKILL) {
+                delivered = true;
+            } else if sys::last_error().raw_os_error() != Some(libc::ESRCH) {
+                failed += 1;
+                note(quiet, b"cannot signal", pid, Some(b"process group"));
+                continue;
+            }
+        }
+        if !delivered {
+            let pfd = sys::pidfd_open(pid);
+            if pfd >= 0 {
+                // The pidfd pins the process, so the signal cannot land on a
+                // reused PID.
+                delivered = sys::pidfd_send_signal(pfd, sys::SIGKILL);
+                if !delivered && sys::last_error().raw_os_error() == Some(libc::ESRCH) {
+                    sys::close(pfd);
+                    skipped += 1;
+                    note(quiet, b"skip", pid, Some(b"already gone"));
+                    continue;
+                }
+                sys::close(pfd);
+            }
+            if !delivered {
+                delivered = sys::kill(pid, sys::SIGKILL);
+            }
+        }
+        if delivered {
+            signalled.push((pid, cur_start.unwrap_or(0)));
         } else if sys::last_error().raw_os_error() == Some(libc::ESRCH) {
             skipped += 1;
+            note(quiet, b"skip", pid, Some(b"already gone"));
         } else {
-            // The pidfd could not signal; re-check the identity and kill by
-            // PID, which is no longer pinned now that the pidfd is closed.
-            sys::close(pfd);
-            if !identity_matches(pid, &fields) {
-                skipped += 1;
-            } else if sys::kill(pid, sys::SIGKILL) {
-                count += 1;
-            } else if sys::last_error().raw_os_error() == Some(libc::ESRCH) {
-                skipped += 1;
-            } else {
-                failed += 1;
-            }
-            continue;
+            failed += 1;
+            note(quiet, b"cannot signal", pid, None);
         }
-        sys::close(pfd);
     }
-    if failed == 0 {
+
+    let mut stopped = 0usize;
+    if !plan && !signalled.is_empty() {
+        // A `SIGKILL` returns before the process has exited, and a zombie is
+        // dead but still visible. Wait, bounded, until every signalled PID is
+        // gone or a zombie, so "stopped N" is true when it is printed.
+        let deadline = sys::monotonic_ns().saturating_add(2_000_000_000);
+        loop {
+            let mut left = 0usize;
+            for (pid, start) in &signalled {
+                if live::read_starttime(*pid) == Some(*start) && live::alive(*pid) {
+                    left += 1;
+                }
+            }
+            if left == 0 || sys::monotonic_ns() >= deadline {
+                break;
+            }
+            sys::nanosleep(0, 10_000_000);
+        }
+        for (pid, start) in &signalled {
+            if live::read_starttime(*pid) == Some(*start) && live::alive(*pid) {
+                failed += 1;
+                note(
+                    quiet,
+                    b"still running",
+                    *pid,
+                    Some(b"the signal did not land in 2 s"),
+                );
+            } else {
+                stopped += 1;
+            }
+        }
+    }
+
+    if failed == 0 && !plan {
         for t in &temp_dirs {
             if safe_temp_dir(t) {
                 let _ = std::fs::remove_dir_all(Path::new(std::ffi::OsStr::from_bytes(t)));
@@ -1346,12 +1671,18 @@ pub fn stop(path: &[u8], force: bool) -> i32 {
         }
     }
     let mut out = Buf::new();
-    out.push_str("stopped ");
-    out.push_u64(count as u64);
-    out.push_str(" processes");
-    if skipped > 0 {
+    if plan {
+        out.push_str("would stop ");
+        out.push_u64(planned as u64);
+        out.push_str(" processes");
+    } else {
+        out.push_str("stopped ");
+        out.push_u64(stopped as u64);
+        out.push_str(" processes");
+    }
+    if skipped > 0 || malformed > 0 {
         out.push_str(", skipped ");
-        out.push_u64(skipped as u64);
+        out.push_u64((skipped + malformed) as u64);
     }
     if failed > 0 {
         out.push_str(", failed ");
@@ -1359,5 +1690,9 @@ pub fn stop(path: &[u8], force: bool) -> i32 {
     }
     out.push(b'\n');
     sys::out(out.as_bytes());
-    if failed > 0 { 1 } else { 0 }
+    if failed > 0 {
+        1
+    } else {
+        0
+    }
 }

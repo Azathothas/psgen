@@ -4,6 +4,12 @@ version = "0.0.1"
 edition = "2021"
 description = "Generate realistic Linux process lists and inject them into the real process table"
 license = "0BSD"
+repository = "https://github.com/Azathothas/psgen"
+homepage = "https://github.com/Azathothas/psgen"
+readme = "README.md"
+keywords = ["procfs", "process-table", "monitoring", "linux", "testing"]
+categories = ["command-line-utilities", "development-tools::testing"]
+rust-version = "1.79"
 
 [[bin]]
 name = "psgen"
