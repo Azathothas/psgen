@@ -545,10 +545,13 @@ pub fn child_entry(fd: i32) -> ! {
     } else if !child.self_copy.is_empty() {
         child.self_copy.clone()
     } else {
-        match sys::read_link(b"/proc/self/exe") {
-            Some(p) => p,
-            None => b"/proc/self/exe".to_vec(),
-        }
+        // Exec the magic link, not the text readlink returns. When the stub
+        // has already entered a private mount namespace and the binary lives
+        // on another mount, the text path renders relative to that mount and
+        // does not exist outside the namespace. The magic link resolves to
+        // the file the process is already running, whose path stays visible
+        // to the caller.
+        b"/proc/self/exe".to_vec()
     };
     let (buf, argv) = build_argv(&child.cmd);
     if sys::dup2(fd, 3) != 3 {

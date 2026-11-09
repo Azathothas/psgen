@@ -43,7 +43,7 @@ pub fn render(count: usize, seed: u64, pidfile: &[u8], create_users: bool) -> Bu
     let mut out = Buf::new();
     out.push_str("[Unit]\n");
     out.push_str("Description=psgen synthetic process table\n");
-    out.push_str("After=local-fs.target proc-fs-nets.target\n");
+    out.push_str("After=local-fs.target sysinit.target\n");
     out.push_str("ConditionPathExists=/proc/self/stat\n\n");
     out.push_str("[Service]\n");
     out.push_str("Type=oneshot\n");
