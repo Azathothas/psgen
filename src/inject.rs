@@ -133,6 +133,17 @@ pub fn prepare(rows: &mut [Proc], args: &Args, create_users: bool) -> Prep {
             "--no-root disables user switching and the bind tier; --shadow-dir still selects a shadow copy".to_string(),
         );
     }
+    if args.create_users && args.no_root {
+        warnings.push("--create-users has no effect with --no-root".to_string());
+    } else if args.create_users && !args.user {
+        warnings.push("--create-users has no effect with --no-user".to_string());
+    }
+    if !args.mem && args.mem_cap_mb > 0 {
+        warnings.push("--mem-cap has no effect with --no-mem".to_string());
+    }
+    if !args.mem && args.phys_cap.is_some() {
+        warnings.push("--phys-cap has no effect with --no-mem".to_string());
+    }
     if args.verify && !args.mem {
         warnings.push("--verify has no effect with --no-mem".to_string());
     }
@@ -552,7 +563,9 @@ fn random_hex16() -> [u8; 16] {
     let mut raw = [0u8; 8];
     if !sys::getrandom(&mut raw) {
         raw[..4].copy_from_slice(&sys::getpid().to_le_bytes());
-        raw[4..].copy_from_slice(&sys::monotonic_ns().to_le_bytes());
+        // The buffer is 8 bytes and the tail is 4, so copy four bytes of
+        // the clock rather than the whole u64.
+        raw[4..].copy_from_slice(&sys::monotonic_ns().to_le_bytes()[..4]);
     }
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = [0u8; 16];
@@ -1186,6 +1199,14 @@ pub fn stop(path: &[u8], force: bool) -> i32 {
     let mut count = 0usize;
     let mut skipped = 0usize;
     let mut failed = 0usize;
+    // Children before roots. A root's process group kill reaches every child
+    // that stayed in the group, and those children are reaped before their own
+    // pidfile lines are reached, which made the "stopped" count depend on
+    // timing. Signalling the deepest PIDs first gives each line its own
+    // signal, and the root's group kill then only catches stragglers that
+    // never reported.
+    lines.reverse();
+
     for line in &mut lines {
         if line.is_empty() || line[0] == b'#' {
             continue;
@@ -1208,43 +1229,91 @@ pub fn stop(path: &[u8], force: bool) -> i32 {
         }
         let pfd = sys::pidfd_open(pid);
         if pfd < 0 {
-            if sys::last_error().raw_os_error() == Some(libc::ESRCH) {
+            let open_err = sys::last_error().raw_os_error();
+            if open_err == Some(libc::ESRCH) {
                 skipped += 1;
                 continue;
             }
-            // No pidfd: check the identity and kill by PID. A leader's PID is
-            // its PGID, so try the group first; a non-leader returns ESRCH.
+            // No pidfd: check the identity and kill by PID. Only a group
+            // leader owns a process group whose ID is its PID. A stale group
+            // with that ID can exist after PID reuse, so do not signal it for
+            // a non-leader.
             if !identity_matches(pid, &fields) {
-                skipped += 1;
+                // EPERM or EACCES means the PID exists but the caller may not
+                // inspect it (for example /proc mounted with hidepid=2).
+                // That is not the same as a gone PID.
+                if matches!(open_err, Some(libc::EPERM) | Some(libc::EACCES))
+                    || live::read_starttime(pid).is_none()
+                {
+                    failed += 1;
+                } else {
+                    skipped += 1;
+                }
                 continue;
             }
-            if sys::kill(-pid, sys::SIGKILL) {
+            let leader = live::read_stat(pid)
+                .map(|s| s.pgrp == pid as i64)
+                .unwrap_or(false);
+            if leader {
+                if sys::kill(-pid, sys::SIGKILL) {
+                    count += 1;
+                    continue;
+                }
+                if sys::last_error().raw_os_error() != Some(libc::ESRCH) {
+                    failed += 1;
+                    continue;
+                }
+            }
+            if sys::kill(pid, sys::SIGKILL) {
                 count += 1;
             } else if sys::last_error().raw_os_error() == Some(libc::ESRCH) {
-                if sys::kill(pid, sys::SIGKILL) {
-                    count += 1;
-                } else if sys::last_error().raw_os_error() == Some(libc::ESRCH) {
-                    skipped += 1;
-                } else {
-                    failed += 1;
-                }
+                skipped += 1;
             } else {
                 failed += 1;
             }
             continue;
         }
         // The pidfd pins the process, so the identity read below and the
-        // signal that follows cannot land on a reused PID.
-        if !identity_matches(pid, &fields) {
-            skipped += 1;
+        // signal that follows cannot land on a reused PID. Read stat once:
+        // its starttime and pgrp are both needed, and a second read here
+        // gives the already killed children time to be reaped before their
+        // pidfile lines are reached.
+        let info = live::read_stat(pid);
+        let cur_start = info.as_ref().map(|s| s.starttime);
+        let cur_comm = live::read_comm(pid);
+        let matches = if fields.len() >= 2 {
+            let want_start = str::parse_u64(fields[1]).unwrap_or(0);
+            let want_comm = if fields.len() == 3 { fields[2] } else { b"" };
+            cur_start == Some(want_start)
+                && (want_comm.is_empty() || cur_comm.as_deref() == Some(want_comm))
+        } else {
+            exe_matches(pid, &me)
+        };
+        if !matches {
+            // The pidfd proves the PID exists. If the identity cannot be read,
+            // the process is unreadable, not gone; keep the temp dirs and
+            // return nonzero.
+            if cur_start.is_none() {
+                failed += 1;
+            } else {
+                skipped += 1;
+            }
             sys::close(pfd);
             continue;
         }
         // A leader's PID is its PGID. Kill the group so children that never
-        // wrote a status record are reached; a non-leader returns ESRCH and
-        // the pidfd path below handles the process itself.
-        if sys::kill(-pid, sys::SIGKILL) {
+        // wrote a status record are reached. For a non-leader, skip the group
+        // signal: a stale group with this ID can exist after PID reuse.
+        let leader = info
+            .map(|s| s.pgrp == pid as i64)
+            .unwrap_or(false);
+        if leader && sys::kill(-pid, sys::SIGKILL) {
             count += 1;
+            sys::close(pfd);
+            continue;
+        }
+        if leader && sys::last_error().raw_os_error() != Some(libc::ESRCH) {
+            failed += 1;
             sys::close(pfd);
             continue;
         }
