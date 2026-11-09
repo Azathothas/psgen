@@ -5,7 +5,7 @@ use crate::rng::Rng;
 use crate::str::{self, Buf};
 use crate::sys;
 use crate::util;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -30,10 +30,16 @@ pub struct Proc {
 
 pub struct Opts {
     pub count: usize,
+    /// `--host-uptime`: pretend the host has been up this long. `None` reads
+    /// `/proc/uptime`.
+    pub uptime: Option<u64>,
     pub profile: Vec<u8>,
     pub family: Option<u8>,
     pub self_user: Vec<u8>,
     pub uniq: bool,
+    /// `--repeat-max`: raise the per-command repeat bound so a count the corpus
+    /// cannot supply realistically is still met. `None` keeps the bound.
+    pub repeat_max: Option<usize>,
 }
 
 /// Virtual size the stub needs before the template's own mappings. The std
@@ -52,6 +58,44 @@ pub struct Fit {
 }
 
 impl Fit {
+    /// How many distinct PIDs a synthetic table can show.
+    ///
+    /// PID 1 is always init in a generated table, so the usable space is
+    /// `2 .. pid_max - 1`: PID 0 and the negative PIDs the kernel reserves are
+    /// not something `ps` ever shows. A `pid_max` below 3 leaves no room at
+    /// all, which is a property of the host, not something to paper over with
+    /// a duplicate. 0 means "unknown": no cap.
+    pub fn pid_capacity(&self) -> Option<usize> {
+        if self.pid_max == 0 {
+            return None;
+        }
+        Some(self.pid_max.saturating_sub(2) as usize)
+    }
+
+    /// Why a table cannot hold `want` rows, if the host limits it.
+    pub fn shortfall_reason(&self, want: usize) -> Option<String> {
+        let cap = self.pid_capacity()?;
+        // PID 1 is init, so the table can show `cap` more rows.
+        let room = cap.saturating_add(1);
+        if want <= room {
+            return None;
+        }
+        let pids = if self.pid_max > 3 {
+            format!("PID 1 and 2..{}", self.pid_max - 1)
+        } else {
+            "PID 1 alone".to_string()
+        };
+        Some(format!(
+            "pid_max is {}, so a snapshot can hold {} {} ({})",
+            self.pid_max,
+            room,
+            if room == 1 { "process" } else { "processes" },
+            pids
+        ))
+    }
+}
+
+impl Fit {
     /// The limits of this host: MemTotal, lowered to the cgroup limit when
     /// that is smaller, and pid_max.
     pub fn host() -> Fit {
@@ -63,6 +107,22 @@ impl Fit {
         Fit {
             mem_kb: mem,
             pid_max: util::pid_max(),
+        }
+    }
+
+    /// The limits of a host named on the command line, falling back to this
+    /// one for whichever value was not given.
+    ///
+    /// This exists so a table can be generated *for* another machine — a 512 MiB
+    /// container, or a host with a small `pid_max` — and so the fit logic can be
+    /// exercised end to end in a test on a machine that has neither.
+    pub fn target(mem_mb: Option<u64>, pid_max: Option<u64>) -> Fit {
+        let host = Fit::host();
+        Fit {
+            mem_kb: mem_mb
+                .map(|m| m.saturating_mul(1024))
+                .unwrap_or(host.mem_kb),
+            pid_max: pid_max.unwrap_or(host.pid_max),
         }
     }
 
@@ -80,7 +140,11 @@ impl Fit {
 /// `inst` raises the bound for the daemons that really do run several
 /// instances. A table with one command 74 times, or two `cargo build` jobs
 /// per core, is not a table any host shows.
-fn repeat_cap(t: &Tmpl, _want: usize) -> usize {
+fn repeat_cap(t: &Tmpl, opts: &Opts) -> usize {
+    if let Some(n) = opts.repeat_max {
+        // The caller asked for the count no matter what: 0 means no cap.
+        return if n == 0 { usize::MAX } else { n };
+    }
     let inst = if t.inst == 0 { 1 } else { t.inst as usize };
     // A realistic table shows each fixed command a handful of times, not
     // dozens. Spreading the repeats by the number of repeatable templates in
@@ -578,50 +642,83 @@ fn parent_index(idx: usize) -> Option<usize> {
 /// PIDs drawn for a synthetic table stay below `pid_max`, which is 32768 on
 /// some embedded and container-tuned kernels. The sequence wraps rather than
 /// running past it.
+/// Allocates the synthetic PIDs of one table.
+///
+/// The host decides the space: PID 1 is init, so usable PIDs are
+/// `2 .. pid_max - 1`. Every PID handed out is unique for the life of the
+/// allocator, and an allocator that runs out says so instead of wrapping into a
+/// duplicate: a `ps` snapshot cannot show two processes with the same PID, and
+/// silently repeating one is exactly the defect the review found.
 struct Pids {
     next: i64,
+    /// Highest PID this allocator may return; 0 means unlimited.
     max: i64,
-    used: std::collections::BTreeSet<i32>,
+    used: BTreeSet<i32>,
+    /// Free PIDs left, when the space is bounded.
+    free: Option<usize>,
 }
 
 impl Pids {
     fn new(rng: &mut Rng, fit: &Fit) -> Pids {
-        let max = if fit.pid_max >= 2 {
-            fit.pid_max as i64 - 1
-        } else {
-            i64::MAX
+        let (max, free) = match fit.pid_capacity() {
+            // pid_max below 3 leaves no usable PID at all.
+            Some(0) => (0, Some(0)),
+            Some(cap) => (fit.pid_max as i64 - 1, Some(cap)),
+            None => (0, None),
         };
-        let base = (rng.range(300, 2500) as i64).min(max.max(2));
+        let lo = 2i64;
+        let hi = if max > 0 { max } else { 2_500 };
+        let base = (rng.range(300, 2500) as i64).clamp(lo, hi.max(lo));
         Pids {
             next: base,
             max,
-            used: std::collections::BTreeSet::new(),
+            used: BTreeSet::new(),
+            free,
         }
     }
 
-    fn step(&mut self, rng: &mut Rng) -> i32 {
-        let mut delta = rng.range(1, 24) as i64;
-        // A `ps` snapshot has one row per PID. Keep stepping past a PID that
-        // has already been handed out. After the first collision, step by one
-        // so a stride that shares a factor with the PID space cannot cycle
-        // forever while free PIDs remain.
-        let tries = self.max.clamp(2, 1_000_000) as usize;
+    /// The next unused PID, or `None` when the space is exhausted.
+    ///
+    /// A `ps` snapshot has one row per PID, so a collision steps forward one at
+    /// a time: a stride that shares a factor with the PID space cannot cycle
+    /// past the free PIDs. The search is bounded by the space itself, so an
+    /// exhausted allocator returns `None` rather than a duplicate.
+    fn step(&mut self, rng: &mut Rng) -> Option<i32> {
+        if let Some(0) = self.free {
+            // `pid_max` below 3: the host has no PID to give.
+            return None;
+        }
+        let tries = match self.max {
+            0 => 2_500, // unknown space: practically unbounded
+            m => (m as usize).max(2),
+        };
+        let delta = rng.range(1, 24) as i64;
+        let mut step = delta;
         for attempt in 0..tries {
             if attempt > 0 {
-                delta = 1;
+                // Walk one by one after the first collision, so every free PID
+                // in the space is reachable.
+                step = 1;
             }
-            self.next = self.next.saturating_add(delta);
-            if self.next > self.max {
-                // Wrap to the low end rather than printing a PID the kernel
-                // cannot allocate.
+            self.next = self.next.saturating_add(step);
+            if self.max > 0 && self.next > self.max {
+                self.next = 2;
+            }
+            if self.next < 2 {
                 self.next = 2;
             }
             let pid = self.next as i32;
             if self.used.insert(pid) {
-                return pid;
+                if let Some(f) = &mut self.free {
+                    *f = f.saturating_sub(1);
+                }
+                return Some(pid);
+            }
+            if let Some(0) = self.free {
+                return None;
             }
         }
-        self.next as i32
+        None
     }
 }
 
@@ -629,7 +726,7 @@ impl Pids {
 /// family is in scope and the corpus contains it; daemons share the boot time.
 pub fn gen_table(rng: &mut Rng, opts: &Opts, fit: &Fit) -> Vec<Proc> {
     let weights = corpus::profile_weights(&opts.profile);
-    let uptime = util::uptime_secs();
+    let uptime = opts.uptime.unwrap_or_else(util::uptime_secs);
     let mut rows: Vec<Proc> = Vec::new();
     let mut used: Vec<usize> = Vec::new();
     let want = if opts.count == 0 { 30 } else { opts.count };
@@ -638,14 +735,11 @@ pub fn gen_table(rng: &mut Rng, opts: &Opts, fit: &Fit) -> Vec<Proc> {
     if sys_in_scope {
         if let Some(init_idx) = corpus::CORPUS.iter().position(|t| t.cmd == "/sbin/init") {
             let init = &corpus::CORPUS[init_idx];
-            let mut p = make_proc(init, init_idx, rng, opts, uptime);
-            p.pid = 1;
-            rows.push(p);
+            rows.push(make_proc(init, init_idx, rng, opts, uptime));
             used.push(init_idx);
         }
     }
 
-    let mut pids = Pids::new(rng, fit);
     let mut guard = 0usize;
     let limit = want.saturating_mul(40).saturating_add(1000);
     let mut counts = vec![0usize; corpus::CORPUS.len()];
@@ -654,7 +748,7 @@ pub fn gen_table(rng: &mut Rng, opts: &Opts, fit: &Fit) -> Vec<Proc> {
         guard += 1;
         if counts[idx] > 0
             && (!repeatable(&corpus::CORPUS[idx])
-                || counts[idx] >= repeat_cap(&corpus::CORPUS[idx], want))
+                || counts[idx] >= repeat_cap(&corpus::CORPUS[idx], opts))
         {
             continue;
         }
@@ -662,9 +756,7 @@ pub fn gen_table(rng: &mut Rng, opts: &Opts, fit: &Fit) -> Vec<Proc> {
         if let Some(pidx) = parent_index(idx) {
             if pidx != idx && !used.contains(&pidx) && rows.len() < want {
                 let parent = &corpus::CORPUS[pidx];
-                let mut pp = make_proc(parent, pidx, rng, opts, uptime);
-                pp.pid = pids.step(rng);
-                rows.push(pp);
+                rows.push(make_proc(parent, pidx, rng, opts, uptime));
                 used.push(pidx);
             }
         }
@@ -673,44 +765,50 @@ pub fn gen_table(rng: &mut Rng, opts: &Opts, fit: &Fit) -> Vec<Proc> {
         let instances = if t.inst == 0 { 1 } else { t.inst as usize };
         let take = instances.min(want - rows.len());
         for _ in 0..take {
-            let mut p = make_proc(t, idx, rng, opts, uptime);
-            p.pid = pids.step(rng);
-            rows.push(p);
+            rows.push(make_proc(t, idx, rng, opts, uptime));
         }
     }
-    // Fill a large request from templates that produce a different command
-    // line every time. A fixed command is never repeated: `sys -n 200` used to
-    // come back as 120 copies of `sshd: user [priv]`, which is not a table a
-    // host could produce.
-    let mut pending: Vec<Proc> = Vec::new();
-    fill(
-        rng,
-        opts,
-        &weights,
-        &mut pending,
-        want.saturating_sub(rows.len()),
-        &mut counts,
-        uptime,
-    );
-    for mut p in pending {
-        p.pid = pids.step(rng);
-        rows.push(p);
+    fill(rng, opts, &weights, &mut rows, want, &mut counts, uptime);
+
+    // PIDs last: the host's PID space decides how many rows can exist at all,
+    // and one pass over the finished population honours it exactly.
+    let mut pids = Pids::new(rng, fit);
+    let mut out: Vec<Proc> = Vec::with_capacity(rows.len());
+    for (i, mut p) in rows.into_iter().enumerate() {
+        let pid = if i == 0 && p.cmd == b"/sbin/init"[..] {
+            1
+        } else {
+            match pids.step(rng) {
+                Some(pid) => pid,
+                None => break,
+            }
+        };
+        p.pid = pid;
+        out.push(p);
     }
-    rows.sort_unstable_by_key(|p| p.pid);
-    fit_rows(&mut rows, fit);
-    rows
+    out.sort_unstable_by_key(|p| p.pid);
+    fit_rows(&mut out, fit);
+    out
 }
 
-/// Fill a population up to `want` with rows the corpus can legitimately
-/// supply more than once.
+/// Fill a population up to `want` with rows the corpus can legitimately supply
+/// more than once.
 ///
-/// `-n` is honoured (the tests and the README promise the count), but reaching
-/// a large count must not come from one command repeated without limit
-/// (`sys -n 200` used to be 120 copies of `sshd: user [priv]`). The remainder
-/// is handed out as a *quota* to the templates that may repeat, proportional to
-/// their weight, and each template then generates up to its quota. A template
-/// whose placeholder changes the command line is also allowed to repeat, so a
-/// quota never has to become duplicates of one string.
+/// `-n` is a guarantee for `table` and `inject`, so this pass reaches the count
+/// whenever any in-scope template can repeat. With `k` candidates and `need`
+/// rows, the pigeonhole minimum for the busiest command is `ceil(need / k)`, so
+/// that is the bound: the remainder is split *evenly* rather than
+/// weight-proportionally, which is the most realistic table the count allows and
+/// the least dominant distribution that can still reach it. Weight decides only
+/// the leftover when `need` does not divide by `k`.
+///
+/// `--repeat-max N` overrides the bound (0 = unlimited). A caller who would
+/// rather have fewer rows than a repeated command gets that with
+/// `--repeat-max 1`, at the cost of the count.
+///
+/// A template whose row costs more than one (a worker needs its master) links to
+/// an existing master when the main pass produced one, and adds one only when it
+/// must.
 fn fill(
     rng: &mut Rng,
     opts: &Opts,
@@ -720,11 +818,10 @@ fn fill(
     counts: &mut [usize],
     uptime: u64,
 ) {
-    if want == 0 {
+    if out.len() >= want {
         return;
     }
-    let mut candidates: Vec<usize> = Vec::new();
-    let mut total_w = 0u64;
+    let mut candidates: Vec<(usize, usize)> = Vec::new();
     for (idx, t) in corpus::CORPUS.iter().enumerate() {
         if opts.family.map(|f| f != t.fam).unwrap_or(false) {
             continue;
@@ -735,66 +832,92 @@ fn fill(
         if corpus::F_REPEAT & t.flags == 0 && !has_variants(t) {
             continue;
         }
-        // A worker added without its master would show PPID 1, which is the
-        // shape this fill pass exists to avoid; the main pass links them.
-        if parent_index(idx).map(|p| p != idx).unwrap_or(false) {
-            continue;
-        }
-        candidates.push(idx);
-        total_w += cand_weight(t, weights, opts.family);
+        let extra = parent_index(idx).map(|p| p != idx).unwrap_or(false) as usize;
+        // A candidate must be able to afford its own row plus, if it is a
+        // worker, a master that is not there yet.
+        candidates.push((idx, extra));
     }
-    if candidates.is_empty() || total_w == 0 {
+    if candidates.is_empty() {
         return;
     }
-    // Quota per candidate, in proportion to weight, at least one each.
-    let mut quota: Vec<usize> = Vec::with_capacity(candidates.len());
-    let mut caps: Vec<usize> = Vec::with_capacity(candidates.len());
-    for idx in &candidates {
-        let t = &corpus::CORPUS[*idx];
-        let w = cand_weight(t, weights, opts.family);
-        quota.push((want as u64 * w / total_w) as usize);
-        // No single command may take more than a small share of the table: a
-        // host with 5000 processes has a handful of `cargo build` jobs, not a
-        // hundred. The floor keeps a small request spread over the templates
-        // that can supply it.
-        caps.push(repeat_cap(t, want).max((want / 25).max(1)));
-    }
-    for (q, cap) in quota.iter_mut().zip(&caps) {
-        if *q > *cap {
-            *q = *cap;
-        }
-    }
-    let mut extra = want.saturating_sub(quota.iter().sum::<usize>());
-    // Any leftover goes round-robin, but only while the candidate still has
-    // room under its cap. Once every candidate is full, stop: `shortfall`
-    // reports the rows that cannot be supplied without a fake command.
-    while extra > 0 {
-        let mut progressed = false;
-        for pos in 0..quota.len() {
-            if extra == 0 {
+    let need = want - out.len();
+    let k = candidates.len();
+    let bound = match opts.repeat_max {
+        Some(0) => usize::MAX,
+        Some(n) => n,
+        None => need.div_ceil(k).max(1),
+    };
+    // Even split; the remainder goes to the heavier templates first.
+    let mut quota: Vec<usize> = vec![(need / k).min(bound); k];
+    let mut rest = need.saturating_sub(quota.iter().sum::<usize>());
+    let shares: Vec<u64> = candidates
+        .iter()
+        .map(|(idx, _)| cand_weight(&corpus::CORPUS[*idx], weights, opts.family))
+        .collect();
+    let total: u64 = shares.iter().sum::<u64>().max(1);
+    let mut frac: Vec<(u64, usize)> = shares
+        .iter()
+        .enumerate()
+        .map(|(i, w)| (w * need as u64 % total, i))
+        .collect();
+    frac.sort_unstable_by(|a, b| b.cmp(a));
+    let mut fi = 0usize;
+    while rest > 0 {
+        let pos = frac[fi % k].1;
+        fi += 1;
+        if quota[pos] >= bound {
+            // Everything is at the bound; the caller asked for a cap that
+            // cannot reach the count, and `shortfall` reports the gap.
+            if frac.iter().all(|(_, p)| quota[*p] >= bound) {
                 break;
             }
-            if quota[pos] < caps[pos] {
-                quota[pos] += 1;
-                extra -= 1;
-                progressed = true;
-            }
+            continue;
         }
-        if !progressed {
-            break;
-        }
+        quota[pos] += 1;
+        rest -= 1;
     }
-    for (pos, idx) in candidates.iter().enumerate() {
+    // `--repeat-max` bounds how often one *command line* may appear, not how
+    // often one template may be drawn: two templates can expand to the same
+    // command, and a caller who asked for no repeats means no repeats.
+    let mut emitted: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
+    for p in out.iter() {
+        *emitted.entry(p.cmd.clone()).or_insert(0) += 1;
+    }
+    let command_bound = opts.repeat_max;
+    for (pos, (idx, _)) in candidates.iter().enumerate() {
         let t = &corpus::CORPUS[*idx];
-        let mut made = 0usize;
-        let mut guard = 0usize;
-        while made < quota[pos] && guard < quota[pos].saturating_mul(8) + 16 {
-            guard += 1;
-            counts[*idx] += 1;
+        let mut parent_row = parent_index(*idx).and_then(|pidx| {
+            if pidx == *idx {
+                None
+            } else {
+                out.iter().position(|r| r.tmpl == pidx)
+            }
+        });
+        for _ in 0..quota[pos] {
+            if out.len() >= want {
+                return;
+            }
+            if parent_row.is_none() {
+                if let Some(pidx) = parent_index(*idx) {
+                    if pidx != *idx && out.len() + 1 < want {
+                        let mut pp = make_proc(&corpus::CORPUS[pidx], pidx, rng, opts, uptime);
+                        pp.parent = None;
+                        out.push(pp);
+                        parent_row = Some(out.len() - 1);
+                    }
+                }
+            }
             let mut p = make_proc(t, *idx, rng, opts, uptime);
-            p.parent = None;
+            let seen = *emitted.get(&p.cmd).unwrap_or(&0);
+            if let Some(bound) = command_bound {
+                if bound != 0 && seen >= bound {
+                    continue;
+                }
+            }
+            *emitted.entry(p.cmd.clone()).or_insert(0) += 1;
+            counts[*idx] += 1;
+            p.parent = parent_row;
             out.push(p);
-            made += 1;
         }
     }
 }
@@ -803,7 +926,7 @@ fn fill(
 /// no synthetic PIDs: the kernel assigns real ones.
 pub fn gen_inject(rng: &mut Rng, opts: &Opts, fit: &Fit) -> Vec<Proc> {
     let weights = corpus::profile_weights(&opts.profile);
-    let uptime = util::uptime_secs();
+    let uptime = opts.uptime.unwrap_or_else(util::uptime_secs);
     let want = if opts.count == 0 { 12 } else { opts.count };
     let mut rows: Vec<Proc> = Vec::new();
     let mut used: Vec<usize> = Vec::new();
@@ -821,7 +944,7 @@ pub fn gen_inject(rng: &mut Rng, opts: &Opts, fit: &Fit) -> Vec<Proc> {
         // changes the command line) and room under its bound.
         if counts[idx] > 0
             && (!repeatable(&corpus::CORPUS[idx])
-                || counts[idx] >= repeat_cap(&corpus::CORPUS[idx], want))
+                || counts[idx] >= repeat_cap(&corpus::CORPUS[idx], opts))
         {
             continue;
         }
@@ -849,25 +972,7 @@ pub fn gen_inject(rng: &mut Rng, opts: &Opts, fit: &Fit) -> Vec<Proc> {
             rows.push(p);
         }
     }
-    // See pad_table: only a template with a placeholder can add a row without
-    // repeating a command line.
-    let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
-    let mut pad_guard = 0usize;
-    let pad_limit = want.saturating_mul(40).saturating_add(1000);
-    while rows.len() < want && pad_guard < pad_limit {
-        pad_guard += 1;
-        let idx = weighted_index(rng, &weights, opts.family);
-        if counts[idx] >= repeat_cap(&corpus::CORPUS[idx], want) {
-            continue;
-        }
-        counts[idx] += 1;
-        let mut p = make_proc(&corpus::CORPUS[idx], idx, rng, opts, uptime);
-        if !seen.insert(p.cmd.clone()) {
-            continue;
-        }
-        p.parent = None;
-        rows.push(p);
-    }
+    fill(rng, opts, &weights, &mut rows, want, &mut counts, uptime);
     fit_rows(&mut rows, fit);
     rows
 }
@@ -1095,9 +1200,127 @@ mod tests {
         };
         let mut pids = Pids::new(&mut rng, &fit);
         for _ in 0..5000 {
-            let p = pids.step(&mut rng) as u64;
+            let p = pids.step(&mut rng).expect("plenty of space") as u64;
             assert!(p < fit.pid_max, "pid {} at or above pid_max", p);
             assert!(p > 1, "pid {} is reserved", p);
+        }
+    }
+
+    #[test]
+    fn a_tiny_pid_space_yields_exactly_that_many_unique_pids() {
+        for pid_max in [3u64, 4, 5, 10, 100] {
+            let mut rng = Rng::new(11);
+            let fit = Fit { mem_kb: 0, pid_max };
+            let mut pids = Pids::new(&mut rng, &fit);
+            let want = (pid_max - 2) as usize;
+            let mut seen = BTreeSet::new();
+            for i in 0..want {
+                let p = pids
+                    .step(&mut rng)
+                    .unwrap_or_else(|| panic!("pid_max {} ran out at {}", pid_max, i));
+                assert!(p >= 2, "pid {} is below 2", p);
+                assert!(
+                    (p as u64) < pid_max,
+                    "pid {} is at or above pid_max {}",
+                    p,
+                    pid_max
+                );
+                assert!(seen.insert(p), "pid {} was handed out twice", p);
+            }
+            assert!(
+                pids.step(&mut rng).is_none(),
+                "pid_max {} gave out more than its {} usable PIDs",
+                pid_max,
+                want
+            );
+        }
+    }
+
+    #[test]
+    fn pid_max_below_three_has_no_usable_space() {
+        for pid_max in [0u64, 1, 2] {
+            let fit = Fit { mem_kb: 0, pid_max };
+            if pid_max == 0 {
+                // 0 means "unknown", which must not be read as "no PIDs".
+                assert!(fit.pid_capacity().is_none());
+                continue;
+            }
+            assert_eq!(fit.pid_capacity(), Some(0));
+            let mut rng = Rng::new(3);
+            let mut pids = Pids::new(&mut rng, &fit);
+            assert!(
+                pids.step(&mut rng).is_none(),
+                "pid_max {} produced a PID",
+                pid_max
+            );
+            // And the table says so rather than printing a PID the host cannot
+            // have.
+            let opts = Opts {
+                count: 50,
+                profile: b"server".to_vec(),
+                family: None,
+                self_user: b"root".to_vec(),
+                uniq: true,
+                repeat_max: None,
+                uptime: None,
+            };
+            let mut rng = Rng::new(3);
+            let rows = gen_table(&mut rng, &opts, &fit);
+            for p in &rows {
+                assert!(
+                    p.pid >= 1 && (p.pid as u64) <= pid_max,
+                    "pid {} out of range",
+                    p.pid
+                );
+            }
+            assert!(
+                fit.shortfall_reason(50).is_some(),
+                "pid_max {} did not report a shortfall",
+                pid_max
+            );
+        }
+    }
+
+    #[test]
+    fn a_table_never_repeats_a_pid_when_the_space_is_small() {
+        let opts = Opts {
+            count: 60,
+            profile: b"server".to_vec(),
+            family: None,
+            self_user: b"root".to_vec(),
+            uniq: true,
+            repeat_max: None,
+            uptime: None,
+        };
+        for pid_max in [10u64, 37, 100, 500] {
+            let fit = Fit { mem_kb: 0, pid_max };
+            let mut rng = Rng::new(5);
+            let rows = gen_table(&mut rng, &opts, &fit);
+            let mut seen = BTreeSet::new();
+            for p in &rows {
+                assert!(
+                    (p.pid as u64) < pid_max,
+                    "pid {} at or above pid_max {}",
+                    p.pid,
+                    pid_max
+                );
+                assert!(seen.insert(p.pid), "pid {} appeared twice", p.pid);
+            }
+            let room = (pid_max - 1) as usize;
+            assert!(
+                rows.len() <= room,
+                "pid_max {} produced {} rows with room for {}",
+                pid_max,
+                rows.len(),
+                room
+            );
+            if rows.len() < 60 {
+                assert!(
+                    fit.shortfall_reason(60).is_some(),
+                    "pid_max {} silently under-delivered",
+                    pid_max
+                );
+            }
         }
     }
 
@@ -1110,26 +1333,9 @@ mod tests {
         };
         let mut pids = Pids::new(&mut rng, &fit);
         let mut seen = std::collections::BTreeSet::new();
-        for _ in 0..5000 {
-            let p = pids.step(&mut rng);
-            assert!(seen.insert(p), "pid {} repeated", p);
-        }
-    }
-
-    #[test]
-    fn pids_honour_a_small_pid_max() {
-        let mut rng = Rng::new(7);
-        let fit = Fit {
-            mem_kb: 0,
-            pid_max: 100,
-        };
-        let mut pids = Pids::new(&mut rng, &fit);
-        let mut seen = std::collections::BTreeSet::new();
-        // PIDs 2..99 are available, so 97 rows must all be distinct.
-        for _ in 0..97 {
-            let p = pids.step(&mut rng) as u64;
-            assert!(p < fit.pid_max, "pid {} at or above pid_max", p);
-            assert!(seen.insert(p), "pid {} repeated", p);
+        for i in 0..5000 {
+            let p = pids.step(&mut rng).expect("plenty of space");
+            assert!(seen.insert(p), "pid {} repeated at {}", p, i);
         }
     }
 

@@ -87,6 +87,16 @@ pub struct Args {
     pub plan: bool,
     /// `check --require-binaries`: a missing executable is a failure.
     pub require_binaries: bool,
+    /// `--repeat-max N`: cap on how often one command may be repeated. `None`
+    /// keeps the realistic default; `Some(0)` means no cap.
+    pub repeat_max: Option<usize>,
+    /// `--host-mem MiB`: generate for a host with this much memory instead of
+    /// this one.
+    pub host_mem_mb: Option<u64>,
+    /// `--host-pid-max N`: generate for a host whose pid_max is this.
+    pub host_pid_max: Option<u64>,
+    /// `--host-uptime S`: generate for a host that has been up this long.
+    pub host_uptime: Option<u64>,
     /// Every option name seen on the command line, in canonical long form.
     /// Used to reject an option that the chosen subcommand does not consume.
     pub seen: Vec<&'static str>,
@@ -142,6 +152,10 @@ impl Args {
             load_disk: None,
             plan: false,
             require_binaries: false,
+            repeat_max: None,
+            host_mem_mb: None,
+            host_pid_max: None,
+            host_uptime: None,
             seen: Vec::new(),
         }
     }
@@ -302,6 +316,14 @@ INJECT
 CORPUS AND CHECK
       --binaries        report which template executables exist on this host
       --require-binaries  like --binaries, but exit 1 when any is missing
+  --host-mem MiB      generate for a host with this much memory instead of this
+                      one (table)
+  --host-pid-max N    generate for a host whose pid_max is N (table); a host
+                      with pid_max below 3 has no PID to show, which is reported
+  --host-uptime S     generate as if the host had been up S seconds (table)
+  --repeat-max N      how often one command may be repeated; 0 means no cap,
+                      omitted means the realistic bound. Raising it is what
+                      makes a count the corpus cannot supply reachable.
   The corpus dump prints the sentinel @self for a template that runs as the
   invoking user; list, table and inject replace it with the user's name (or
   the decimal uid when the uid has no passwd entry).
@@ -509,6 +531,7 @@ fn applies(sub: Sub, name: &str) -> bool {
     let inject_flags = matches!(
         name,
         "-n" | "--count"
+            | "--repeat-max"
             | "-s"
             | "--seed"
             | "-p"
@@ -560,6 +583,7 @@ fn applies(sub: Sub, name: &str) -> bool {
                 | "--profile"
                 | "-f"
                 | "--family"
+                | "--repeat-max"
                 | "--sort"
                 | "--no-sort"
                 | "--uniq"
@@ -574,6 +598,10 @@ fn applies(sub: Sub, name: &str) -> bool {
                 | "--profile"
                 | "-f"
                 | "--family"
+                | "--repeat-max"
+                | "--host-mem"
+                | "--host-pid-max"
+                | "--host-uptime"
                 | "--utc-offset"
                 | "--local"
                 | "--live"
@@ -954,6 +982,30 @@ pub fn parse(args: &[Vec<u8>]) -> Result<Args, ParseError> {
                             .into(),
                     )
                 }
+                b"--host-mem" => {
+                    a.seen.push("--host-mem");
+                    let v = take_value(args, &mut i, inline).ok_or("missing value for --host-mem")?;
+                    a.host_mem_mb = Some(str::parse_u64(v).ok_or("invalid --host-mem")?);
+                }
+                b"--host-pid-max" => {
+                    a.seen.push("--host-pid-max");
+                    let v =
+                        take_value(args, &mut i, inline).ok_or("missing value for --host-pid-max")?;
+                    a.host_pid_max = Some(str::parse_u64(v).ok_or("invalid --host-pid-max")?);
+                }
+                b"--host-uptime" => {
+                    a.seen.push("--host-uptime");
+                    let v =
+                        take_value(args, &mut i, inline).ok_or("missing value for --host-uptime")?;
+                    a.host_uptime = Some(str::parse_u64(v).ok_or("invalid --host-uptime")?);
+                }
+                b"--repeat-max" => {
+                    a.seen.push("--repeat-max");
+                    let v =
+                        take_value(args, &mut i, inline).ok_or("missing value for --repeat-max")?;
+                    let n = str::parse_u64(v).ok_or("invalid --repeat-max")?;
+                    a.repeat_max = Some(usize::try_from(n).map_err(|_| "invalid --repeat-max")?);
+                }
                 b"-q" | b"--quiet" => {
                     a.seen.push("--quiet");
                     a.quiet = true;
@@ -1266,30 +1318,33 @@ fn pidfile_error(path: &[u8]) -> Buf {
 /// contribute more than one row. What a caller does need to hear is the case
 /// where even that cannot reach the number, which happens for a family whose
 /// templates all run once and cannot vary (`list -f mail -n 50`).
-fn shortfall(family: Option<u8>, got: usize, want: usize, list: bool) {
+fn shortfall(family: Option<u8>, got: usize, want: usize, list: bool, reason: Option<&str>) {
     if want == 0 || got >= want {
         return;
     }
     let mut out = Buf::new();
     out.push_str("psgen: ");
+    out.push_u64(got as u64);
+    out.push_str(if got == 1 { " row" } else { " rows" });
+    out.push_str(" of ");
+    out.push_u64(want as u64);
+    out.push_str(" could be produced");
     match family {
         Some(f) => {
-            out.push_str("family ");
+            out.push_str(" for family ");
             out.push_str(corpus::family_name(f));
         }
-        None => out.push_str("the corpus"),
+        None => out.push_str(" for this host"),
     }
-    out.push_str(" can supply ");
-    out.push_u64(got as u64);
-    out.push_str(" of the ");
-    out.push_u64(want as u64);
-    out.push_str(" rows requested");
-    if list {
+    if let Some(r) = reason {
+        out.push_str(": ");
+        out.push_str(r);
+    } else if list {
         out.push_str("; a list never repeats a command (use --no-uniq to pad)");
     } else {
-        out.push_str(" without putting one command in more than a small share of the rows");
+        out.push_str("; the corpus has no template that can repeat further");
     }
-    out.push(b'\n');
+    out.push_str(". Use --repeat-max N to allow more repeats, or ask for fewer rows.\n");
     sys::err(out.as_bytes());
 }
 
@@ -1564,6 +1619,8 @@ pub fn run() -> i32 {
                 family: args.family,
                 self_user: b"deploy".to_vec(),
                 uniq: args.uniq,
+                repeat_max: None,
+                uptime: None,
             };
             check::run(&mut rng, &opts, args.binaries, args.require_binaries)
         }
@@ -1608,6 +1665,8 @@ pub fn run() -> i32 {
                 family: args.family,
                 self_user: util::current_user().name,
                 uniq: args.uniq,
+                repeat_max: args.repeat_max,
+                uptime: args.host_uptime,
             };
             let mut cmds = gen::gen_list(&mut rng, &opts);
             shortfall(
@@ -1619,6 +1678,7 @@ pub fn run() -> i32 {
                     args.count.min(2000)
                 },
                 true,
+                None,
             );
             if args.sort {
                 cmds.sort_unstable();
@@ -1665,15 +1725,23 @@ pub fn run() -> i32 {
                 family: args.family,
                 self_user: util::current_user().name,
                 uniq: args.uniq,
+                repeat_max: args.repeat_max,
+                uptime: args.host_uptime,
             };
-            let fit = gen::Fit::host();
+            let fit = gen::Fit::target(args.host_mem_mb, args.host_pid_max);
             let rows = gen::gen_table(&mut rng, &opts, &fit);
             let want = if args.count == 0 {
                 30
             } else {
                 args.count.min(5000)
             };
-            shortfall(args.family, rows.len(), want, false);
+            shortfall(
+                args.family,
+                rows.len(),
+                want,
+                false,
+                fit.shortfall_reason(want).as_deref(),
+            );
             let out = table::render(
                 &rows,
                 table::mem_budget_kb(),
@@ -1734,6 +1802,8 @@ pub fn run() -> i32 {
                 family: args.family,
                 self_user: me.name,
                 uniq: args.uniq,
+                repeat_max: args.repeat_max,
+                uptime: args.host_uptime,
             };
             // The stub's own sizes are planned by prepare(); only the corpus
             // sizes need to be lowered to what this host can hold.
@@ -1743,7 +1813,13 @@ pub fn run() -> i32 {
             } else {
                 args.count.min(500)
             };
-            shortfall(args.family, rows.len(), want, false);
+            shortfall(
+                args.family,
+                rows.len(),
+                want,
+                false,
+                gen::Fit::none().shortfall_reason(want).as_deref(),
+            );
 
             // A disk target that would fill the filesystem is refused here,
             // before anything is spawned.
