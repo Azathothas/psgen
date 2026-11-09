@@ -36,6 +36,7 @@ Assets are `psgen-<version>-<target>.tar.gz`, `psgen-<target>` and
 `SHA256SUMS`.
 
 ```sh
+# Both come from the tag and Cargo.toml; the example uses the current release.
 TAG=v0.0.1-beta.1
 VERSION=0.0.1
 TARGET=x86_64-unknown-linux-musl
@@ -166,7 +167,7 @@ object.
 `--pidfile FILE` records the run:
 
 ```text
-# psgen 0.0.1 boot <boot-id>
+# psgen <version> boot <boot-id>
 # temp <absolute-temp-dir>
 <pid>\t<starttime>\t<comm>
 ```

@@ -196,4 +196,17 @@ jobs:
           set -eu
           pre=""
           case "$TAG" in *-*) pre="--prerelease" ;; esac
-          gh release create "$TAG" $pre --verify-tag --title "psgen $TAG" --notes-file .github/release-notes.md dist/*
+          # The fixed notes are the boilerplate; the entries for this tag are
+          # appended from CHANGELOG.md, so a release says what changed.
+          version=${TAG#v}
+          version=${version%%-*}
+          {
+            cat .github/release-notes.md
+            echo
+            awk -v want="## $version" '
+              index($0, want) == 1 { on = 1; next }
+              /^## / && on { exit }
+              on { print }
+            ' CHANGELOG.md
+          } > /tmp/notes.md
+          gh release create "$TAG" $pre --verify-tag --title "psgen $TAG" --notes-file /tmp/notes.md dist/*
