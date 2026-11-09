@@ -8,6 +8,7 @@ use crate::util;
 
 pub struct StatInfo {
     pub pid: i32,
+    pub ppid: i64,
     pub comm: Vec<u8>,
     pub state: u8,
     pub pgrp: i64,
@@ -46,6 +47,7 @@ pub fn read_stat(pid: i32) -> Option<StatInfo> {
     }
     Some(StatInfo {
         pid,
+        ppid: str::parse_i64(field(&fields, 1)).unwrap_or(0),
         comm,
         state: field(&fields, 0).first().copied().unwrap_or(b'?'),
         pgrp: str::parse_i64(field(&fields, 2)).unwrap_or(0),

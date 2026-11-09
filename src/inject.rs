@@ -684,6 +684,40 @@ fn write_pidfile(path: &[u8], pids: &[i32], temps: &[std::path::PathBuf]) -> boo
 }
 
 const OWNER_FILE: &[u8] = b".psgen-owner";
+const LIVE_FILE: &[u8] = b".psgen-live";
+
+/// Record the stubs that are still alive in a staging directory.
+///
+/// The injector exits before a `--duration` run ends, so the owner marker goes
+/// stale while the stubs are still using their `--disk` data and shadow copy.
+/// The prune pass must keep those directories until the last stub is gone.
+fn write_live_marker(temps: &[std::path::PathBuf], pids: &[(i32, u64)]) {
+    let mut body = Vec::new();
+    for (pid, start) in pids {
+        body.extend_from_slice(pid.to_string().as_bytes());
+        body.push(b' ');
+        body.extend_from_slice(start.to_string().as_bytes());
+        body.push(b'\n');
+    }
+    for dir in temps {
+        let _ = std::fs::write(dir.join(std::ffi::OsStr::from_bytes(LIVE_FILE)), &body);
+    }
+}
+
+fn read_live_marker(dir: &Path) -> Option<Vec<(i32, u64)>> {
+    let text = std::fs::read(dir.join(std::ffi::OsStr::from_bytes(LIVE_FILE))).ok()?;
+    let mut pids = Vec::new();
+    for line in text.split(|b| *b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let mut it = line.split(|b| *b == b' ');
+        let pid = str::parse_u64(it.next()?)?;
+        let start = str::parse_u64(it.next().unwrap_or(b""))?;
+        pids.push((i32::try_from(pid).ok()?, start));
+    }
+    Some(pids)
+}
 
 fn make_temp_dir(idx: usize) -> Option<std::path::PathBuf> {
     make_temp_dir_in(&std::env::temp_dir(), idx)
@@ -740,15 +774,18 @@ fn read_owner_marker(dir: &Path) -> Option<(i32, u64)> {
     Some((i32::try_from(pid).ok()?, start))
 }
 
-/// Remove the staging directories of runs whose injector is gone.
+/// Remove the staging directories of runs whose injector and stubs are gone.
 ///
 /// A `--duration` run that nobody stops leaves its shadow copy and `--disk`
 /// data behind: the injector exits, the stub dies on its alarm, and nothing
 /// else knows the directory exists. The directory name already carries the
 /// injector PID, and the owner marker carries its starttime, so a recycled PID
-/// cannot keep a dead run's directory alive. Directories newer than a minute
-/// are left alone, which covers a concurrent run that has created the
-/// directory but not yet written its marker.
+/// cannot keep a dead run's directory alive.
+///
+/// A directory is removed only when it has a live marker and none of the PIDs
+/// in that marker still exists. An unmarked directory may belong to another
+/// tool, or to a run that crashed before it could write the marker, so it is
+/// left alone.
 pub fn prune_staging(prep: &Prep) -> usize {
     let mut roots: Vec<std::path::PathBuf> = vec![std::env::temp_dir()];
     if let Some(d) = &prep.shadow_root {
@@ -767,7 +804,6 @@ pub fn prune_staging(prep: &Prep) -> usize {
 fn prune_root(root: &Path) -> usize {
     use std::os::unix::fs::MetadataExt;
     let me = sys::geteuid();
-    let now = sys::now_secs();
     let rd = match std::fs::read_dir(root) {
         Ok(rd) => rd,
         Err(_) => return 0,
@@ -776,10 +812,9 @@ fn prune_root(root: &Path) -> usize {
     for e in rd.flatten() {
         let name = e.file_name();
         let nameb = name.as_os_str().as_bytes();
-        let pid = match staging_pid(nameb) {
-            Some(p) => p,
-            None => continue,
-        };
+        if staging_pid(nameb).is_none() {
+            continue;
+        }
         let path = e.path();
         let meta = match std::fs::symlink_metadata(&path) {
             Ok(m) => m,
@@ -789,28 +824,28 @@ fn prune_root(root: &Path) -> usize {
         if !meta.file_type().is_dir() || meta.uid() != me {
             continue;
         }
-        match read_owner_marker(&path) {
-            Some((owner, start)) => {
-                // The marker names the injector and its starttime, so a
-                // recycled PID cannot keep a dead run's directory alive. A
-                // live injector of another user is skipped here too: its
-                // starttime matches.
-                if live::read_starttime(owner) == Some(start) {
+        if let Some((owner, start)) = read_owner_marker(&path) {
+            // The marker names the injector and its starttime, so a recycled
+            // PID cannot keep a dead run's directory alive. A live injector of
+            // another user is skipped here too: its starttime matches.
+            if live::read_starttime(owner) == Some(start) {
+                continue;
+            }
+        }
+        match read_live_marker(&path) {
+            Some(pids) => {
+                if pids
+                    .iter()
+                    .any(|(pid, start)| live::read_starttime(*pid) == Some(*start))
+                {
                     continue;
                 }
             }
             None => {
-                // A directory a run has created but not yet marked is left
-                // alone for a minute; after that only a PID that is entirely
-                // gone is safe to reclaim.
-                if now.saturating_sub(meta.mtime().max(0) as u64) < 60 {
-                    continue;
-                }
-                let mut procpath = b"/proc/".to_vec();
-                procpath.extend_from_slice(pid.to_string().as_bytes());
-                if Path::new(std::ffi::OsStr::from_bytes(&procpath)).exists() {
-                    continue;
-                }
+                // No live marker: the directory may belong to another tool,
+                // or to a run that crashed before it could write the marker.
+                // Deleting it could destroy a live stub's disk data.
+                continue;
             }
         }
         if std::fs::remove_dir_all(&path).is_ok() {
@@ -1146,6 +1181,9 @@ pub fn spawn(rows: &[Proc], args: &Args, prep: &Prep) -> Result<SpawnResult, Str
     if arena_fd >= 0 {
         sys::close(arena_fd);
     }
+    // The roots exist now, so a later prune can see that their staging
+    // directories are still in use even after this injector exits.
+    write_live_marker(&all_temps, &root_pids);
 
     let disk_ms = args.disk_mb.unwrap_or(0).saturating_mul(30);
     let timeout = 2_000u64
@@ -1244,6 +1282,8 @@ pub fn spawn(rows: &[Proc], args: &Args, prep: &Prep) -> Result<SpawnResult, Str
             )
         })
         .collect();
+    let live_ids: Vec<(i32, u64)> = ident.iter().map(|(pid, start, _)| (*pid, *start)).collect();
+    write_live_marker(&all_temps, &live_ids);
     Ok(SpawnResult {
         pids,
         roots: root_pids,
@@ -1411,7 +1451,10 @@ fn parse_stop_line(line: &[u8]) -> Option<StopLine> {
         return None;
     }
     let start = if fields.len() >= 2 {
-        str::parse_u64(fields[1])
+        // A second field that is present but unparseable is a malformed line,
+        // not a one-field line. Treating it as one-field used to downgrade the
+        // identity check to the executable name and kill an unrelated process.
+        Some(str::parse_u64(fields[1])?)
     } else {
         None
     };
@@ -1425,6 +1468,67 @@ fn parse_stop_line(line: &[u8]) -> Option<StopLine> {
         start,
         comm,
     })
+}
+
+/// Count pidfile rows that still name a live process.
+///
+/// A pidfile can only be overwritten safely when none of its recorded rows
+/// still exists. Re-injecting over a live pidfile used to orphan the first
+/// run's stubs: the second run rewrote the file and pruned the first run's
+/// staging directories, and `stop` then had no record of the old PIDs.
+pub fn live_pidfile_rows(path: &[u8]) -> usize {
+    let text = match sys::read_file_nofollow(path, 1 << 20) {
+        Some(t) => t,
+        None => return 0,
+    };
+    let mut live_rows = 0usize;
+    for raw in text.split(|b| *b == b'\n') {
+        if raw.is_empty() || raw[0] == b'#' {
+            continue;
+        }
+        let line = match parse_stop_line(raw) {
+            Some(l) => l,
+            None => continue,
+        };
+        let alive = match line.start {
+            Some(start) => live::read_starttime(line.pid) == Some(start),
+            None => {
+                let mut procpath = b"/proc/".to_vec();
+                procpath.extend_from_slice(line.pid.to_string().as_bytes());
+                Path::new(std::ffi::OsStr::from_bytes(&procpath)).exists()
+            }
+        };
+        if alive {
+            live_rows += 1;
+        }
+    }
+    live_rows
+}
+
+/// How many pidfile rows lie between a row and the top of its tree.
+///
+/// The pidfile does not store a parent, so the depth is read from `/proc`. A
+/// row whose parent is not in the pidfile is a root. The walk is bounded so a
+/// corrupted `/proc` cannot loop.
+fn stop_depths(lines: &[StopLine]) -> std::collections::BTreeMap<i32, usize> {
+    let mut depths = std::collections::BTreeMap::new();
+    for line in lines {
+        let mut depth = 0usize;
+        let mut cur = line.pid;
+        for _ in 0..64 {
+            let ppid = match live::read_stat(cur) {
+                Some(s) => s.ppid as i32,
+                None => break,
+            };
+            if ppid <= 1 || !lines.iter().any(|l| l.pid == ppid) {
+                break;
+            }
+            depth += 1;
+            cur = ppid;
+        }
+        depths.insert(line.pid, depth);
+    }
+    depths
 }
 
 /// Stop (or, with `plan`, describe) every process a pidfile names.
@@ -1472,7 +1576,7 @@ pub fn stop(path: &[u8], force: bool, plan: bool, quiet: bool) -> i32 {
     }
     if let Some(hb) = &header_boot {
         let cur = util::boot_id();
-        if !force && !hb.is_empty() && !cur.is_empty() && *hb != cur {
+        if !force && (hb.is_empty() || cur.is_empty() || *hb != cur) {
             sys::err(b"psgen: pidfile is from another boot; use --force to ignore\n");
             return 1;
         }
@@ -1480,9 +1584,16 @@ pub fn stop(path: &[u8], force: bool, plan: bool, quiet: bool) -> i32 {
     let me = current_exe_bytes();
     // Children before roots: a root's process-group kill reaches every child
     // that stayed in the group, and those children are then already gone when
-    // their own lines are reached. Deepest PID first gives every line its own
-    // signal, which makes the count stable.
-    lines.sort_unstable_by_key(|l| std::cmp::Reverse(l.pid));
+    // their own lines are reached. Sorting by depth gives every line its own
+    // signal even when a PID wrap makes a child's number lower than its
+    // parent's.
+    let depths = stop_depths(&lines);
+    lines.sort_unstable_by_key(|l| {
+        (
+            std::cmp::Reverse(depths.get(&l.pid).copied().unwrap_or(0)),
+            std::cmp::Reverse(l.pid),
+        )
+    });
 
     let mut signalled: Vec<(i32, u64)> = Vec::new();
     let mut planned = 0usize;
@@ -1576,14 +1687,32 @@ pub fn stop(path: &[u8], force: bool, plan: bool, quiet: bool) -> i32 {
             continue;
         }
         if plan {
-            let comm = live::read_comm(pid).unwrap_or_default();
-            let mut out = Buf::new();
-            out.push_str("would signal ");
-            out.push_u64(pid as u64);
-            out.push_str(" (");
-            out.push_bytes(&comm);
-            out.push_str(")\n");
-            sys::out(out.as_bytes());
+            // A plan is a prediction of the real stop. Check that the real
+            // signal would be permitted; otherwise `--plan` reports success
+            // for a process the caller cannot stop.
+            if !sys::kill(pid, 0) {
+                let err = sys::last_error().raw_os_error();
+                if err == Some(libc::EPERM) {
+                    failed += 1;
+                    note(quiet, b"cannot signal", pid, Some(b"permission denied"));
+                    continue;
+                }
+                if err != Some(libc::ESRCH) {
+                    failed += 1;
+                    note(quiet, b"cannot signal", pid, None);
+                    continue;
+                }
+            }
+            if !quiet {
+                let comm = live::read_comm(pid).unwrap_or_default();
+                let mut out = Buf::new();
+                out.push_str("would signal ");
+                out.push_u64(pid as u64);
+                out.push_str(" (");
+                out.push_bytes(&comm);
+                out.push_str(")\n");
+                sys::out(out.as_bytes());
+            }
             planned += 1;
             continue;
         }

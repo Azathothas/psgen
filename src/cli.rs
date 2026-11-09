@@ -290,7 +290,7 @@ INJECT
                         exact two-column format is kept for existing callers
       --plan            with --dry-run, print the resolved plan instead: exe
                         tier, per-row user/VSZ/RSS/CPU/tty/threads/exe, parent
-                        links, temp dirs and the physical cost estimate
+                        links and the physical cost estimate
       --json            with --dry-run, print the plan as one JSON object
       --table           after spawning, print the real ps aux table for the stubs
       --verify          compare each stub's real VSZ/RSS with the planned
@@ -584,11 +584,13 @@ fn applies(sub: Sub, name: &str) -> bool {
             "--pidfile" | "--force" | "--elevate" | "--plan" | "-q" | "--quiet"
         ),
         Corpus => false,
-        // `check` validates the corpus itself: no profile, no seeding, and a
-        // family only narrows which templates it looks at.
+        // `check` validates the corpus itself: no profile, and a family only
+        // narrows which templates it looks at. `--seed` is accepted because
+        // check expands commands with the generator, and the seed changes
+        // which expansion is checked.
         Check => matches!(
             name,
-            "-f" | "--family" | "--binaries" | "--require-binaries"
+            "-f" | "--family" | "-s" | "--seed" | "--binaries" | "--require-binaries"
         ),
         Unit => matches!(
             name,
@@ -904,9 +906,6 @@ pub fn parse(args: &[Vec<u8>]) -> Result<Args, ParseError> {
                     let v = take_value(args, &mut i, inline).ok_or("missing value for --lines")?;
                     let n = usize::try_from(str::parse_u64(v).ok_or("invalid --lines")?)
                         .map_err(|_| "invalid --lines")?;
-                    if n == 0 {
-                        return Err("--lines must be at least 1".into());
-                    }
                     a.log_lines = n;
                 }
                 b"--delay" => {
@@ -1250,10 +1249,11 @@ fn pidfile_error(path: &[u8]) -> Buf {
             out.push_str(" is not writable");
         } else {
             // The parent is writable, so the failure was the target name
-            // itself: NAME_MAX is the usual cause.
-            out.push_str(" is writable but the file name cannot be created");
+            // itself. NAME_MAX is one cause, not the only one: PATH_MAX, a
+            // filesystem quota, or an unreadable target can fail here too.
+            out.push_str(" is writable but the file could not be created");
             out.push_str(" (the name may exceed NAME_MAX once the temporary");
-            out.push_str(" suffix is added)");
+            out.push_str(" suffix is added, or the filesystem refused it)");
         }
     }
     out
@@ -1806,6 +1806,23 @@ pub fn run() -> i32 {
                 return 0;
             }
 
+            // A pidfile that still records live stubs cannot be reused: the
+            // pending rewrite would erase the only record of the old run, and
+            // the old stubs would outlive `stop`.
+            if let Some(p) = &args.pidfile {
+                if inject::live_pidfile_rows(p) > 0 {
+                    let mut out = Buf::new();
+                    out.push_str("psgen: the pidfile ");
+                    out.push_bytes(p);
+                    out.push_str(
+                        " records live processes; stop them first or choose another --pidfile",
+                    );
+                    out.push(b'\n');
+                    sys::err(out.as_bytes());
+                    return 2;
+                }
+            }
+
             // Forget the staging directories of runs whose injector is gone.
             // A `--duration` run that nobody stops leaves its shadow copy and
             // --disk data behind; the next run reclaims them.
@@ -1821,9 +1838,10 @@ pub fn run() -> i32 {
             // Prove the pidfile can be written before the first stub exists,
             // and leave a valid header-only pidfile behind. A failure after
             // the fork would otherwise leave live stubs with no record.
+            let mut pending_written = false;
             if let Some(p) = &args.pidfile {
-                let pending = inject::write_pending_pidfile(p);
-                if !pending {
+                pending_written = inject::write_pending_pidfile(p);
+                if !pending_written {
                     // The preflight proved a write works, so a failure here is
                     // a race (the directory went away); refuse rather than
                     // spawn what cannot be stopped.
@@ -1839,6 +1857,14 @@ pub fn run() -> i32 {
             let result = match inject::spawn(&rows, &args, &prep) {
                 Ok(r) => r,
                 Err(e) => {
+                    // Every `spawn` error is raised before the first fork, so
+                    // no stub exists to record. Remove the header-only file
+                    // rather than leave a pidfile that claims a run happened.
+                    if pending_written {
+                        if let Some(p) = &args.pidfile {
+                            let _ = std::fs::remove_file(Path::new(std::ffi::OsStr::from_bytes(p)));
+                        }
+                    }
                     let mut out = Buf::new();
                     out.push_str("psgen: ");
                     out.push_str(&e);
@@ -1850,6 +1876,11 @@ pub fn run() -> i32 {
             print_summary(&prep, &result, &args);
 
             if result.pids.is_empty() {
+                if pending_written {
+                    if let Some(p) = &args.pidfile {
+                        let _ = std::fs::remove_file(Path::new(std::ffi::OsStr::from_bytes(p)));
+                    }
+                }
                 sys::err(b"psgen: no processes were spawned\n");
                 return 1;
             }
