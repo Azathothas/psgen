@@ -271,8 +271,9 @@ INJECT
       --allow-proc-exe  alias of --no-exe: exec /proc/self/exe, no spoof
       --shadow-dir DIR  directory for the shadow copy when the bind is
                         unavailable or with --no-root; the copy goes in a
-                        per-run subdirectory; ignored with --no-exe and when
-                        the bind tier is in use
+                        per-run subdirectory. With --no-root it forces the
+                        shadow tier; ignored with --no-exe and when the bind
+                        tier is in use
       --no-root         portable mode: no user switch, no mount namespace,
                         no bind tier; the stub uses /proc/self/exe or --shadow-dir
       --tty / --no-tty  give tty processes a real pty (default on);
