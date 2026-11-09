@@ -1049,9 +1049,11 @@ fn run(cfg: Config) -> ! {
 ///    the injector passes on `PSGEN_NONCE`. An inherited fd 3 from a supervisor
 ///    or a permissive sudo rule does not know it, so the config is ignored and
 ///    the process behaves like a normal command line.
-/// 3. The config descriptor must be a sealed memfd, or a file with no name
-///    left (the unlinked-temp fallback), so it cannot be rewritten between the
-///    check and the action.
+/// 3. The config descriptor must be one this run could have made: it has no
+///    name left (a memfd or an unlinked temporary file), it is sealed when the
+///    kernel allows sealing, and it is owned by the uid this process runs as.
+///    An fd opened by an unprivileged caller does not survive `sudo`, so a
+///    descriptor inherited into a privileged psgen fails the ownership check.
 pub fn maybe_run() {
     if sys::geteuid() == 0 && sys::getuid() != 0 {
         sys::err(b"psgen: refusing to run setuid; install it without the setuid bit\n");
@@ -1066,8 +1068,19 @@ pub fn maybe_run() {
         // normal command line, which will reject the stray argument.
         return;
     }
+    // The descriptor must be one this run could have made: it has no name left
+    // (a memfd, or an unlinked temporary file), it is sealed when the kernel
+    // can seal, and it is owned by the same uid that is running this process.
+    // The last check is what closes the `sudo` case: an fd opened by the
+    // caller does not survive the switch to root, so a descriptor inherited
+    // into a privileged psgen is not the injector's.
     let sealed = sys::fd_sealed(3);
     let unlinked = sys::fd_nlink(3) == Some(0);
+    let owned = sys::fd_owner(3) == Some(sys::geteuid());
+    if !owned {
+        sys::err(b"psgen: refusing a config descriptor this process does not own\n");
+        sys::exit(2);
+    }
     if !sealed && !unlinked {
         sys::err(b"psgen: refusing an unsealed, named config descriptor\n");
         sys::exit(2);

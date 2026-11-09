@@ -1280,6 +1280,59 @@ def check_regressions2(tmp):
     if len(lines) < 180:
         fail(f"#25: a stray config changed the command line ({len(lines)} lines)")
 
+    # #25 (stronger): a config with a matching nonce but an attacker-named
+    # self_copy must not exec it and must not create the named directory.
+    hdr = bytearray(104)
+    hdr[:8] = magic
+    self_copy = b"/bin/sh"
+    temp = str(Path(tmp) / "attack").encode()
+    cmd = b"/usr/sbin/nginx"
+    comm = b"nginx"
+    nonce = b"deadbeefdeadbeef"
+
+    def w(off, v):
+        struct.pack_into("<I", hdr, off, v)
+
+    w(8, 3)                        # version
+    w(40, 1)                       # stage
+    w(44, len(comm))
+    w(48, len(self_copy))
+    w(52, len(cmd))
+    w(56, 1)
+    w(60, len(temp))
+    struct.pack_into("<i", hdr, 72, 5)     # max_fd
+    struct.pack_into("<i", hdr, 76, -1)    # arena_fd
+    struct.pack_into("<i", hdr, 80, -1)    # status_fd
+    w(88, 1024)                    # disk_kb
+    w(92, len(self_copy))
+    w(96, len(nonce))
+    blob = (bytes(hdr) + comm + self_copy + cmd + b"u" + temp + self_copy + nonce)
+    import ctypes
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    fd = libc.memfd_create(b"psgen-test", 0)
+    if fd >= 0:
+        os.write(fd, blob)
+        os.lseek(fd, 0, 0)
+        p = subprocess.Popen([str(BIN)], env=dict(os.environ, PSGEN_NONCE="deadbeefdeadbeef"),
+                             preexec_fn=lambda: os.dup2(fd, 3), pass_fds=(fd,),
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(1.0)
+        try:
+            exe = os.readlink(f"/proc/{p.pid}/exe")
+        except OSError:
+            exe = ""
+        if exe == "/bin/sh":
+            p.kill()
+            p.wait()
+            fail("#25: a forged config with a matching nonce executed its self_copy")
+        if (Path(tmp) / "attack").exists():
+            p.kill()
+            p.wait()
+            fail("#25: a forged config created the directory it named")
+        p.kill()
+        p.wait()
+        os.close(fd)
+
     # #14: a denied getrandom must not abort after the stubs are spawned.
     #     (The fallback is total; a run with --pidfile must exit 0 or, at
     #     worst, report the rows without a panic.)

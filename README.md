@@ -272,8 +272,10 @@ cage image from `tests/sand/Containerfile`.
   Run `stop` only on a pidfile you control. `stop` does not unlink the pidfile,
   which is why re-running `inject` against the same path works.
 - The stub refuses to run from a setuid installation, and only honours a
-  config descriptor that carries the per-run nonce in its environment and is a
-  sealed memfd or an unlinked file. It also only writes into, and only execs
+  config descriptor that carries the per-run nonce in its environment, is a
+  sealed memfd or an unlinked file, and is owned by the uid the stub runs as
+  (a descriptor inherited through `sudo` was opened by the caller, so it fails
+  that check). It also only writes into, and only execs
   from, a staging directory that passes the same ownership and name rule
   `stop` uses before removing one. Do not install it setuid.
 - The nonce protects a descriptor that a supervisor or a `sudo` rule hands in;

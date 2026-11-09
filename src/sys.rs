@@ -243,6 +243,16 @@ fn seal_mask() -> i32 {
     libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL
 }
 
+/// The owner uid of the object a descriptor refers to, or None when fstat
+/// fails.
+pub fn fd_owner(fd: i32) -> Option<u32> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return None;
+    }
+    Some(st.st_uid as u32)
+}
+
 /// Whether a descriptor carries the seals the stub requires.
 pub fn fd_sealed(fd: i32) -> bool {
     let r = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
