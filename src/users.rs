@@ -116,7 +116,7 @@ pub fn ensure(name: &[u8], create: bool) -> (Option<(u32, u32)>, bool, Option<St
         Ok(s) => s,
         Err(_) => return (None, false, Some("invalid user name".to_string())),
     };
-    let attempts: [&[&str]; 2] = [
+    let attempts: [&[&str]; 3] = [
         &[
             "--system",
             "--badname",
@@ -135,6 +135,20 @@ pub fn ensure(name: &[u8], create: bool) -> (Option<(u32, u32)>, bool, Option<St
             "--shell",
             "/usr/sbin/nologin",
             "--user-group",
+        ],
+        // A host can have the group without the user, for example after a
+        // package was removed but its group survived. --user-group fails
+        // there, so use the existing group by name.
+        &[
+            "--system",
+            "--badname",
+            "--no-create-home",
+            "--home-dir",
+            "/nonexistent",
+            "--shell",
+            "/usr/sbin/nologin",
+            "--gid",
+            name_str,
         ],
     ];
     let mut last_error = String::new();

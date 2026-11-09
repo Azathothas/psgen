@@ -127,30 +127,48 @@ fn executable(cmd: &[u8]) -> Option<&[u8]> {
     } else if let Some(p) = first.iter().position(|b| *b == b':') {
         &first[..p]
     } else {
-        str::basename(first)
+        first
     };
     if name.is_empty() {
         None
-    } else {
+    } else if name.contains(&b'/') {
+        // Keep the absolute path: the command names where the binary lives.
         Some(name)
+    } else {
+        Some(str::basename(name))
     }
+}
+
+fn exists_in(dir: &[u8], name: &[u8]) -> bool {
+    let mut path = Vec::with_capacity(dir.len() + name.len() + 1);
+    path.extend_from_slice(dir);
+    if !dir.ends_with(b"/") {
+        path.push(b'/');
+    }
+    path.extend_from_slice(name);
+    sys::access(&path, 1)
 }
 
 fn exists(name: &[u8]) -> bool {
     if name.contains(&b'/') {
         return sys::access(name, 1);
     }
+    if let Some(path) = std::env::var_os("PATH") {
+        use std::os::unix::ffi::OsStrExt;
+        for dir in path.as_os_str().as_bytes().split(|b| *b == b':') {
+            if !dir.is_empty() && exists_in(dir, name) {
+                return true;
+            }
+        }
+    }
     for dir in [
-        &b"/usr/local/bin/"[..],
-        &b"/usr/bin/"[..],
-        &b"/bin/"[..],
-        &b"/usr/sbin/"[..],
-        &b"/sbin/"[..],
+        &b"/usr/local/bin"[..],
+        &b"/usr/bin"[..],
+        &b"/bin"[..],
+        &b"/usr/sbin"[..],
+        &b"/sbin"[..],
     ] {
-        let mut path = Vec::with_capacity(dir.len() + name.len());
-        path.extend_from_slice(dir);
-        path.extend_from_slice(name);
-        if sys::access(&path, 1) {
+        if exists_in(dir, name) {
             return true;
         }
     }
