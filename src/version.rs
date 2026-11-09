@@ -25,12 +25,16 @@ pub const PIDFILE_BOOT: &[u8] = b" boot ";
 /// The boot id from a `# psgen <version> boot <boot-id>` line.
 ///
 /// The version is not interpreted, so a pidfile written by a different release
-/// is still recognised after an upgrade. `None` means the line is not a psgen
-/// header at all.
+/// is still recognised after an upgrade. A psgen header without a `boot`
+/// marker yields an empty boot id rather than `None`, so `stop` can refuse it
+/// instead of silently skipping the boot check. `None` means the line is not a
+/// psgen header at all.
 pub fn pidfile_boot_id(line: &[u8]) -> Option<Vec<u8>> {
     let rest = line.strip_prefix(PIDFILE_PREFIX)?;
-    let at = str::find(rest, PIDFILE_BOOT)?;
-    Some(str::trim(&rest[at + PIDFILE_BOOT.len()..]).to_vec())
+    match str::find(rest, PIDFILE_BOOT) {
+        Some(at) => Some(str::trim(&rest[at + PIDFILE_BOOT.len()..]).to_vec()),
+        None => Some(Vec::new()),
+    }
 }
 
 #[cfg(test)]
@@ -51,7 +55,10 @@ mod tests {
         );
         assert_eq!(pidfile_boot_id(b"# temp /tmp/x"), None);
         assert_eq!(pidfile_boot_id(b"1234\t5\tcomm"), None);
-        assert_eq!(pidfile_boot_id(b"# psgen 0.0.1"), None);
+        // A header without a boot marker is still a psgen header. It yields an
+        // empty boot id so `stop` refuses it instead of skipping the check.
+        assert_eq!(pidfile_boot_id(b"# psgen 0.0.1"), Some(Vec::new()));
+        assert_eq!(pidfile_boot_id(b"# psgen 0.0.1 boot "), Some(Vec::new()));
     }
 
     #[test]
