@@ -228,7 +228,15 @@ fn make_proc(t: &Tmpl, tmpl: usize, rng: &mut Rng, opts: &Opts, uptime: u64) -> 
         rng.range(3, 1800)
     } else if t.flags & corpus::F_CHILD != 0 {
         let up = uptime.max(60);
-        rng.range(5, up)
+        // Pick a boot-relative start with a fixed-point draw. A plain
+        // rng.range(5, up) reduces a fresh random word modulo `up`, and
+        // `up` grows by one every second, so the same seed produced a
+        // different age on every run. Scaling a 32-bit draw keeps the
+        // start stable to within a second as uptime advances.
+        let span = up.saturating_sub(5).max(1);
+        let draw = rng.next_u64() >> 32;
+        let offset = span.saturating_mul(draw) / (1u64 << 32);
+        up.saturating_sub(offset)
     } else if t.fam == corpus::FAM_DEV {
         rng.range(5, 6 * 3600)
     } else if t.fam == corpus::FAM_DESK {
@@ -399,7 +407,9 @@ fn parent_index(idx: usize) -> Option<usize> {
         find_idx("php-fpm: master process")
     } else if cmd.starts_with("gunicorn: worker") {
         find_idx("gunicorn: master")
-    } else if cmd.starts_with("postgres: 17/main: app app") {
+    } else if cmd.starts_with("postgres: 17/main: ") {
+        // The postmaster forks every backend and background worker, so all
+        // of them belong to its session, not their own.
         find_idx("/usr/lib/postgresql/17/bin/postgres -D")
     } else if cmd.starts_with("containerd-shim") || cmd.starts_with("/usr/bin/containerd-shim") {
         find_idx("/usr/bin/containerd")
