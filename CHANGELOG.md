@@ -7,10 +7,11 @@ fix: the symptom and everything that shares its root cause.
 
 ### Correctness
 
-- The pidfile header is parsed and written without the version string, so a
-  pidfile from another release still disarms the boot-id check correctly
-  instead of silently passing it. `0.0.1` now comes from `Cargo.toml` in one
-  place.
+- The pidfile header is written with the version from `Cargo.toml`, and parsed
+  without interpreting it, so a pidfile from another release still gets the
+  boot-id check instead of silently passing it.
+- A psgen header with an empty or missing boot id is refused unless `--force`
+  is given, instead of skipping the boot check.
 - `pidfile_target_ok` compares eight header bytes, not nine, so a pidfile psgen
   wrote is accepted again on the next run, by `inject` and by `doctor`.
 - The pidfile preflight tests the temporary name the writer actually creates

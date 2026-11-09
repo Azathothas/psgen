@@ -86,10 +86,10 @@ want.
 
 The options a command honours are the options it accepts: an option that does
 not apply to the chosen subcommand is a usage error (exit 2), not a silent
-no-op. Common options are `-n/--count`, `-s/--seed`, `-p/--profile`
-(`server`, `dev`, `desktop`), `-f/--family` (`sys`, `web`, `db`, `ctr`, `dev`,
-`mon`, `sto`, `mail`, `desk`, `net`), `--utc-offset` (minutes, ±1440),
-`--local`, `--sort/--no-sort` and `--uniq/--no-uniq`.
+no-op. The generator options are `-n/--count`, `-s/--seed`, `-p/--profile`
+(`server`, `dev`, `desktop`) and `-f/--family` (`sys`, `web`, `db`, `ctr`,
+`dev`, `mon`, `sto`, `mail`, `desk`, `net`). `list` adds `--sort/--no-sort`
+and `--uniq/--no-uniq`; `table` and `inject` add `--utc-offset` and `--local`.
 
 `stop` takes `--force`, `--plan` and `-q`; `doctor` takes `--json` and
 `--pidfile`; `log` takes `-m/--module`, `--lines` (at most 200000), `--delay`,
@@ -158,9 +158,8 @@ lowered, and padding is disabled with a warning if the limit is too small.
 `--verify` compares real VSZ and RSS with the plan within 128 kB and has no
 effect with `--no-mem` (it warns). `--dry-run` prints the two columns it always
 printed; `--dry-run --plan` prints the resolved plan instead (tier, per-row
-user, VSZ, RSS, CPU, tty, threads, exe, parent, temp directories and the
-physical estimate) and `--dry-run --json` prints the same plan as one JSON
-object.
+user, VSZ, RSS, CPU, tty, threads, exe, parent and the physical estimate) and
+`--dry-run --json` prints the same plan as one JSON object.
 
 ### Pidfile and stop
 
@@ -204,11 +203,11 @@ the caller, has a basename matching `.psgen-<digits>-<digits>-<digits>`, and
 every signal succeeded.
 
 A run that ends by `--duration` alone leaves its staging directories, because
-the injector is gone by then. The next `inject` reclaims them: a directory
-whose owner marker names an injector that is no longer running (same PID and
-same starttime) is removed before anything is spawned. A directory created
-less than a minute ago and not yet marked is left alone, so a concurrent run is
-never touched.
+the injector is gone by then. The next `inject` reclaims them: a directory is
+removed only when it carries a live marker and none of the PIDs in that marker
+still exists. A directory without a live marker may belong to another tool or
+to a run that stopped before it could write one, so it is left alone. A live
+`--duration` run keeps its marker until its last stub exits.
 
 `--wait` requires a non-zero `--duration` (exit 2 otherwise, except with
 `--dry-run`). It blocks for the duration, then kills each root's process group
@@ -234,7 +233,8 @@ The root section of `tests/invariants.py` runs only with passwordless `sudo`;
 it is skipped otherwise. So are the checks that depend on a capability the host
 lacks: a pty (doctor says so), a reaping PID 1, and a hard `RLIMIT_FSIZE` large
 enough to exercise the free-space guard. A host that cannot run a check prints
-why and continues; it never aborts the suite. `python3` is required.
+why and continues; a check that does run and fails exits non-zero. `python3` is
+required.
 
 Besides the behavioural checks, `tests/invariants.py` carries a regression for
 every defect the beta-test rounds filed, each of which failed before the fix:
