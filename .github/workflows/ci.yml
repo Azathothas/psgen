@@ -40,9 +40,12 @@ jobs:
           cargo build --locked --release
           ./target/release/psgen unit > /tmp/psgen.service
           if command -v systemd-analyze >/dev/null 2>&1; then
-            systemd-analyze verify /tmp/psgen.service || true
+            systemd-analyze verify /tmp/psgen.service
           fi
-          ! grep -q 'proc-fs-nets.target' /tmp/psgen.service
+          if grep -q 'proc-fs-nets.target' /tmp/psgen.service; then
+            echo "unit names a nonexistent target" >&2
+            exit 1
+          fi
           grep -q '^RuntimeDirectory=psgen$' /tmp/psgen.service
           grep -q '^ExecStop=-' /tmp/psgen.service
 
