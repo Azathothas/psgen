@@ -154,12 +154,17 @@ USAGE
   psgen unit [options]          print a systemd unit that injects at boot
 
 COMMON
-  -n, --count N       rows or commands (list: all templates, table: 30, inject: 12)
-  -s, --seed N        deterministic output
-  -p, --profile NAME  server (default), dev, desktop
+  -n, --count N       rows or commands (list: all templates, table: 30,
+                      table --live: all, inject: 12). A family that has fewer
+                      unique rows than requested prints a shortfall warning.
+  -s, --seed N        fix the selection and jitter; START and TIME still
+                      follow the wall clock
+  -p, --profile NAME  server (default), dev, desktop; for list the weights
+                      apply only above the template count
   -f, --family NAME   sys, web, db, ctr, dev, mon, sto, mail, desk, net
       --utc-offset M  minutes east of UTC for the START column (default 0)
-      --local         use the system timezone for the START column
+      --local         use the system timezone for the START column; overrides
+                      --utc-offset
       --sort / --no-sort   list only
       --uniq / --no-uniq   list only
   -h, --help
@@ -171,18 +176,21 @@ INJECT
       --pidfile FILE    write the spawned PIDs here; an existing file must be
                         empty or a psgen pidfile
       --mem / --no-mem  pad VSZ and RSS (default on)
-      --mem-cap MiB     cap the planned RSS sum; the reported RSS can exceed
-                        it by up to a page per stub (0 = no cap, default)
-      --mem-target KiB  per-stub RSS target in KiB
+      --mem-cap MiB     cap the planned RSS sum; each stub keeps a 4 MiB
+                        floor, so a cap at or below 4 MiB per stub is raised
+                        to it and warned about (0 = no cap, default)
+      --mem-target KiB  per-stub RSS target in KiB, clamped to the template's
+                        VSZ minus 4 MiB
       --phys-cap MiB    physical budget for the arena, page tables and base
-                        RSS (0 = unlimited, omitted = a quarter of RAM or
-                        half the cgroup limit)
+                        RSS (0 = unlimited, omitted = the smaller of a quarter
+                        of RAM and half the cgroup limit)
       --disk MiB        write this many MiB of temp data per stub
       --exe / --no-exe  bind the template executable path (default on)
       --allow-proc-exe  alias of --no-exe: exec /proc/self/exe, no spoof
       --shadow-dir DIR  directory for the shadow copy when the bind is
                         unavailable or with --no-root; the copy goes in a
-                        per-run subdirectory; ignored with --no-exe
+                        per-run subdirectory; ignored with --no-exe and when
+                        the bind tier is in use
       --no-root         portable mode: no user switch, no mount namespace,
                         no bind tier; the stub uses /proc/self/exe or --shadow-dir
       --tty / --no-tty  give tty processes a real pty (default on);
@@ -190,14 +198,15 @@ INJECT
                         controlling terminal
       --threads / --no-threads  give threaded processes a second thread (default on)
       --user / --no-user  switch to the template user when running as root
-      --create-users    create missing template users with useradd
-      --busy            burn CPU for processes that are normally CPU bound
+      --create-users    create missing template users with useradd; no effect
+                        with --no-root or without root
+      --busy            burn CPU for every row whose corpus CPU is non-zero
       --cpu PCT         target cpu percent for every row; forces the busy path
                         when non-zero, 0 clears it (0..100)
-      --dry-run         print what would be spawned
+      --dry-run         print user and command for what would be spawned
       --table           after spawning, print the real ps aux table for the stubs
       --verify          compare each stub's real VSZ/RSS with the planned
-                        value; requires --mem
+                        value within 128 kB; has no effect with --no-mem
       --wait            block for a non-zero --duration, then stop the stubs
       --elevate         re-exec through sudo -n when not already root
   -q, --quiet           suppress the inject summary
@@ -217,7 +226,7 @@ LOG
 
 LOAD
       --cpu-util PCT  burn this percent of one core
-      --mem-util PCT  touch and hold this percent of MemTotal, or of the cgroup limit when lower
+      --mem-util PCT  touch and hold this percent of MemTotal, or of the cgroup limit when lower (0..95)
       --disk-util MiB write and hold MiB of temp data
   -d, --duration S    stop after S seconds (0 = until killed)
 
@@ -225,7 +234,7 @@ STOP
       --force           ignore the boot id; a three-field line still checks
                         starttime and comm, a two-field line still checks
                         starttime, and a one-field line still requires
-                        an exe match
+                        an exe match (proc-self rows only)
 "
 }
 
@@ -511,6 +520,11 @@ pub fn parse(args: &[Vec<u8>]) -> Result<Args, &'static str> {
     {
         return Err("--force only applies to stop");
     }
+    // --dry-run is an inject preview. Accepting it for stop made a command
+    // that looks like a preview kill the run.
+    if a.dry_run && a.sub == Sub::Stop {
+        return Err("--dry-run only applies to inject");
+    }
     Ok(a)
 }
 
@@ -551,7 +565,7 @@ fn elevate(argv: &[Vec<u8>], args: &Args) -> Option<i32> {
     }
 }
 
-fn print_notes(prep: &inject::Prep) {
+fn print_notes(prep: &inject::Prep, args: &Args) {
     for w in &prep.warnings {
         let mut out = Buf::new();
         out.push_str("psgen: ");
@@ -560,7 +574,7 @@ fn print_notes(prep: &inject::Prep) {
         sys::err(out.as_bytes());
     }
     let c = &prep.caps;
-    let reduced = !c.pty || (c.root && !c.user_switch);
+    let reduced = (!c.pty && args.tty) || (c.root && !c.user_switch && args.user);
     if reduced {
         let mut out = Buf::new();
         out.push_str("psgen: reduced capability:");
@@ -638,6 +652,14 @@ fn print_summary(prep: &inject::Prep, result: &inject::SpawnResult, args: &Args)
         }
     } else {
         out.push_str(" (pass --pidfile FILE to be able to stop them)");
+        if !result.temps.is_empty() {
+            out.push_str("; temp dirs:");
+            for t in &result.temps {
+                out.push(b' ');
+                out.push_bytes(t.as_os_str().as_bytes());
+            }
+            out.push_str(" (remove them with rm -rf when the run ends)");
+        }
     }
     if result.failed > 0 {
         out.push_str(", ");
@@ -702,6 +724,16 @@ fn print_summary(prep: &inject::Prep, result: &inject::SpawnResult, args: &Args)
     }
 }
 
+/// The START offset to hand to the table. `--local` selects the system
+/// timezone, so a UTC offset would shift a second time; local wins.
+fn start_offset(args: &Args) -> i64 {
+    if args.local {
+        0
+    } else {
+        args.offset_min
+    }
+}
+
 fn pidfile_parent(path: &[u8]) -> &[u8] {
     match path.iter().rposition(|b| *b == b'/') {
         Some(0) => b"/",
@@ -729,8 +761,14 @@ fn pidfile_error(path: &[u8]) -> Buf {
             out.push_str(" does not exist");
         } else if !sys::is_dir(parent) {
             out.push_str(" is not a directory");
-        } else {
+        } else if !sys::access(parent, sys::W_OK) {
             out.push_str(" is not writable");
+        } else {
+            // The parent is writable, so the failure was the target name
+            // itself: NAME_MAX is the usual cause.
+            out.push_str(" is writable but the file name cannot be created");
+            out.push_str(" (the name may exceed NAME_MAX once the temporary");
+            out.push_str(" suffix is added)");
         }
     }
     out
@@ -848,6 +886,18 @@ pub fn run() -> i32 {
                 uniq: args.uniq,
             };
             let mut cmds = gen::gen_list(&mut rng, &opts);
+            if let Some(f) = args.family {
+                let want = args.count.min(2000);
+                if args.count > 0 && cmds.len() < want {
+                    let msg = format!(
+                        "psgen: family {} supplies {} rows; {} were requested\n",
+                        corpus::family_name(f),
+                        cmds.len(),
+                        want
+                    );
+                    sys::err(msg.as_bytes());
+                }
+            }
             if args.sort {
                 cmds.sort_unstable();
             }
@@ -872,7 +922,7 @@ pub fn run() -> i32 {
                 let out = table::render(
                     &rows,
                     util::mem_total_kb(),
-                    args.offset_min,
+                    start_offset(&args),
                     args.local,
                     sys::page_kb(),
                 );
@@ -895,10 +945,22 @@ pub fn run() -> i32 {
                 uniq: args.uniq,
             };
             let rows = gen::gen_table(&mut rng, &opts);
+            if let Some(f) = args.family {
+                let want = if args.count == 0 { 30 } else { args.count.min(5000) };
+                if rows.len() < want {
+                    let msg = format!(
+                        "psgen: family {} supplies {} rows; {} were requested\n",
+                        corpus::family_name(f),
+                        rows.len(),
+                        want
+                    );
+                    sys::err(msg.as_bytes());
+                }
+            }
             let out = table::render(
                 &rows,
                 util::mem_total_kb(),
-                args.offset_min,
+                start_offset(&args),
                 args.local,
                 sys::page_kb(),
             );
@@ -957,6 +1019,18 @@ pub fn run() -> i32 {
                 uniq: args.uniq,
             };
             let mut rows = gen::gen_inject(&mut rng, &opts);
+            if let Some(f) = args.family {
+                let want = if args.count == 0 { 12 } else { args.count.min(500) };
+                if rows.len() < want {
+                    let msg = format!(
+                        "psgen: family {} supplies {} rows; {} were requested\n",
+                        corpus::family_name(f),
+                        rows.len(),
+                        want
+                    );
+                    sys::err(msg.as_bytes());
+                }
+            }
 
             // A disk target that would fill the filesystem is refused here,
             // before anything is spawned.
@@ -1010,11 +1084,11 @@ pub fn run() -> i32 {
                     out.push(b'\n');
                 }
                 sys::out(out.as_bytes());
-                print_notes(&prep);
+                print_notes(&prep, &args);
                 return 0;
             }
 
-            print_notes(&prep);
+            print_notes(&prep, &args);
             let result = match inject::spawn(&rows, &args, &prep) {
                 Ok(r) => r,
                 Err(e) => {
@@ -1058,11 +1132,12 @@ pub fn run() -> i32 {
             }
 
             if args.table {
-                let live_rows = live::read_pids(&result.pids);
+                let mut live_rows = live::read_pids(&result.pids);
+                live_rows.sort_unstable_by_key(|p| p.pid);
                 let out = table::render(
                     &live_rows,
                     util::mem_total_kb(),
-                    args.offset_min,
+                    start_offset(&args),
                     args.local,
                     sys::page_kb(),
                 );
