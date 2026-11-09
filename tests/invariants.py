@@ -1718,6 +1718,356 @@ def check_regressions2(tmp):
         fail("#21: --require-binaries exited with an unexpected code")
 
 
+def seccomp_helper() -> Path | None:
+    """Build the seccomp launcher, or None when there is no C compiler."""
+    src = ROOT / "tests" / "helpers" / "deny_syscall.c"
+    if not src.is_file():
+        return None
+    cc = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
+    if not cc:
+        return None
+    out = Path(tempfile.mkdtemp(prefix="psgen-seccomp-")) / "deny_syscall"
+    p = subprocess.run([cc, "-O2", "-o", str(out), str(src)],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if p.returncode != 0:
+        print(f"SKIP: cannot build the seccomp helper: {p.stderr.strip()[:200]}",
+              file=sys.stderr)
+        return None
+    return out
+
+
+def check_residuals(tmp):
+    """Regressions for the defects a second review found in the first PR."""
+
+    # #16: `-n` is a guarantee, not a target, for one family as well as for the
+    # whole corpus. Every family that has a template able to repeat must reach
+    # the requested count exactly, and the busiest command must stay under
+    # half the table.
+    for fam in ("sys", "web", "db", "mon", "net", "mail", "sto", "desk", "dev", "ctr"):
+        p = run(["table", "-f", fam, "-n", "200"], check=False)
+        rows = p.stdout.splitlines()[1:]
+        if len(rows) != 200:
+            fail(f"#16: table -f {fam} -n 200 returned {len(rows)} rows")
+        cmds = [" ".join(r.split()[10:]) for r in rows]
+        top = max(cmds.count(c) for c in set(cmds))
+        if top > len(cmds) // 2:
+            fail(f"#16: table -f {fam} -n 200 has one command {top} of {len(cmds)} rows")
+    # The count is exact for `inject` too.
+    rows = run(["inject", "-f", "web", "-n", "120", "--dry-run"]).stdout.splitlines()
+    if len(rows) != 120:
+        fail(f"#16: inject -f web -n 120 printed {len(rows)} rows")
+
+    # #16 (opt-out): `--repeat-max 1` is how a caller asks for fewer rows rather
+    # than a repeated command, and the shortfall names the reason.
+    p = run(["table", "-f", "sto", "-n", "200", "--repeat-max", "1"], check=False)
+    rows = p.stdout.splitlines()[1:]
+    if len(rows) >= 200:
+        fail("#16: --repeat-max 1 still reached 200 rows")
+    if "row" not in p.stderr or "could be produced" not in p.stderr:
+        fail(f"#16: the shortfall message is unhelpful: {p.stderr.strip()!r}")
+    cmds = [" ".join(r.split()[10:]) for r in rows]
+    if cmds and max(cmds.count(c) for c in set(cmds)) > 1:
+        fail("#16: --repeat-max 1 repeated a command")
+    # ... and the default reaches the count for the same family.
+    rows = run(["table", "-f", "sto", "-n", "200"]).stdout.splitlines()[1:]
+    if len(rows) != 200:
+        fail(f"#16: table -f sto -n 200 returned {len(rows)} rows by default")
+
+    # #28: a small pid_max caps the table, reports the gap, and never repeats or
+    # exceeds a PID.
+    for pid_max in (2, 3, 4, 10, 100):
+        p = run(["table", "-n", "50", "--host-pid-max", str(pid_max)], check=False)
+        rows = p.stdout.splitlines()[1:]
+        pids = [int(r.split()[1]) for r in rows]
+        if len(set(pids)) != len(pids):
+            fail(f"#28: pid_max {pid_max} produced a duplicate PID")
+        for pid in pids:
+            if pid < 1 or pid >= pid_max:
+                fail(f"#28: pid_max {pid_max} produced PID {pid}")
+        room = max(pid_max - 1, 1)
+        if len(pids) > room:
+            fail(f"#28: pid_max {pid_max} produced {len(pids)} rows with room for {room}")
+        if pid_max < 50 and "could be produced" not in p.stderr:
+            fail(f"#28: pid_max {pid_max} silently under-delivered")
+        if pid_max >= 50 and p.stderr:
+            fail(f"#28: pid_max {pid_max} printed a shortfall it does not have")
+
+    # #28 (memory half): a small host is fitted, not exceeded.
+    rows = run(["table", "-n", "600", "--host-mem", "256"]).stdout.splitlines()[1:]
+    total = 0
+    for line in rows:
+        m = PS_RE.match(line)
+        if not m:
+            continue
+        rss = int(m.group("rss"))
+        total += rss
+        if rss > 256 * 1024:
+            fail(f"#28: a 256 MiB host got a {rss} kB row")
+        if float(m.group("mem")) > 100.0:
+            fail("#28: %MEM above 100 on a 256 MiB host")
+    if total > 256 * 1024:
+        fail(f"#28: a 256 MiB host got {total} kB of RSS")
+
+    # #2: the same seed must give the same non-time columns at any uptime, with
+    # no private mount and no fake host: the generator takes the uptime.
+    def masked(args, uptime):
+        out = run(args + ["--host-uptime", str(uptime)]).stdout
+        rows = []
+        for line in out.splitlines()[1:]:
+            m = PS_RE.match(line)
+            if not m:
+                continue
+            rows.append((m.group("pid"), m.group("cpu"), m.group("vsz"),
+                         m.group("rss"), m.group("stat"), m.group("cmd")))
+        return rows
+
+    for uptime in (0, 1, 5, 10, 11, 30, 60, 61, 600):
+        a = masked(["table", "-n", "30", "-s", "165"], uptime)
+        b = masked(["table", "-n", "30", "-s", "165"], uptime + 1)
+        if a != b:
+            fail(f"#2: seed 165 differs between uptime {uptime} and {uptime + 1}")
+
+    # #14: a real seccomp denial of getrandom must not abort after the pidfile
+    # header is written, and the run must stay stoppable.
+    helper = seccomp_helper()
+    if helper is None:
+        print("SKIP: #14 needs a C compiler for the seccomp launcher",
+              file=sys.stderr)
+    else:
+        pf = Path(tmp) / "getrandom.pid"
+        p = subprocess.run([str(helper), "getrandom", str(BIN), "inject", "-n", "2",
+                            "--no-user", "--no-mem", "--no-tty", "--no-threads",
+                            "--pidfile", str(pf)],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           text=True, timeout=180)
+        if p.returncode >= 128:
+            fail(f"#14: inject died by signal {p.returncode - 128} under a getrandom denial")
+        if p.returncode != 0:
+            fail(f"#14: inject failed under a getrandom denial: {p.stderr.strip()[:300]}")
+        if not pf.exists():
+            fail("#14: no pidfile after a getrandom denial")
+        pids = read_pids(pf)
+        if len(pids) != 2:
+            fail(f"#14: {len(pids)} rows recorded under a getrandom denial")
+        out = stop_pidfile(pf)
+        if "stopped 2 processes" not in out:
+            fail(f"#14: the run was not stoppable after a getrandom denial: {out!r}")
+
+        # The other half: a failure inside spawn, after the header-only pidfile
+        # exists. Nothing may be spawned and the header must be removed.
+        pf = Path(tmp) / "pipe2.pid"
+        p = subprocess.run([str(helper), "pipe2", str(BIN), "inject", "-n", "2",
+                            "--no-user", "--no-mem", "--no-tty", "--no-threads",
+                            "--pidfile", str(pf)],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           text=True, timeout=180)
+        if p.returncode == 0:
+            fail("#14: inject succeeded with pipe2 denied")
+        if pf.exists():
+            fail("#14: a post-header spawn failure left a pidfile behind")
+        if "pipe2" not in p.stderr:
+            fail(f"#14: the failure does not name the syscall: {p.stderr.strip()[:200]!r}")
+
+    # #25: a hardlink named psgen-stub must not be executed. A hardlink is a
+    # regular file with a second link, which is exactly what the leaf check
+    # refuses.
+    if not (shutil.which("ln") and os.path.isdir("/proc/self/fd")):
+        print("SKIP: #25 hardlink leaf needs ln", file=sys.stderr)
+    else:
+        staging = Path(tmp) / "hardlink"
+        staging.mkdir()
+        run(["inject", "-n", "1", "-s", "5", "--no-user", "--no-mem", "--no-tty",
+             "--no-threads", "--shadow-dir", str(staging),
+             "--pidfile", str(Path(tmp) / "hl.pid")], check=False)
+        dirs = list(staging.glob(".psgen-*"))
+        if not dirs:
+            print("SKIP: #25 no shadow staging was created", file=sys.stderr)
+        else:
+            d = dirs[0]
+            run([str(BIN), "stop", "--pidfile", str(Path(tmp) / "hl.pid")], check=False)
+            run([str(BIN), "stop", "--pidfile", str(Path(tmp) / "hl.pid")], check=False)
+            leaf = d / "psgen-stub"
+            victim = d / "victim"
+            if leaf.exists():
+                leaf.unlink()
+            shutil.copy2("/bin/echo", victim)
+            try:
+                os.link(victim, leaf)
+            except OSError as e:
+                print(f"SKIP: #25 cannot make a hardlink here: {e}", file=sys.stderr)
+            else:
+                # Feed the stub a config that names the hardlinked leaf. It must
+                # not exec it.
+                cfg = Path(tmp) / "hl.cfg"
+                nonce = b"deadbeefdeadbeef"
+                comm = b"nginx"
+                cmd = b"/usr/sbin/nginx"
+                self_copy = str(leaf).encode()
+                temp = str(d).encode()
+                import struct
+                hdr = bytearray(104)
+                hdr[:8] = b"PGCFG023"
+
+                def w(off, v):
+                    struct.pack_into("<I", hdr, off, v)
+
+                w(8, 3)
+                w(40, 1)
+                w(44, len(comm))
+                w(48, len(self_copy))
+                w(52, len(cmd))
+                w(56, 1)
+                w(60, len(temp))
+                struct.pack_into("<i", hdr, 72, 5)
+                struct.pack_into("<i", hdr, 76, -1)
+                struct.pack_into("<i", hdr, 80, -1)
+                w(92, len(self_copy))
+                w(96, len(nonce))
+                blob = bytes(hdr) + comm + self_copy + cmd + b"u" + temp + self_copy + nonce
+                cfg.write_bytes(blob)
+                env = dict(os.environ, PSGEN_NONCE=nonce.decode())
+                with open(cfg, "rb") as f:
+                    proc = subprocess.Popen(
+                        [str(BIN)], env=env, stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        preexec_fn=lambda: os.dup2(f.fileno(), 3),
+                        pass_fds=(f.fileno(),))
+                time.sleep(1.0)
+                try:
+                    exe = os.readlink(f"/proc/{proc.pid}/exe")
+                except OSError:
+                    exe = ""
+                proc.kill()
+                proc.wait()
+                if exe == str(victim) or exe == str(leaf):
+                    fail("#25: a hardlinked psgen-stub was executed")
+                leaf.unlink()
+                victim.unlink()
+
+    # #25 (data.bin): a pre-existing hardlink named data.bin must not be
+    # truncated by --disk.
+    if shutil.which("ln"):
+        staging = Path(tmp) / "diskhard"
+        staging.mkdir()
+        outer = Path(tmp) / "victim-file"
+        outer.write_bytes(b"keep me\n")
+        pf = Path(tmp) / "disk.pid"
+        run(["inject", "-n", "1", "-s", "5", "--disk", "1", "--no-user",
+             "--no-mem", "--no-tty", "--no-threads", "--shadow-dir", str(staging),
+             "--pidfile", str(pf)], check=False)
+        dirs = list(staging.glob(".psgen-*"))
+        for d in dirs:
+            run([str(BIN), "stop", "--pidfile", str(pf)], check=False)
+            data = d / "data.bin"
+            if data.exists():
+                data.unlink()
+            try:
+                os.link(outer, data)
+            except OSError:
+                continue
+            # Run the stub for this directory through a config naming it.
+            cfg = Path(tmp) / "disk.cfg"
+            nonce = b"deadbeefdeadbeef"
+            comm = b"nginx"
+            cmd = b"/usr/sbin/nginx"
+            temp = str(d).encode()
+            import struct
+            hdr = bytearray(104)
+            hdr[:8] = b"PGCFG023"
+
+            def w2(off, v):
+                struct.pack_into("<I", hdr, off, v)
+
+            w2(8, 3)
+            w2(40, 1)
+            w2(44, len(comm))
+            w2(48, 0)
+            w2(52, len(cmd))
+            w2(56, 1)
+            w2(60, len(temp))
+            struct.pack_into("<i", hdr, 72, 5)
+            struct.pack_into("<i", hdr, 76, -1)
+            struct.pack_into("<i", hdr, 80, -1)
+            w2(88, 1024)  # 1 MiB of --disk data
+            w2(92, 0)
+            w2(96, len(nonce))
+            blob = bytes(hdr) + comm + cmd + b"u" + temp + nonce
+            cfg.write_bytes(blob)
+            env = dict(os.environ, PSGEN_NONCE=nonce.decode())
+            with open(cfg, "rb") as f:
+                proc = subprocess.Popen(
+                    [str(BIN)], env=env, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    preexec_fn=lambda: os.dup2(f.fileno(), 3),
+                    pass_fds=(f.fileno(),))
+            time.sleep(1.2)
+            proc.kill()
+            proc.wait()
+            if outer.read_bytes() != b"keep me\n":
+                fail("#25: a hardlinked data.bin was truncated")
+            data.unlink()
+            break
+        try:
+            outer.unlink()
+        except OSError:
+            pass
+
+    # #26: the error names what actually failed. A path that is too long is not
+    # a NAME_MAX problem when the basename is short and the directory is deep.
+    deep = Path(tmp)
+    while len(str(deep)) < 4090:
+        deep = deep / ("d" * 200)
+    p = run(["inject", "-n", "1", "--no-user", "--no-mem", "--no-tty",
+             "--no-threads", "--pidfile", str(deep / "p.pid")], check=False)
+    if p.returncode != 2:
+        fail(f"#26: an over-long path exited {p.returncode}")
+    if "NAME_MAX" in p.stderr and "PATH_MAX" not in p.stderr:
+        if len(str(deep / "p.pid")) > 4096:
+            fail("#26: a PATH_MAX failure was reported as NAME_MAX")
+
+    # #6: a psgen header with no boot id is refused, not silently accepted.
+    pf = Path(tmp) / "noboot.pid"
+    pf.write_text("# psgen 0.0.1\n")
+    p = run(["stop", "--pidfile", str(pf)], check=False)
+    if p.returncode == 0:
+        fail("#6: a header with no boot id was accepted")
+    p = run(["stop", "--pidfile", str(pf), "--force"], check=False)
+    if p.returncode != 0:
+        fail(f"#6: --force did not accept a header with no boot id: {p.stderr.strip()!r}")
+
+    # #15: --plan -q is quiet, and a target the caller cannot signal is reported.
+    pf = Path(tmp) / "plan2.pid"
+    run(["inject", "-n", "2", "-s", "5", "--no-user", "--no-mem", "--no-tty",
+         "--no-threads", "--pidfile", str(pf)])
+    p = run(["stop", "--pidfile", str(pf), "--plan", "-q"], check=False)
+    if "would signal" in p.stdout:
+        fail("#15: --plan -q printed would-signal lines")
+    stop_pidfile(pf)
+
+    # #24: --lines 0 is "print nothing and succeed", which is what the base
+    # did; the review kept that rather than turning it into an error.
+    p = run(["log", "--lines", "0"], check=False)
+    if p.returncode != 0 or p.stdout.strip():
+        fail(f"#24: log --lines 0 printed {p.stdout[:40]!r} and exited {p.returncode}")
+
+    # #5: an unmarked foreign .psgen-* directory is never removed.
+    foreign = Path(tmp) / ".psgen-1-2-3"
+    foreign.mkdir()
+    (foreign / "keep.txt").write_text("not ours\n")
+    run(["inject", "-n", "1", "-s", "7", "--no-user", "--no-mem", "--no-tty",
+         "--no-threads", "--pidfile", str(Path(tmp) / "f.pid")],
+        env=dict(os.environ, TMPDIR=str(tmp)), check=False)
+    if not (foreign / "keep.txt").exists():
+        fail("#5: an unmarked foreign .psgen-* directory was removed")
+    stop_pidfile(Path(tmp) / "f.pid")
+    shutil.rmtree(foreign, ignore_errors=True)
+
+
+def check_regressions2_tmp():
+    with tempfile.TemporaryDirectory(prefix="psgen-res-") as tmp:
+        check_residuals(Path(tmp))
+
+
 def main() -> int:
     if not BIN.exists():
         fail(f"{BIN} missing, run cargo build --release")
@@ -1735,6 +2085,7 @@ def main() -> int:
     check_stop()
     check_counts()
     check_regressions()
+    check_regressions2_tmp()
     if can_root():
         check_root()
     else:
