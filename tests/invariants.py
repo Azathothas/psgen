@@ -1337,7 +1337,10 @@ def check_regressions2(tmp):
     # A zombie is gone for every purpose `stop` reports, so the liveness test
     # is the same one the tool uses.
     alive_now = [pid for pid in pids if alive(pid)]
-    if p.returncode == 0 and alive_now:
+    # The one-field form identifies a row by its exe. Under qemu-user that is
+    # the emulator, so it cannot identify any row; the three-field form is the
+    # supported one there and is exercised above.
+    if exe_known() and p.returncode == 0 and alive_now:
         fail(f"#22: a one-field pidfile reported success with {len(alive_now)} rows alive")
     stop_pidfile(pf)
 
