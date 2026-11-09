@@ -1320,28 +1320,26 @@ def check_regressions2(tmp):
     if loc != both:
         fail("#17: --local and --utc-offset were both applied")
 
-    # #16: a family whose distinct commands are fewer than the request says so,
-    # and no single command absorbs the remainder.
+    # #16: a count is honoured by spreading the repeats over the templates that
+    # can run more than once, and a request that cannot be met at all says so.
     for fam, n in (("mail", 50), ("mon", 50), ("sto", 50), ("net", 50)):
         p = run(["table", "-f", fam, "-n", str(n)])
         cmds = [" ".join(r.split()[10:]) for r in p.stdout.splitlines()[1:]]
-        if len(set(cmds)) >= n and "distinct rows" in p.stderr:
-            fail(f"#16: {fam} warned about a shortfall it does not have")
-        if len(set(cmds)) < n and "distinct rows" not in p.stderr:
-            fail(f"#16: {fam} shortfall was silent")
         if cmds and max(cmds.count(c) for c in set(cmds)) > n // 2:
             fail(f"#16: {fam} -n {n} is dominated by one command")
-        # The short list case: `list` never repeats, and says so.
+        if "can supply" in p.stderr and not cmds:
+            fail(f"#16: {fam} warned but produced no rows")
+        # `list` never repeats, so it stops short and says so.
         lp = run(["list", "-f", fam, "-n", str(n)])
-        if len(lp.stdout.splitlines()) >= n and "never repeats" in lp.stderr:
-            fail(f"#16: list -f {fam} warned about a shortfall it does not have")
-        if len(lp.stdout.splitlines()) < n and "never repeats" not in lp.stderr:
+        lines = lp.stdout.splitlines()
+        if len(lines) < n and "a list never repeats" not in lp.stderr:
             fail(f"#16: list -f {fam} shortfall was silent")
+        if len(set(lines)) != len(lines):
+            fail(f"#16: list -f {fam} repeated a command")
     rows = run(["table", "-f", "sys", "-n", "200"]).stdout.splitlines()[1:]
     cmds = [" ".join(r.split()[10:]) for r in rows]
-    # The count is honoured by repeating templates that can run more than once,
-    # spread across all of them: the regression was one command taking 60% of
-    # the table (120 of 200 rows were `sshd: user [priv]`).
+    # The regression was one command taking 60% of the table (120 of 200 rows
+    # were `sshd: user [priv]`).
     top = max(cmds.count(c) for c in set(cmds))
     if top > len(cmds) // 3:
         fail(f"#16: sys -n 200 has one command {top} of {len(cmds)} rows")
@@ -1349,6 +1347,8 @@ def check_regressions2(tmp):
         fail(f"#16: sys -n 200 used only {len(set(cmds))} distinct commands")
     big = [" ".join(r.split()[10:]) for r in
            run(["table", "-n", "5000", "-s", "1"]).stdout.splitlines()[1:]]
+    if len(big) < 1000:
+        fail(f"#16: table -n 5000 produced only {len(big)} rows")
     top = max(big.count(c) for c in set(big))
     if top > len(big) // 25:
         fail(f"#16: table -n 5000 has one command {top} of {len(big)} rows")

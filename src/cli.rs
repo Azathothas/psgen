@@ -231,9 +231,7 @@ USAGE
 COMMON
   -n, --count N       rows or commands (list: all templates, table: 30,
                       table --live: all, inject: 12). A family that has fewer
-                      distinct rows than requested prints a shortfall warning
-                      and returns what it has; it is never padded with the same
-                      command twice.
+                      request that cannot be met at all prints a warning.
   -s, --seed N        fix the selection and jitter; START and TIME still
                       follow the wall clock
   -p, --profile NAME  server (default), dev, desktop; list honours the weights
@@ -1260,23 +1258,14 @@ fn pidfile_error(path: &[u8]) -> Buf {
     out
 }
 
-/// Warn when a family cannot supply the requested count. The generator never
-/// pads with the same command twice, so a short count is the honest answer.
-/// How many of `rows` carry a distinct command line. A population padded with
-/// repeats is the case a count warning has to describe, so this is what the
-/// message counts.
-fn distinct_commands(rows: &[gen::Proc]) -> usize {
-    let mut seen: Vec<&[u8]> = rows.iter().map(|p| p.cmd.as_slice()).collect();
-    seen.sort_unstable();
-    seen.dedup();
-    seen.len()
-}
-
-/// Say how many distinct rows a request can produce.
+/// Say so when a request cannot be met at all.
 ///
-/// `padded` says whether the caller fills the remainder with templates that
-/// legitimately repeat (table, inject) or stops short (list).
-fn shortfall(family: Option<u8>, got: usize, want: usize, padded: bool) {
+/// A table that repeats a row a real host runs several times is not a
+/// shortfall: the count is honoured, and `F_REPEAT` marks the templates that may
+/// contribute more than one row. What a caller does need to hear is the case
+/// where even that cannot reach the number, which happens for a family whose
+/// templates all run once and cannot vary (`list -f mail -n 50`).
+fn shortfall(family: Option<u8>, got: usize, want: usize, list: bool) {
     if want == 0 || got >= want {
         return;
     }
@@ -1289,19 +1278,15 @@ fn shortfall(family: Option<u8>, got: usize, want: usize, padded: bool) {
         }
         None => out.push_str("the corpus"),
     }
-    out.push_str(" has ");
+    out.push_str(" can supply ");
     out.push_u64(got as u64);
-    out.push_str(" distinct rows for ");
+    out.push_str(" of the ");
     out.push_u64(want as u64);
-    out.push_str(" requested");
-    if padded {
-        out.push_str(
-            "; the rest are repeated templates that can run more than once on a real host",
-        );
+    out.push_str(" rows requested");
+    if list {
+        out.push_str("; a list never repeats a command (use --no-uniq to pad)");
     } else {
-        out.push_str("; a list never repeats a command, so it stops at ");
-        out.push_u64(got as u64);
-        out.push_str(" (use --no-uniq to pad)");
+        out.push_str(" without repeating a command a host would not repeat");
     }
     out.push(b'\n');
     sys::err(out.as_bytes());
@@ -1632,7 +1617,7 @@ pub fn run() -> i32 {
                 } else {
                     args.count.min(2000)
                 },
-                false,
+                true,
             );
             if args.sort {
                 cmds.sort_unstable();
@@ -1682,13 +1667,12 @@ pub fn run() -> i32 {
             };
             let fit = gen::Fit::host();
             let rows = gen::gen_table(&mut rng, &opts, &fit);
-            let n = distinct_commands(&rows);
             let want = if args.count == 0 {
                 30
             } else {
                 args.count.min(5000)
             };
-            shortfall(args.family, n, want, true);
+            shortfall(args.family, rows.len(), want, false);
             let out = table::render(
                 &rows,
                 table::mem_budget_kb(),
@@ -1753,13 +1737,12 @@ pub fn run() -> i32 {
             // The stub's own sizes are planned by prepare(); only the corpus
             // sizes need to be lowered to what this host can hold.
             let mut rows = gen::gen_inject(&mut rng, &opts, &gen::Fit::none());
-            let n = distinct_commands(&rows);
             let want = if args.count == 0 {
                 12
             } else {
                 args.count.min(500)
             };
-            shortfall(args.family, n, want, true);
+            shortfall(args.family, rows.len(), want, false);
 
             // A disk target that would fill the filesystem is refused here,
             // before anything is spawned.
