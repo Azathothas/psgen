@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Invariant checks for psgen 0.0.1. Run by tests/smoke.sh.
+"""Invariant checks for psgen. Run by tests/smoke.sh.
 
 The agent-side checks run as the invoking user. Root-side checks run through
 sudo when passwordless sudo is available, and skip otherwise.
@@ -18,7 +18,17 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-BIN = ROOT / "target" / "release" / "psgen"
+BIN = Path(os.environ.get("PSGEN_BIN", ROOT / "target" / "release" / "psgen"))
+
+
+def cargo_version() -> str:
+    for line in (ROOT / "Cargo.toml").read_text().splitlines():
+        if line.startswith('version = "'):
+            return line.split('"')[1]
+    raise SystemExit("no version in Cargo.toml")
+
+
+VERSION = cargo_version()
 HEADER = "USER         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND"
 PS_RE = re.compile(
     r"^(?P<user>\S+)\s+(?P<pid>\d+)\s+(?P<cpu>\d+\.\d)\s+"
@@ -182,7 +192,7 @@ def boot_id():
 
 
 def check_cli():
-    if run(["--version"]).stdout.strip() != "psgen 0.0.1":
+    if run(["--version"]).stdout.strip() != f"psgen {VERSION}":
         fail("wrong version")
     help_text = run(["--help"]).stdout
     if "psgen inject" not in help_text:
@@ -365,12 +375,14 @@ def inject_and_check(args, tmp, want, root=False, read_root=None):
 
 
 def stop_pidfile(path, root=False):
+    out = ""
     if Path(path).exists():
-        run(["stop", "--pidfile", str(path)], root=root, check=False)
+        out = run(["stop", "--pidfile", str(path)], root=root, check=False).stdout
     try:
         Path(path).unlink()
     except OSError:
         pass
+    return out
 
 
 def check_injection():
@@ -804,7 +816,7 @@ def check_doctor():
         doc = json.loads(j.stdout)
     except json.JSONDecodeError as e:
         fail(f"doctor --json is not valid JSON: {e}")
-    if doc.get("version") != "0.0.1":
+    if doc.get("version") != VERSION:
         fail(f"doctor --json version {doc.get('version')!r}")
     if doc.get("ok") is not True:
         fail("doctor --json says not ok")
@@ -1182,6 +1194,8 @@ def check_regressions():
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     subprocess.run(["sudo", "-n", "groupdel", "haproxy"],
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            print("SKIP: F-11 needs passwordless sudo", file=sys.stderr)
 
         check_regressions2(tmp)
 
@@ -1594,6 +1608,68 @@ def check_regressions2(tmp):
         fail("#5: the next run did not prune the staging directories")
     if list((Path(tmp) / "tmpdir").glob(".psgen-*")):
         fail("#5: the prune left a dead run's data directory")
+
+    # #5 (second half): a live --duration run must keep its staging until its
+    # last stub exits. The injector is already gone, so only the live marker
+    # can tell the prune that the data is still in use.
+    live_tmp = Path(tmp) / "livetmp"
+    live_tmp.mkdir()
+    live_shadow = Path(tmp) / "live-staging"
+    live_env = dict(os.environ, TMPDIR=str(live_tmp))
+    pf1 = Path(tmp) / "live1.pid"
+    pf2 = Path(tmp) / "live2.pid"
+    run(["inject", "-n", "1", "-s", "7", "-d", "8", "--disk", "1",
+         "--no-user", "--no-mem", "--no-tty", "--no-threads",
+         "--shadow-dir", str(live_shadow), "--pidfile", str(pf1)], env=live_env)
+    dirs = list(live_tmp.glob(".psgen-*"))
+    if not dirs:
+        fail("#5: the live run created no staging directory")
+    try:
+        p = run(["inject", "-n", "1", "-s", "7", "-d", "1", "--no-user",
+                 "--no-mem", "--no-tty", "--no-threads",
+                 "--shadow-dir", str(live_shadow), "--pidfile", str(pf2)],
+                env=live_env, check=False)
+        if "pruned" in p.stderr:
+            fail("#5: the prune removed a live --duration run's staging")
+        if not dirs[0].is_dir():
+            fail("#5: the live --duration run's staging directory is gone")
+        if not (dirs[0] / "data.bin").is_file():
+            fail("#5: the live --duration run's disk data is gone")
+    finally:
+        stop_pidfile(pf2)
+        stop_pidfile(pf1)
+
+    # #1: a pidfile that still records live stubs cannot be reused. The second
+    # inject must refuse, and the first run must remain stoppable.
+    pf = Path(tmp) / "reuse.pid"
+    run(["inject", "-n", "2", "-s", "7", "--no-user", "--no-mem", "--no-tty",
+         "--no-threads", "--pidfile", str(pf)])
+    p = run(["inject", "-n", "2", "-s", "7", "--no-user", "--no-mem", "--no-tty",
+             "--no-threads", "--pidfile", str(pf)], check=False)
+    if p.returncode != 2 or "records live processes" not in p.stderr:
+        fail(f"#1: reusing a live pidfile was not refused: rc {p.returncode}")
+    out = stop_pidfile(pf)
+    if "stopped 2 processes" not in out:
+        fail(f"#1: the first run could not be stopped after the refusal: {out!r}")
+    run(["inject", "-n", "2", "-s", "7", "--no-user", "--no-mem", "--no-tty",
+         "--no-threads", "--pidfile", str(pf)])
+    stop_pidfile(pf)
+
+    # #4 (third case): a malformed starttime is skipped, not treated as a
+    # one-field line whose executable check can kill an unrelated process.
+    sp = subprocess.Popen(["sleep", "30"])
+    try:
+        pf = Path(tmp) / "malformed.pid"
+        pf.write_text(f"# psgen {VERSION} boot {boot_id()}\n"
+                      f"{sp.pid}\tnotanumber\tsleep\n")
+        out = run(["stop", "--pidfile", str(pf)]).stdout
+        if "skipped 1" not in out:
+            fail(f"#4: a malformed starttime was not skipped: {out.strip()!r}")
+        if sp.poll() is not None:
+            fail("#4: a malformed starttime killed the named process")
+    finally:
+        sp.kill()
+        sp.wait()
 
     # #24: a closed reader stops the generator, and --lines is bounded.
     proc = subprocess.Popen([str(BIN), "log", "-m", "weblog", "--lines", "100000",
