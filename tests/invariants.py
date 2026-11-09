@@ -2017,13 +2017,26 @@ def check_residuals(tmp):
     deep = Path(tmp)
     while len(str(deep)) < 4090:
         deep = deep / ("d" * 200)
+    target = str(deep / "p.pid")
     p = run(["inject", "-n", "1", "--no-user", "--no-mem", "--no-tty",
-             "--no-threads", "--pidfile", str(deep / "p.pid")], check=False)
+             "--no-threads", "--pidfile", target], check=False)
     if p.returncode != 2:
         fail(f"#26: an over-long path exited {p.returncode}")
-    if "NAME_MAX" in p.stderr and "PATH_MAX" not in p.stderr:
-        if len(str(deep / "p.pid")) > 4096:
+    # The message has to name what failed. For a path over PATH_MAX with short
+    # components that is not a NAME_MAX problem, and saying "not a psgen
+    # pidfile" (the old wording) is a lie about a path that was never opened.
+    if len(target) > 4096:
+        if "cannot be examined" not in p.stderr:
+            fail(f"#26: an over-long path was not reported as unopenable: {p.stderr[:160]!r}")
+        if "NAME_MAX" in p.stderr:
             fail("#26: a PATH_MAX failure was reported as NAME_MAX")
+    # A basename over NAME_MAX is a different message, and it must be refused
+    # before anything is spawned.
+    long_name = Path(tmp) / ("n" * 300)
+    p = run(["inject", "-n", "2", "--no-user", "--no-mem", "--no-tty",
+             "--no-threads", "--pidfile", str(long_name)], check=False)
+    if p.returncode != 2 or "spawned" in p.stdout:
+        fail(f"#26: a NAME_MAX basename was not refused before spawning: {p.returncode}")
 
     # #6: a psgen header with no boot id is refused, not silently accepted.
     pf = Path(tmp) / "noboot.pid"

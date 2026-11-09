@@ -436,25 +436,48 @@ pub fn pidfile_temp_name(path: &[u8], level: usize, nonce: u64) -> Vec<u8> {
 /// FIFO, a socket or a symlink would be replaced by a regular file. An absent
 /// path and an empty regular file are fine; a non-empty regular file must
 /// already start with the psgen header.
-pub fn pidfile_target_ok(path: &[u8]) -> bool {
+/// Why a pidfile path cannot be used, when it cannot.
+pub enum TargetProblem {
+    /// The path could not be examined at all: `ENAMETOOLONG` for a component
+    /// above `NAME_MAX` or a path above `PATH_MAX`, `EACCES` for a directory
+    /// the caller cannot search, and so on.
+    Unreadable(i32),
+    /// The object exists but is not an absent path, an empty file, or a psgen
+    /// pidfile.
+    Foreign,
+}
+
+/// Whether a pidfile may replace the object at `path`.
+///
+/// `pidfile_target_ok` is the boolean form; this one says why, so the error
+/// message can name the real cause instead of asserting the usual one.
+pub fn pidfile_target(path: &[u8]) -> Result<(), TargetProblem> {
     let path = path.strip_suffix(&[0]).unwrap_or(path);
     let p = Path::new(OsStr::from_bytes(path));
     let meta = match std::fs::symlink_metadata(p) {
         Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
-        Err(_) => return false,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(TargetProblem::Unreadable(
+                e.raw_os_error().unwrap_or(libc::EIO).abs(),
+            ))
+        }
     };
     if !meta.file_type().is_file() {
-        return false;
+        return Err(TargetProblem::Foreign);
     }
     if meta.len() == 0 {
-        return true;
+        return Ok(());
     }
     let mut buf = [0u8; 16];
     match sys::read_file(path, &mut buf) {
-        Some(n) => n >= 8 && &buf[..8] == b"# psgen ",
-        None => false,
+        Some(n) if n >= 8 && &buf[..8] == b"# psgen " => Ok(()),
+        _ => Err(TargetProblem::Foreign),
     }
+}
+
+pub fn pidfile_target_ok(path: &[u8]) -> bool {
+    pidfile_target(path).is_ok()
 }
 
 /// Whether a pidfile at `path` could be written.

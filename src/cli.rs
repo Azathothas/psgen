@@ -1287,6 +1287,13 @@ fn pidfile_error(path: &[u8]) -> Buf {
         out.push_str(": the path is empty");
     } else if sys::is_dir(path) {
         out.push_str(": the path is a directory");
+    } else if let Err(probe::TargetProblem::Unreadable(e)) = probe::pidfile_target(path) {
+        // "Not an empty file or a psgen pidfile" would be a lie here: the path
+        // could not be examined, which is a different problem with a different
+        // fix (a shorter name, or a directory the caller can search).
+        out.push_str(": the path cannot be examined (");
+        out.push_str(&std::io::Error::from_raw_os_error(e).to_string());
+        out.push(b')');
     } else if !probe::pidfile_target_ok(path) {
         out.push_str(": the path is not an empty file or a psgen pidfile");
     } else {
