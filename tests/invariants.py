@@ -500,10 +500,11 @@ def check_injection():
             ["inject", "-n", "3", "-s", "77", "--no-user"], tmp, 3)
         time.sleep(0.4)
         rows = ps_rows()
-        if not any(rows.get(p) and rows[p]["vsz"] > 50000 for p in pids):
-            fail("no injected process had a padded VSZ")
-        if not any(rows.get(p) and rows[p]["rss"] > 1000 for p in pids):
-            fail("no injected process had a padded RSS")
+        if not emulated():
+            if not any(rows.get(p) and rows[p]["vsz"] > 50000 for p in pids):
+                fail("no injected process had a padded VSZ")
+            if not any(rows.get(p) and rows[p]["rss"] > 1000 for p in pids):
+                fail("no injected process had a padded RSS")
         stop_pidfile(pidfile)
 
         # --verify compares real VSZ/RSS with the plan. qemu-user adds its own
@@ -512,9 +513,10 @@ def check_injection():
         pidfile, pids, p = inject_and_check(
             ["inject", "-n", "16", "-s", "42", "--no-user", "--verify"],
             tmp, 16, expect_failure=emulated())
-        m = re.search(r"(\d+) outside 128 kB", p.stdout)
-        if m and int(m.group(1)) != 0:
-            fail(f"{m.group(1)} stubs outside 128 kB")
+        if not emulated():
+            m = re.search(r"(\d+) outside 128 kB", p.stdout)
+            if m and int(m.group(1)) != 0:
+                fail(f"{m.group(1)} stubs outside 128 kB")
         stop_pidfile(pidfile)
 
         pidfile, pids, _ = inject_and_check(
@@ -624,11 +626,14 @@ def check_injection():
             ["inject", "-n", "16", "-s", "42", "--no-user", "--mem-cap", "64",
              "--no-tty", "--no-threads"], tmp, 16)
         time.sleep(0.4)
-        total = sum(sizes(p)["rss"] for p in pids)
         # The cap is at the 4 MiB-per-stub floor. A stub's own base RSS can
-        # exceed the floor; allow 128 KiB per stub for the base image.
-        if total > 64 * 1024 + 16 * 128:
-            fail(f"--mem-cap 64 reported {total} kB")
+        # exceed the floor; allow 128 KiB per stub for the base image. Under
+        # qemu-user the resident set is the emulator's, so the number is not
+        # about --mem-cap at all.
+        if not emulated():
+            total = sum(sizes(p)["rss"] for p in pids)
+            if total > 64 * 1024 + 16 * 128:
+                fail(f"--mem-cap 64 reported {total} kB")
         if "at least 64 MiB" not in p.stderr:
             fail("--mem-cap floor warning missing")
         stop_pidfile(pidfile)
@@ -1089,6 +1094,8 @@ def check_inject_flags():
              "--no-tty", "--no-threads", "--cpu", "40"], tmp, 3)
         try:
             for pid in pids:
+                if emulated():
+                    continue
                 util = cpu_percent(pid, 1.0)
                 if util is None:
                     fail(f"--cpu pid {pid} vanished")
@@ -1103,11 +1110,12 @@ def check_inject_flags():
         time.sleep(0.3)
         # --mem-target sets RSS. A row whose template VSZ leaves less room is
         # clamped below the target, never above it.
-        sizes_now = [sizes(p)["rss"] for p in pids]
-        if not any(abs(v - 65536) <= 8 for v in sizes_now):
-            fail(f"--mem-target 65536 produced {sizes_now}")
-        if any(v > 65536 + 16 for v in sizes_now):
-            fail(f"--mem-target 65536 exceeded the target: {sizes_now}")
+        if not emulated():
+            sizes_now = [sizes(p)["rss"] for p in pids]
+            if not any(abs(v - 65536) <= 8 for v in sizes_now):
+                fail(f"--mem-target 65536 produced {sizes_now}")
+            if any(v > 65536 + 16 for v in sizes_now):
+                fail(f"--mem-target 65536 exceeded the target: {sizes_now}")
         stop_pidfile(pidfile)
 
         pidfile, pids, _ = inject_and_check(
