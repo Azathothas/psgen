@@ -253,8 +253,19 @@ pub fn fd_fs_type(fd: i32) -> Option<i64> {
     Some(st.f_type as i64)
 }
 
+/// The filesystem type of a path, or None when statfs fails.
+pub fn path_fs_type(path: &[u8]) -> Option<i64> {
+    let p = cstr(path)?;
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(p.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    Some(st.f_type as i64)
+}
+
 /// `FUSE_SUPER_MAGIC`: a FUSE filesystem can report a forged owner and link
-/// count, so a config descriptor on one is never one this run created.
+/// count, so a config descriptor or staging path on one is never trusted by a
+/// root run.
 pub const FUSE_SUPER_MAGIC: i64 = 0x6573_5546;
 
 /// The owner uid of the object a descriptor refers to, or None when fstat

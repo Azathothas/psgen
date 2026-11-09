@@ -405,6 +405,9 @@ fn safe_copy(path: &[u8]) -> bool {
     }
     // Reject a symlink or a directory: a caller who can replace the leaf must
     // not turn the exec of a staging copy into the exec of another file.
+    if sys::geteuid() == 0 && sys::path_fs_type(path) == Some(sys::FUSE_SUPER_MAGIC) {
+        return false;
+    }
     match std::fs::symlink_metadata(Path::new(OsStr::from_bytes(path))) {
         Ok(m) if m.file_type().is_file() => {}
         _ => return false,
