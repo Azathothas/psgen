@@ -1656,20 +1656,29 @@ def check_regressions2(tmp):
     stop_pidfile(pf)
 
     # #4 (third case): a malformed starttime is skipped, not treated as a
-    # one-field line whose executable check can kill an unrelated process.
-    sp = subprocess.Popen(["sleep", "30"])
+    # one-field line whose executable check can kill a psgen stub.
+    pf = Path(tmp) / "malformed.pid"
+    run(["inject", "-n", "1", "-s", "7", "--no-exe", "--no-user", "--no-mem",
+         "--no-tty", "--no-threads", "--pidfile", str(pf)])
+    lines = pf.read_text().splitlines()
+    row = next(l for l in lines if l and not l.startswith("#"))
+    fields = row.split("\t")
+    pid = int(fields[0])
+    fields[1] = "notanumber"
+    lines = [("\t".join(fields) if l == row else l) for l in lines]
+    pf.write_text("\n".join(lines) + "\n")
     try:
-        pf = Path(tmp) / "malformed.pid"
-        pf.write_text(f"# psgen {VERSION} boot {boot_id()}\n"
-                      f"{sp.pid}\tnotanumber\tsleep\n")
         out = run(["stop", "--pidfile", str(pf)]).stdout
         if "skipped 1" not in out:
             fail(f"#4: a malformed starttime was not skipped: {out.strip()!r}")
-        if sp.poll() is not None:
-            fail("#4: a malformed starttime killed the named process")
+        if not Path(f"/proc/{pid}").exists():
+            fail("#4: a malformed starttime killed the named psgen stub")
     finally:
-        sp.kill()
-        sp.wait()
+        try:
+            os.kill(pid, 9)
+        except OSError:
+            pass
+        pf.unlink(missing_ok=True)
 
     # #24: a closed reader stops the generator, and --lines is bounded.
     proc = subprocess.Popen([str(BIN), "log", "-m", "weblog", "--lines", "100000",
