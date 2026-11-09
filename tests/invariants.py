@@ -400,10 +400,16 @@ def check_injection():
             raw = cmdline(pid)
             if not r:
                 fail(f"pid {pid} missing from ps aux")
-            if r["cmd"] != raw:
+            # A `/proc/PID/cmdline` read of a stub that exited in the window is
+            # empty, and `ps` shows the bracketed comm for a zombie. That is the
+            # same "already dead" case `alive()` exists for; the row was planned,
+            # it just is not observable any more.
+            if not alive(pid) and (not raw or r["cmd"].endswith(" <defunct>")):
+                continue
+            if r["cmd"].removesuffix(" <defunct>") != raw:
                 fail(f"pid {pid} ps cmd {r['cmd']!r} != cmdline {raw!r}")
             if raw not in wanted:
-                fail(f"pid {pid} cmdline not planned")
+                fail(f"pid {pid} cmdline {raw!r} not planned")
             if r["tty"] != "?":
                 fail(f"pid {pid} --no-tty still has {r['tty']}")
             if "l" in r["stat"]:
