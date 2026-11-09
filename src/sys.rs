@@ -243,6 +243,20 @@ fn seal_mask() -> i32 {
     libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL
 }
 
+/// The filesystem type of the object a descriptor refers to, or None when
+/// fstatfs fails.
+pub fn fd_fs_type(fd: i32) -> Option<i64> {
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatfs(fd, &mut st) } != 0 {
+        return None;
+    }
+    Some(st.f_type as i64)
+}
+
+/// `FUSE_SUPER_MAGIC`: a FUSE filesystem can report a forged owner and link
+/// count, so a config descriptor on one is never one this run created.
+pub const FUSE_SUPER_MAGIC: i64 = 0x6573_5546;
+
 /// The owner uid of the object a descriptor refers to, or None when fstat
 /// fails.
 pub fn fd_owner(fd: i32) -> Option<u32> {

@@ -403,6 +403,12 @@ fn safe_copy(path: &[u8]) -> bool {
     if path.is_empty() || crate::str::basename(path) != b"psgen-stub" {
         return false;
     }
+    // Reject a symlink or a directory: a caller who can replace the leaf must
+    // not turn the exec of a staging copy into the exec of another file.
+    match std::fs::symlink_metadata(Path::new(OsStr::from_bytes(path))) {
+        Ok(m) if m.file_type().is_file() => {}
+        _ => return false,
+    }
     match Path::new(OsStr::from_bytes(path)).parent() {
         Some(p) => crate::inject::safe_temp_dir(p.as_os_str().as_bytes()),
         None => false,
@@ -632,11 +638,27 @@ fn fork_children(cfg: &Config) {
     }
 }
 
+/// Whether a config descriptor has the shape this run creates: owned by the
+/// current euid, sealed or unlinked, and not on a FUSE filesystem where those
+/// fields can be forged.
+fn config_fd_ok(fd: i32) -> bool {
+    if sys::fd_fs_type(fd) == Some(sys::FUSE_SUPER_MAGIC) {
+        return false;
+    }
+    let sealed = sys::fd_sealed(fd);
+    let unlinked = sys::fd_nlink(fd) == Some(0);
+    let owned = sys::fd_owner(fd) == Some(sys::geteuid());
+    owned && (sealed || unlinked)
+}
+
 pub fn child_entry(fd: i32) -> ! {
     let child = match read_config(fd) {
         Some(c) => c,
         None => sys::exit(1),
     };
+    if child.nonce.is_empty() || child.nonce != env_nonce() || !config_fd_ok(fd) {
+        sys::exit(1);
+    }
     sys::prctl_set_name(&child.comm);
     close_unneeded_except(&child, fd);
     if !set_stage(fd, 1) {
@@ -877,9 +899,20 @@ fn write_disk(cfg: &Config) -> bool {
         return false;
     }
     use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
     let dir = PathBuf::from(OsStr::from_bytes(&cfg.temp));
     let path = dir.join("data.bin");
-    let mut f = match std::fs::File::create(&path) {
+    // `create` would follow a symlink a caller placed in the staging
+    // directory, and the truncate would land on the target. O_NOFOLLOW makes
+    // that an error instead.
+    let mut f = match std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o644)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+    {
         Ok(f) => f,
         Err(_) => return false,
     };
@@ -1043,8 +1076,9 @@ fn run(cfg: Config) -> ! {
 ///
 /// Three things are checked before the config is acted on:
 ///
-/// 1. A setuid install is refused outright. A forged config on fd 3 would
-///    otherwise be a way to run code as root.
+/// 1. A setuid or setgid install is refused outright. A forged config on fd 3
+///    would otherwise be a way to run code as root or with a privileged
+///    group.
 /// 2. The config must carry the nonce this process was started with, which
 ///    the injector passes on `PSGEN_NONCE`. An inherited fd 3 from a supervisor
 ///    or a permissive sudo rule does not know it, so the config is ignored and
@@ -1055,8 +1089,10 @@ fn run(cfg: Config) -> ! {
 ///    An fd opened by an unprivileged caller does not survive `sudo`, so a
 ///    descriptor inherited into a privileged psgen fails the ownership check.
 pub fn maybe_run() {
-    if sys::geteuid() == 0 && sys::getuid() != 0 {
-        sys::err(b"psgen: refusing to run setuid; install it without the setuid bit\n");
+    if (sys::geteuid() == 0 && sys::getuid() != 0) || (sys::getegid() == 0 && sys::getgid() != 0) {
+        sys::err(
+            b"psgen: refusing to run setuid or setgid; install it without the setuid/setgid bit\n",
+        );
         sys::exit(2);
     }
     let cfg = match read_config(3) {
@@ -1077,6 +1113,10 @@ pub fn maybe_run() {
     let sealed = sys::fd_sealed(3);
     let unlinked = sys::fd_nlink(3) == Some(0);
     let owned = sys::fd_owner(3) == Some(sys::geteuid());
+    if sys::fd_fs_type(3) == Some(sys::FUSE_SUPER_MAGIC) {
+        sys::err(b"psgen: refusing a config descriptor on a FUSE filesystem\n");
+        sys::exit(2);
+    }
     if !owned {
         sys::err(b"psgen: refusing a config descriptor this process does not own\n");
         sys::exit(2);
