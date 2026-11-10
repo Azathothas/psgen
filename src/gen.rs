@@ -28,6 +28,10 @@ pub struct Proc {
     /// reads and can cross a minute boundary, which is what made the live
     /// table disagree with `ps` by one minute.
     pub start_epoch: u64,
+    /// The CPU time to print in TIME, when the caller knows it exactly. The
+    /// live table reads it from `/proc/PID/stat`; a synthetic row derives it
+    /// from `age * %CPU`, which is a model, not a measurement.
+    pub time_secs: Option<u64>,
     pub pid: i32,
     pub tmpl: usize,
     pub parent: Option<usize>,
@@ -500,6 +504,7 @@ fn make_proc(
         flags: t.flags,
         age,
         start_epoch: now.saturating_sub(age),
+        time_secs: None,
         pid: 0,
         tmpl,
         parent: None,
@@ -1258,6 +1263,7 @@ mod tests {
             flags: 0,
             age: 0,
             start_epoch: 0,
+            time_secs: None,
             pid: 0,
             tmpl: 0,
             parent: None,

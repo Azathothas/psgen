@@ -262,6 +262,7 @@ pub fn read_pid(pid: i32, btime: u64, hz: u64, now: u64, mem_total: u64) -> Opti
         flags: 0,
         age,
         start_epoch,
+        time_secs: Some(ticks / hz.max(1)),
         pid,
         tmpl: 0,
         parent: None,

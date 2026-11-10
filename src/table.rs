@@ -207,7 +207,11 @@ pub fn render(rows: &[Proc], mem_total_kb: u64, offset_min: i64, local: bool, pa
         // space later, so COMMAND starts at the header offset whatever the
         // time is.
         pad_to(&mut out, row_start, TIME_COL - 2);
-        let time_secs = p.age.saturating_mul(p.cpu as u64) / 1000;
+        // The live table knows the real CPU time; a synthetic row models it
+        // from the age and the %CPU it claims.
+        let time_secs = p
+            .time_secs
+            .unwrap_or_else(|| p.age.saturating_mul(p.cpu as u64) / 1000);
         let time_start = out.v.len();
         out.push_time(time_secs);
         let time_len = out.v.len() - time_start;

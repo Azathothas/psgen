@@ -2384,6 +2384,12 @@ def check_live_matches_ps():
             fail(f"#3: live RSS for pid {pid} is {a['rss']}, ps says {b['rss']}")
         if abs(float(a["mem"]) - float(b["mem"])) > 0.5:
             fail(f"#3: live %MEM for pid {pid} is {a['mem']}, ps says {b['mem']}")
+        # TIME accumulates between the two reads, so allow a couple of seconds.
+        def secs(t):
+            p = [int(x) for x in t.split(":")]
+            return p[0] * 60 + p[1] if len(p) == 2 else p[0] * 3600 + p[1] * 60 + p[2]
+        if abs(secs(a["time"]) - secs(b["time"])) > 2:
+            fail(f"#3: live TIME for pid {pid} is {a['time']}, ps says {b['time']}")
 
 
 def check_option_matrix():
