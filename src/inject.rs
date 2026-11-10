@@ -846,10 +846,15 @@ fn prune_root(root: &Path) -> usize {
                 }
             }
             None => {
-                // No live marker: the directory may belong to another tool,
-                // or to a run that crashed before it could write the marker.
-                // Deleting it could destroy a live stub's disk data.
-                continue;
+                // No live marker. A stub writes one before it execs, so a
+                // directory with no marker has no stub using it. If the owner
+                // marker names a dead injector, the run died before any stub
+                // started and the directory is safe to remove. Without an
+                // owner marker it may belong to another tool, so it is left
+                // alone.
+                if read_owner_marker(&path).is_none() {
+                    continue;
+                }
             }
         }
         if std::fs::remove_dir_all(&path).is_ok() {
@@ -1326,9 +1331,15 @@ pub fn safe_temp_dir(t: &[u8]) -> bool {
     if !p.is_absolute() {
         return false;
     }
-    // A FUSE daemon can report any owner and file type. A root run must not
-    // write into or execute from a directory whose metadata it cannot trust.
-    if sys::geteuid() == 0 && sys::path_fs_type(t) == Some(sys::FUSE_SUPER_MAGIC) {
+    // A FUSE daemon or user-controlled overlay can report any owner and file
+    // type. A root run must not write into or execute from a directory whose
+    // metadata it cannot trust.
+    if sys::geteuid() == 0
+        && matches!(
+            sys::path_fs_type(t),
+            Some(sys::FUSE_SUPER_MAGIC) | Some(sys::OVERLAYFS_SUPER_MAGIC)
+        )
+    {
         return false;
     }
     let meta = match std::fs::symlink_metadata(p) {
@@ -1340,6 +1351,11 @@ pub fn safe_temp_dir(t: &[u8]) -> bool {
     }
     use std::os::unix::fs::MetadataExt;
     if meta.uid() != sys::geteuid() {
+        return false;
+    }
+    // A staging directory must not be group-writable or world-writable, or
+    // another user could swap a symlink or hardlink inside it.
+    if meta.mode() & 0o022 != 0 {
         return false;
     }
     let name = match p.file_name().and_then(|n| n.to_str()) {
@@ -1423,6 +1439,11 @@ fn corpus_command(cmdline: &[u8], exe: &[u8]) -> bool {
         let want = gen::template_exe(t);
         if exe.is_empty() || want.is_empty() || want == exe {
             return true;
+        }
+        if let Ok(canon) = std::fs::canonicalize(Path::new(std::ffi::OsStr::from_bytes(&want))) {
+            if canon.as_os_str().as_bytes() == exe {
+                return true;
+            }
         }
     }
     false
@@ -1740,22 +1761,39 @@ pub fn stop(path: &[u8], force: bool, plan: bool, quiet: bool) -> i32 {
             planned += 1;
             continue;
         }
+        let pfd = sys::pidfd_open(pid);
+        // Re-verify identity after opening the pidfd (or right before kill if
+        // pidfd_open is unavailable) so a PID recycled between the first
+        // `/proc` read and the signal is not hit.
+        let post = live::read_stat(pid);
+        if post.as_ref().map(|s| s.starttime) != cur_start
+            || post.as_ref().map(|s| s.state) == Some(b'Z')
+        {
+            if pfd >= 0 {
+                sys::close(pfd);
+            }
+            skipped += 1;
+            note(quiet, b"skip", pid, Some(b"already gone"));
+            continue;
+        }
         // A leader's PID is its PGID, so its group kill reaches children that
         // never wrote a status record. For a non-leader the group signal would
         // address a stale group, so signal the process itself.
-        let leader = info.as_ref().map(|s| s.pgrp == pid as i64).unwrap_or(false);
+        let leader = post.as_ref().map(|s| s.pgrp == pid as i64).unwrap_or(false);
         let mut delivered = false;
         if leader {
             if sys::kill(-pid, sys::SIGKILL) {
                 delivered = true;
             } else if sys::last_error().raw_os_error() != Some(libc::ESRCH) {
+                if pfd >= 0 {
+                    sys::close(pfd);
+                }
                 failed += 1;
                 note(quiet, b"cannot signal", pid, Some(b"process group"));
                 continue;
             }
         }
         if !delivered {
-            let pfd = sys::pidfd_open(pid);
             if pfd >= 0 {
                 // The pidfd pins the process, so the signal cannot land on a
                 // reused PID.
@@ -1766,11 +1804,13 @@ pub fn stop(path: &[u8], force: bool, plan: bool, quiet: bool) -> i32 {
                     note(quiet, b"skip", pid, Some(b"already gone"));
                     continue;
                 }
-                sys::close(pfd);
             }
             if !delivered {
                 delivered = sys::kill(pid, sys::SIGKILL);
             }
+        }
+        if pfd >= 0 {
+            sys::close(pfd);
         }
         if delivered {
             signalled.push((pid, cur_start.unwrap_or(0)));
@@ -1818,8 +1858,15 @@ pub fn stop(path: &[u8], force: bool, plan: bool, quiet: bool) -> i32 {
 
     if failed == 0 && !plan {
         for t in &temp_dirs {
-            if safe_temp_dir(t) {
-                let _ = std::fs::remove_dir_all(Path::new(std::ffi::OsStr::from_bytes(t)));
+            let p = Path::new(std::ffi::OsStr::from_bytes(t));
+            let busy = read_live_marker(p)
+                .map(|pids| {
+                    pids.iter()
+                        .any(|(pid, start)| live::same_process(*pid, *start))
+                })
+                .unwrap_or(false);
+            if !busy && safe_temp_dir(t) {
+                let _ = std::fs::remove_dir_all(p);
             }
         }
     }
