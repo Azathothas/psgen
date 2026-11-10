@@ -344,25 +344,37 @@ fn jitter(rng: &mut Rng, base: u32, pct: u64) -> u32 {
     v.max(1024) as u32
 }
 
-fn resolve_user(t: &Tmpl, opts: &Opts) -> (Vec<u8>, u32, u32) {
-    if t.user == corpus::SELF_USER {
-        let (uid, gid) = util::lookup_user(&opts.self_user).unwrap_or_else(|| {
-            let me = util::current_user();
-            (me.uid, me.gid)
+fn resolve_user_cached(
+    t: &Tmpl,
+    opts: &Opts,
+    cache: &mut BTreeMap<Vec<u8>, (u32, u32)>,
+) -> (Vec<u8>, u32, u32) {
+    let lookup = |name: &[u8], cache: &mut BTreeMap<Vec<u8>, (u32, u32)>| -> (u32, u32) {
+        if let Some(v) = cache.get(name) {
+            return *v;
+        }
+        let v = util::lookup_user(name).unwrap_or_else(|| {
+            if let Some(sv) = cache.get(&opts.self_user) {
+                *sv
+            } else {
+                let sv = util::lookup_user(&opts.self_user).unwrap_or_else(|| {
+                    let me = util::current_user();
+                    (me.uid, me.gid)
+                });
+                cache.insert(opts.self_user.clone(), sv);
+                sv
+            }
         });
+        cache.insert(name.to_vec(), v);
+        v
+    };
+    if t.user == corpus::SELF_USER {
+        let (uid, gid) = lookup(&opts.self_user, cache);
         return (opts.self_user.clone(), uid, gid);
     }
     let name = t.user.as_bytes().to_vec();
-    match util::lookup_user(&name) {
-        Some((uid, gid)) => (name, uid, gid),
-        None => {
-            let (uid, gid) = util::lookup_user(&opts.self_user).unwrap_or_else(|| {
-                let me = util::current_user();
-                (me.uid, me.gid)
-            });
-            (name, uid, gid)
-        }
-    }
+    let (uid, gid) = lookup(&name, cache);
+    (name, uid, gid)
 }
 
 fn boot_age(rng: &mut Rng, uptime: u64) -> u64 {
@@ -371,16 +383,21 @@ fn boot_age(rng: &mut Rng, uptime: u64) -> u64 {
     // move every later value in the stream and break the same-seed contract
     // between uptime 10 and uptime 11.
     let age = rng.fraction(90);
-    let base = uptime.saturating_sub(age);
-    if base == 0 {
-        30 + age * 570 / 90
-    } else {
-        base
-    }
+    // A row cannot have started before the host booted. `uptime.saturating_sub`
+    // used to fall through to a 30..600 s age when the draw was longer than
+    // the uptime, which invented a START before boot on a host up seconds.
+    age.min(uptime)
 }
 
-fn make_proc(t: &Tmpl, tmpl: usize, rng: &mut Rng, opts: &Opts, uptime: u64) -> Proc {
-    let (user, uid, gid) = resolve_user(t, opts);
+fn make_proc(
+    t: &Tmpl,
+    tmpl: usize,
+    rng: &mut Rng,
+    opts: &Opts,
+    uptime: u64,
+    cache: &mut BTreeMap<Vec<u8>, (u32, u32)>,
+) -> Proc {
+    let (user, uid, gid) = resolve_user_cached(t, opts, cache);
     let vsz = jitter(rng, t.vsz, 12);
     let mut rss = jitter(rng, t.rss, 18);
     if rss > vsz {
@@ -410,6 +427,10 @@ fn make_proc(t: &Tmpl, tmpl: usize, rng: &mut Rng, opts: &Opts, uptime: u64) -> 
     } else {
         rng.range(3600, 30 * 86400)
     };
+    // No row can have started before the host booted. The branch above only
+    // bounded `boot_age`; the dev, desk and default ages ignored the uptime
+    // entirely, so `--host-uptime 0` still showed rows from weeks earlier.
+    let age = age.min(uptime);
     let cmd = expand(t.cmd, rng, &opts.self_user, Some(uid));
     let tty = if t.flags & corpus::F_TTY != 0 {
         let mut found: Option<Vec<u8>> = None;
@@ -527,17 +548,17 @@ pub fn gen_list(rng: &mut Rng, opts: &Opts) -> Vec<Vec<u8>> {
     // in-scope corpus row, which the README and tests/invariants.py promise;
     // the rest are drawn by profile weight, so `-p` changes a short list too
     // instead of only the rows above the template count.
-    let mut fixed_used: Vec<usize> = Vec::new();
-    let mut drawn: Vec<usize> = Vec::new();
+    let mut fixed_used = vec![false; corpus::CORPUS.len()];
+    let mut drawn = vec![false; corpus::CORPUS.len()];
     for (idx, t) in corpus::CORPUS.iter().enumerate() {
         if opts.family.map(|f| f == t.fam).unwrap_or(true) {
-            drawn.push(idx);
+            drawn[idx] = true;
             push(
                 expand(t.cmd, rng, &opts.self_user, None),
                 &mut out,
                 &mut seen,
             );
-            fixed_used.push(idx);
+            fixed_used[idx] = true;
             break;
         }
     }
@@ -548,7 +569,7 @@ pub fn gen_list(rng: &mut Rng, opts: &Opts) -> Vec<Vec<u8>> {
                 continue;
             }
         }
-        if !drawn.contains(&idx) {
+        if !drawn[idx] {
             pool.push(idx);
         }
     }
@@ -562,24 +583,34 @@ pub fn gen_list(rng: &mut Rng, opts: &Opts) -> Vec<Vec<u8>> {
             &mut seen,
         );
         if !has_variants(t) {
-            fixed_used.push(idx);
+            fixed_used[idx] = true;
         }
     }
 
-    // Second pass: weighted draws to fill the remainder. Only templates that
-    // can produce a new command line (placeholders) are useful here; a fixed
-    // command cannot add a distinct line, so retrying it is wasted work.
+    // Second pass: weighted draws over templates that can still produce a new
+    // command line (those with variable placeholders, plus any fixed template
+    // not yet emitted).
+    let mut var_pool: Vec<usize> = Vec::new();
+    for (idx, t) in corpus::CORPUS.iter().enumerate() {
+        if let Some(f) = opts.family {
+            if t.fam != f {
+                continue;
+            }
+        }
+        if has_variants(t) || !fixed_used[idx] {
+            var_pool.push(idx);
+        }
+    }
     let mut guard = 0usize;
-    let limit = target.saturating_mul(40).saturating_add(1000);
-    while out.len() < target && guard < limit {
-        let idx = weighted_index(rng, &weights, opts.family);
+    let limit = target.saturating_mul(20).saturating_add(500);
+    while out.len() < target && guard < limit && !var_pool.is_empty() {
+        let pos = weighted_pick(&var_pool, rng, &weights);
+        let idx = var_pool[pos];
         let t = &corpus::CORPUS[idx];
         guard += 1;
         if !has_variants(t) {
-            if fixed_used.contains(&idx) {
-                continue;
-            }
-            fixed_used.push(idx);
+            fixed_used[idx] = true;
+            var_pool.swap_remove(pos);
             push(
                 expand(t.cmd, rng, &opts.self_user, None),
                 &mut out,
@@ -594,9 +625,6 @@ pub fn gen_list(rng: &mut Rng, opts: &Opts) -> Vec<Vec<u8>> {
         );
     }
 
-    // The profile pass skipped the corpus-order prefix once the target was
-    // reached; a target above the template count has already been filled by
-    // the weighted loop above.
     out
 }
 
@@ -729,13 +757,17 @@ pub fn gen_table(rng: &mut Rng, opts: &Opts, fit: &Fit) -> Vec<Proc> {
     let uptime = opts.uptime.unwrap_or_else(util::uptime_secs);
     let mut rows: Vec<Proc> = Vec::new();
     let mut used: Vec<usize> = Vec::new();
+    let mut user_cache: BTreeMap<Vec<u8>, (u32, u32)> = BTreeMap::new();
+    let mut emitted: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
     let want = if opts.count == 0 { 30 } else { opts.count };
 
     let sys_in_scope = opts.family.is_none() || opts.family == Some(corpus::FAM_SYS);
     if sys_in_scope {
         if let Some(init_idx) = corpus::CORPUS.iter().position(|t| t.cmd == "/sbin/init") {
             let init = &corpus::CORPUS[init_idx];
-            rows.push(make_proc(init, init_idx, rng, opts, uptime));
+            let p = make_proc(init, init_idx, rng, opts, uptime, &mut user_cache);
+            *emitted.entry(p.cmd.clone()).or_insert(0) += 1;
+            rows.push(p);
             used.push(init_idx);
         }
     }
@@ -756,8 +788,16 @@ pub fn gen_table(rng: &mut Rng, opts: &Opts, fit: &Fit) -> Vec<Proc> {
         if let Some(pidx) = parent_index(idx) {
             if pidx != idx && !used.contains(&pidx) && rows.len() < want {
                 let parent = &corpus::CORPUS[pidx];
-                rows.push(make_proc(parent, pidx, rng, opts, uptime));
-                used.push(pidx);
+                let pp = make_proc(parent, pidx, rng, opts, uptime, &mut user_cache);
+                if opts
+                    .repeat_max
+                    .map(|b| b == 0 || *emitted.get(&pp.cmd).unwrap_or(&0) < b)
+                    .unwrap_or(true)
+                {
+                    *emitted.entry(pp.cmd.clone()).or_insert(0) += 1;
+                    rows.push(pp);
+                    used.push(pidx);
+                }
             }
         }
         used.push(idx);
@@ -765,11 +805,26 @@ pub fn gen_table(rng: &mut Rng, opts: &Opts, fit: &Fit) -> Vec<Proc> {
         let instances = if t.inst == 0 { 1 } else { t.inst as usize };
         let take = instances.min(want - rows.len());
         for _ in 0..take {
-            rows.push(make_proc(t, idx, rng, opts, uptime));
+            let p = make_proc(t, idx, rng, opts, uptime, &mut user_cache);
+            if let Some(bound) = opts.repeat_max {
+                if bound != 0 && *emitted.get(&p.cmd).unwrap_or(&0) >= bound {
+                    continue;
+                }
+            }
+            *emitted.entry(p.cmd.clone()).or_insert(0) += 1;
+            rows.push(p);
         }
     }
-    fill(rng, opts, &weights, &mut rows, want, &mut counts, uptime);
-
+    fill(
+        rng,
+        opts,
+        &weights,
+        &mut rows,
+        want,
+        &mut counts,
+        uptime,
+        &mut user_cache,
+    );
     // PIDs last: the host's PID space decides how many rows can exist at all,
     // and one pass over the finished population honours it exactly.
     let mut pids = Pids::new(rng, fit);
@@ -809,6 +864,7 @@ pub fn gen_table(rng: &mut Rng, opts: &Opts, fit: &Fit) -> Vec<Proc> {
 /// A template whose row costs more than one (a worker needs its master) links to
 /// an existing master when the main pass produced one, and adds one only when it
 /// must.
+#[allow(clippy::too_many_arguments)]
 fn fill(
     rng: &mut Rng,
     opts: &Opts,
@@ -817,6 +873,7 @@ fn fill(
     want: usize,
     counts: &mut [usize],
     uptime: u64,
+    user_cache: &mut BTreeMap<Vec<u8>, (u32, u32)>,
 ) {
     if out.len() >= want {
         return;
@@ -900,14 +957,21 @@ fn fill(
             if parent_row.is_none() {
                 if let Some(pidx) = parent_index(*idx) {
                     if pidx != *idx && out.len() + 1 < want {
-                        let mut pp = make_proc(&corpus::CORPUS[pidx], pidx, rng, opts, uptime);
+                        let mut pp =
+                            make_proc(&corpus::CORPUS[pidx], pidx, rng, opts, uptime, user_cache);
                         pp.parent = None;
-                        out.push(pp);
-                        parent_row = Some(out.len() - 1);
+                        if command_bound
+                            .map(|b| b == 0 || *emitted.get(&pp.cmd).unwrap_or(&0) < b)
+                            .unwrap_or(true)
+                        {
+                            *emitted.entry(pp.cmd.clone()).or_insert(0) += 1;
+                            out.push(pp);
+                            parent_row = Some(out.len() - 1);
+                        }
                     }
                 }
             }
-            let mut p = make_proc(t, *idx, rng, opts, uptime);
+            let mut p = make_proc(t, *idx, rng, opts, uptime, user_cache);
             let seen = *emitted.get(&p.cmd).unwrap_or(&0);
             if let Some(bound) = command_bound {
                 if bound != 0 && seen >= bound {
@@ -930,6 +994,8 @@ pub fn gen_inject(rng: &mut Rng, opts: &Opts, fit: &Fit) -> Vec<Proc> {
     let want = if opts.count == 0 { 12 } else { opts.count };
     let mut rows: Vec<Proc> = Vec::new();
     let mut used: Vec<usize> = Vec::new();
+    let mut user_cache: BTreeMap<Vec<u8>, (u32, u32)> = BTreeMap::new();
+    let mut emitted: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
     let mut guard = 0usize;
     let limit = want.saturating_mul(40).saturating_add(1000);
     let mut counts = vec![0usize; corpus::CORPUS.len()];
@@ -939,9 +1005,6 @@ pub fn gen_inject(rng: &mut Rng, opts: &Opts, fit: &Fit) -> Vec<Proc> {
         if corpus::CORPUS[idx].cmd == "/sbin/init" {
             continue;
         }
-        // The first appearance of a template is always allowed; a second one
-        // needs a template that may repeat (`F_REPEAT`, or a placeholder that
-        // changes the command line) and room under its bound.
         if counts[idx] > 0
             && (!repeatable(&corpus::CORPUS[idx])
                 || counts[idx] >= repeat_cap(&corpus::CORPUS[idx], opts))
@@ -951,11 +1014,27 @@ pub fn gen_inject(rng: &mut Rng, opts: &Opts, fit: &Fit) -> Vec<Proc> {
         counts[idx] += 1;
         let parent_row = if let Some(pidx) = parent_index(idx) {
             if pidx != idx && !used.contains(&pidx) && rows.len() < want {
-                let mut pp = make_proc(&corpus::CORPUS[pidx], pidx, rng, opts, uptime);
+                let mut pp = make_proc(
+                    &corpus::CORPUS[pidx],
+                    pidx,
+                    rng,
+                    opts,
+                    uptime,
+                    &mut user_cache,
+                );
                 pp.parent = None;
-                rows.push(pp);
-                used.push(pidx);
-                Some(rows.len() - 1)
+                if opts
+                    .repeat_max
+                    .map(|b| b == 0 || *emitted.get(&pp.cmd).unwrap_or(&0) < b)
+                    .unwrap_or(true)
+                {
+                    *emitted.entry(pp.cmd.clone()).or_insert(0) += 1;
+                    rows.push(pp);
+                    used.push(pidx);
+                    Some(rows.len() - 1)
+                } else {
+                    rows.iter().position(|r| r.tmpl == pidx)
+                }
             } else {
                 rows.iter().position(|r| r.tmpl == pidx)
             }
@@ -967,12 +1046,27 @@ pub fn gen_inject(rng: &mut Rng, opts: &Opts, fit: &Fit) -> Vec<Proc> {
         let instances = if t.inst == 0 { 1 } else { t.inst as usize };
         let take = instances.min(want - rows.len());
         for _ in 0..take {
-            let mut p = make_proc(t, idx, rng, opts, uptime);
+            let mut p = make_proc(t, idx, rng, opts, uptime, &mut user_cache);
+            if let Some(bound) = opts.repeat_max {
+                if bound != 0 && *emitted.get(&p.cmd).unwrap_or(&0) >= bound {
+                    continue;
+                }
+            }
+            *emitted.entry(p.cmd.clone()).or_insert(0) += 1;
             p.parent = parent_row;
             rows.push(p);
         }
     }
-    fill(rng, opts, &weights, &mut rows, want, &mut counts, uptime);
+    fill(
+        rng,
+        opts,
+        &weights,
+        &mut rows,
+        want,
+        &mut counts,
+        uptime,
+        &mut user_cache,
+    );
     fit_rows(&mut rows, fit);
     rows
 }

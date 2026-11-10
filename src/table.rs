@@ -176,9 +176,14 @@ pub fn render(rows: &[Proc], mem_total_kb: u64, offset_min: i64, local: bool, pa
         out.push(b' ');
         out.push_tenths_width(p.cpu as u32, 4);
         out.push(b' ');
-        // One process cannot use more than the whole machine, and the field is
-        // four characters wide: 100.0 would shift every column after it.
-        let mem = (rss * 1000 + mem_total_kb / 2)
+        // procps computes `%MEM` as `rss * 1000 / MemTotal` in integer
+        // arithmetic, so it truncates rather than rounds: an RSS of 0.377%
+        // prints as 0.3, which is what `ps aux` shows and what `table --live`
+        // has to match. One process cannot use more than the whole machine,
+        // and the field is four characters wide, so the value is capped at
+        // 999 (99.9).
+        let mem = rss
+            .saturating_mul(1000)
             .checked_div(mem_total_kb)
             .unwrap_or(0)
             .min(999) as u32;

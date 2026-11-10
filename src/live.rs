@@ -131,28 +131,32 @@ fn read_cmdline(pid: i32) -> Vec<u8> {
     b.push_u64(pid as u64);
     path.extend_from_slice(b.as_bytes());
     path.extend_from_slice(b"/cmdline");
-    let mut buf = [0u8; 8192];
-    let n = match sys::read_file(&path, &mut buf) {
-        Some(n) => n,
+    // An argument can be tens of kilobytes (a compiler invocation, a JVM
+    // command line). A fixed 8 KiB buffer cut COMMAND short with no sign that
+    // it had; read up to a bound that covers a normal ARG_MAX.
+    let raw = match sys::read_file_nofollow(&path, 512 * 1024) {
+        Some(v) => v,
         None => return Vec::new(),
     };
-    let mut out = Vec::with_capacity(n);
-    for b in &buf[..n] {
+    let mut out = Vec::with_capacity(raw.len());
+    for b in &raw {
         match *b {
             // Every NUL is a separator, so an empty argv element shows up as an
             // extra space, which is exactly what `ps` prints for one.
             0 => out.push(b' '),
             // `ps` never writes a raw line break into COMMAND: it would split
-            // the row and lose every column after it. Any other control byte
-            // becomes `?`.
-            b'\n' | b'\r' | 0x0b | 0x0c => out.push(b' '),
+            // the row and lose every column after it. The other whitespace
+            // controls print as `?`, as procps does, and so does every other
+            // control byte.
+            b'\n' => out.push(b' '),
             0x01..=0x1f | 0x7f => out.push(b'?'),
             _ => out.push(*b),
         }
     }
-    // `/proc/PID/cmdline` ends with a NUL, so the joined form ends with a
-    // space that `ps` does not print.
-    while out.last() == Some(&b' ') {
+    // `/proc/PID/cmdline` ends with a NUL, so the joined form ends with one
+    // separator space that `ps` does not print. Exactly one is removed, so a
+    // final argv element that ends in a space keeps it, as `ps` shows.
+    if out.last() == Some(&b' ') {
         out.pop();
     }
     out
