@@ -75,6 +75,14 @@ psgen load --cpu-util 50 -d 10
 `inject` at 500. A count includes the synthetic PID 1 row when `sys` is in
 scope, and `table --live` defaults to every process on the host.
 
+`table --live` renders the same columns as `ps aux`. `%MEM` is `rss * 1000 /
+MemTotal` truncated to one decimal, which is what procps prints, not a rounded
+percentage. COMMAND is read up to 512 KiB of `/proc/PID/cmdline`; a final argv
+element that ends in a space keeps it, a newline becomes a space, and other
+control bytes (including `\r`, `\v` and `\f`) become `?`, matching `ps`. The
+live table rejects `--repeat-max` and `--host-mem`, `--host-pid-max` and
+`--host-uptime`: those describe a generated table, not this host.
+
 `-n` is a guarantee for `table` and `inject`: the count is met whenever any
 in-scope template can repeat. The rows after the distinct ones come from the
 templates a real host runs many of — login sessions, build jobs, per-connection
@@ -224,11 +232,14 @@ the caller, has a basename matching `.psgen-<digits>-<digits>-<digits>`, and
 every signal succeeded.
 
 A run that ends by `--duration` alone leaves its staging directories, because
-the injector is gone by then. The next `inject` reclaims them: a directory is
-removed only when it carries a live marker and none of the PIDs in that marker
-still exists. A directory without a live marker may belong to another tool or
-to a run that stopped before it could write one, so it is left alone. A live
-`--duration` run keeps its marker until its last stub exits.
+the injector is gone by then. The next `inject` reclaims them. A stub writes a
+live marker, a `pid starttime` line per root, before it execs, so a directory
+is kept while any process in that marker is still alive (a zombie does not
+count). A directory with no live marker is removed only when its owner marker
+names an injector that is already gone; with neither marker it may belong to
+another tool, so it is left alone. The owner marker also carries the
+injector's starttime, so a recycled PID cannot keep a dead run's directory
+alive.
 
 `--wait` requires a non-zero `--duration` (exit 2 otherwise, except with
 `--dry-run`). It blocks for the duration, then kills each root's process group
@@ -316,8 +327,23 @@ cage image from `tests/sand/Containerfile`.
   symlink cases rather than a mounted daemon.
 - The nonce is a run tag, not authentication: it binds a config descriptor to
   the environment the injector set, and a caller who controls both can match it.
-  What a descriptor cannot forge is its ownership and (for a root run) its
-  filesystem type.
+  It stays visible in `/proc/PID/environ` for the process lifetime, so a
+  process that can read that file can replay it. What a descriptor cannot forge
+  is its ownership and (for a root run) its filesystem type.
+- The config memfd carries the size seals (`F_SEAL_SHRINK`, `F_SEAL_GROW`,
+  `F_SEAL_SEAL`) but not `F_SEAL_WRITE`, so the injector can still write the
+  status record through the same mapping. A descriptor holder that can write
+  the mapping can change the config after it was validated.
+- The staging leaf is validated through its opened descriptor and then executed
+  by path. A caller who can replace that leaf between the two steps has a
+  time-of-check/time-of-use window. The injector keeps the directory mode at
+  `0700`, which bounds who can do that.
+- `child_fds` may not name the stub's own config descriptor or fd 3, and a
+  child stub must be at stage 0, so a self-referential config cannot recurse
+  through the same descriptor. A config that names other descriptors can still
+  fork more processes than the injector planned.
+- A failed privilege drop is reported as a deviation and the stub continues
+  under the uid it already has; it does not abort the run.
 - Release artifacts are static musl only; no GNU/glibc artifacts are published.
   A `cargo install` builds whatever target your host defaults to, which is
   normally glibc; use `cargo install psgen --target x86_64-unknown-linux-musl`

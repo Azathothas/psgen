@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+### Review round 5
+
+Independent review of the second-round branch. Each item was reproduced on the
+branch head before the change.
+
+- `%MEM` truncates to one decimal like procps; the old renderer rounded.
+- Every generated age is capped at the host uptime, not only the boot-relative
+  one, so `--host-uptime 0` no longer shows rows that started weeks before boot.
+- `table --live` keeps a final argv space and maps `\r`, `\v` and `\f` to
+  `?`, and reads 512 KiB of cmdline instead of 8 KiB.
+- `--repeat-max` is enforced per command line in the main table and inject
+  loops, so `--repeat-max 1` on `web` and `sys` emits no duplicate command.
+- `table --live` rejects `--repeat-max` and the `--host-*` flags, `list`
+  rejects `--repeat-max`, `unit` rejects `-q`, and `inject` rejects
+  `--utc-offset` and `--local` without `--table`, instead of ignoring them.
+- A bind-tier row with a symlinked template exe is named as unidentifiable
+  instead of being silently skipped by a one-field pidfile line.
+- The stub refuses any setuid or setgid install, treats overlayfs like FUSE
+  for the config descriptor and staging directory, checks a hardlinked leaf and
+  `data.bin` by descriptor before truncating. A crashed run's staging is
+  pruned once its stubs are gone.
+- `stop` rechecks starttime and state after `pidfd_open`, and keeps a staging
+  directory whose live marker still names a live process.
+- The release test job runs fmt, clippy, `cargo package` and the unit
+  assertions; every cross matrix entry runs smoke; publish dry-runs first; and
+  a tag with no CHANGELOG section fails the notes script.
+- New regressions in `tests/invariants.py` fail on the unreviewed head for the
+  START, `%MEM`, COMMAND, repeat, one-field and prune defects.
+  `tests/workflow.sh` checks the matrix, the test job and the dry-run order.
+
+Known residual limits are documented in README and SECURITY: the nonce is
+visible in `/proc/PID/environ` for the process lifetime, the config memfd is size-sealed but
+not write-sealed, the staging leaf is validated by descriptor and exec'd by
+path, a crafted `child_fds` can still fork more than planned, and a failed
+privilege drop does not abort the stub. The list and table path caches user
+lookups and the variable-template pool, but large tables are still slower than
+the base commit; there is no timing regression for that.
+
 ### Second review round
 
 - `-n` is a guarantee for `table` and `inject`: the count is met whenever any
