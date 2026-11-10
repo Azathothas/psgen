@@ -774,6 +774,20 @@ fn read_owner_marker(dir: &Path) -> Option<(i32, u64)> {
     Some((i32::try_from(pid).ok()?, start))
 }
 
+/// Whether a staging directory still has a live process recorded in it.
+///
+/// The live marker is written by the injector and by each stub before it
+/// execs, so it is the authoritative list of who is using the directory. A
+/// zombie does not count: it holds no files and runs no code.
+pub fn staging_busy(dir: &std::path::Path) -> bool {
+    read_live_marker(dir)
+        .map(|pids| {
+            pids.iter()
+                .any(|(pid, start)| live::same_process(*pid, *start))
+        })
+        .unwrap_or(false)
+}
+
 /// Remove the staging directories of runs whose injector and stubs are gone.
 ///
 /// A `--duration` run that nobody stops leaves its shadow copy and `--disk`
@@ -1859,13 +1873,7 @@ pub fn stop(path: &[u8], force: bool, plan: bool, quiet: bool) -> i32 {
     if failed == 0 && !plan {
         for t in &temp_dirs {
             let p = Path::new(std::ffi::OsStr::from_bytes(t));
-            let busy = read_live_marker(p)
-                .map(|pids| {
-                    pids.iter()
-                        .any(|(pid, start)| live::same_process(*pid, *start))
-                })
-                .unwrap_or(false);
-            if !busy && safe_temp_dir(t) {
+            if !staging_busy(p) && safe_temp_dir(t) {
                 let _ = std::fs::remove_dir_all(p);
             }
         }

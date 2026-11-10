@@ -2098,8 +2098,16 @@ pub fn run() -> i32 {
                     }
                     sys::nanosleep(0, 10_000_000);
                 }
+                // `result.pids` only holds the rows that reported. A stub that
+                // never reported (a `setsid` child, a row killed before its
+                // status record) is not in it, so "no pid is alive" is not the
+                // same as "nothing is using the directory". The live marker is
+                // the same test `stop` uses.
                 for t in &result.temps {
-                    let _ = std::fs::remove_dir_all(t);
+                    let busy = inject::staging_busy(t);
+                    if !busy {
+                        let _ = std::fs::remove_dir_all(t);
+                    }
                 }
             }
             if pidfile_failed {
