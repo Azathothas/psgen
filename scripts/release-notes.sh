@@ -50,12 +50,17 @@ case "$1" in
         printf '%s\n' "$([ "$pre" = no ] && echo yes || echo no)"
         ;;
     section)
-        section "## $full"
-        if ! nonempty "$(section "## $full")"; then
+        body=$(section "## $full")
+        if ! nonempty "$body"; then
             if [ "$pre" = yes ]; then
-                section "## Unreleased"
+                body=$(section "## Unreleased")
             fi
         fi
+        if ! nonempty "$body"; then
+            echo "release-notes.sh: no CHANGELOG section for $tag" >&2
+            exit 1
+        fi
+        printf '%s\n' "$body"
         ;;
     notes)
         out=${3:-}
@@ -74,6 +79,10 @@ case "$1" in
         fi
         if ! nonempty "$body"; then
             body=$(section "## Unreleased")
+        fi
+        if ! nonempty "$body"; then
+            echo "release-notes.sh: no CHANGELOG section for $tag" >&2
+            exit 1
         fi
         {
             cat "${NOTES_HEADER:-.github/release-notes.md}"
