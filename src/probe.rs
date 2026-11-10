@@ -407,8 +407,8 @@ fn pidfile_parent(path: &[u8]) -> &[u8] {
 }
 
 /// How many temporary-name shapes `write_pidfile` will try. The first is the
-/// most collision-resistant; the later ones are shorter, so a pidfile whose
-/// basename is close to `NAME_MAX` still has somewhere to go.
+/// most collision-resistant; the later ones are strictly shorter, so a
+/// pidfile whose basename is close to `NAME_MAX` still has somewhere to go.
 pub fn pidfile_temp_levels() -> usize {
     4
 }
@@ -422,20 +422,14 @@ pub fn pidfile_temp_name(path: &[u8], level: usize, nonce: u64) -> Vec<u8> {
     cand.push(b'.');
     match level {
         0 => cand.extend_from_slice(format!("tmp.{}.{:016x}", sys::getpid(), nonce).as_bytes()),
-        1 => cand.extend_from_slice(format!("tmp.{}", sys::getpid()).as_bytes()),
-        2 => cand
+        1 => cand
             .extend_from_slice(format!("t{}{:06x}", sys::getpid(), nonce & 0xff_ffff).as_bytes()),
+        2 => cand.extend_from_slice(format!("tmp.{}", sys::getpid()).as_bytes()),
         _ => cand.extend_from_slice(format!("t{}", sys::getpid()).as_bytes()),
     }
     cand
 }
 
-/// Whether a pidfile may replace the object at `path`.
-///
-/// `write_pidfile` renames a temporary file over the target, so a device, a
-/// FIFO, a socket or a symlink would be replaced by a regular file. An absent
-/// path and an empty regular file are fine; a non-empty regular file must
-/// already start with the psgen header.
 /// Why a pidfile path cannot be used, when it cannot.
 pub enum TargetProblem {
     /// The path could not be examined at all: `ENAMETOOLONG` for a component
@@ -469,9 +463,10 @@ pub fn pidfile_target(path: &[u8]) -> Result<(), TargetProblem> {
     if meta.len() == 0 {
         return Ok(());
     }
+    let prefix = crate::version::PIDFILE_PREFIX;
     let mut buf = [0u8; 16];
     match sys::read_file(path, &mut buf) {
-        Some(n) if n >= 8 && &buf[..8] == b"# psgen " => Ok(()),
+        Some(n) if n >= prefix.len() && &buf[..prefix.len()] == prefix => Ok(()),
         _ => Err(TargetProblem::Foreign),
     }
 }
@@ -576,18 +571,23 @@ mod tests {
 
     #[test]
     fn pidfile_temp_name_grows_shorter_by_level() {
-        let base = b"/tmp/p.pid";
-        let long = pidfile_temp_name(base, 0, 0x1234);
-        let short = pidfile_temp_name(base, pidfile_temp_levels() - 1, 0x1234);
-        assert!(long.len() > short.len());
-        assert!(long.starts_with(base));
-        assert!(short.starts_with(base));
-        // Every level has to be a different name, or the retry loop spins.
-        let mut seen = Vec::new();
+        let path = b"/tmp/psgen.pid";
+        let mut prev = usize::MAX;
         for level in 0..pidfile_temp_levels() {
-            let n = pidfile_temp_name(base, level, 0xabcd);
-            assert!(!seen.contains(&n), "level {} repeats a name", level);
-            seen.push(n);
+            let n = pidfile_temp_name(path, level, 0x1234_5678_9abc_def0);
+            assert!(
+                n.len() < prev,
+                "level {} ({}) is not shorter than the previous ({})",
+                level,
+                n.len(),
+                prev
+            );
+            prev = n.len();
         }
+        assert_ne!(
+            pidfile_temp_name(path, 0, 1),
+            pidfile_temp_name(path, 0, 2),
+            "different nonces must yield different names"
+        );
     }
 }

@@ -15,7 +15,6 @@ pub const O_CREAT: i32 = libc::O_CREAT;
 pub const O_EXCL: i32 = libc::O_EXCL;
 pub const O_NOCTTY: i32 = libc::O_NOCTTY;
 pub const O_NOFOLLOW: i32 = libc::O_NOFOLLOW;
-pub const O_TRUNC: i32 = libc::O_TRUNC;
 pub const O_CLOEXEC: i32 = libc::O_CLOEXEC;
 
 pub const W_OK: i32 = libc::W_OK;
@@ -139,10 +138,10 @@ pub fn read_link(path: &[u8]) -> Option<Vec<u8>> {
 
 /// Whether the `bpf` syscall is reachable at all.
 ///
-/// Calls command 1 (`BPF_MAP_LOOKUP_ELEM`) with a null attribute. The probe
-/// treats any result other than `EPERM` as reachable; `EPERM` means a seccomp
-/// filter or the kernel policy blocks the syscall. Nothing is looked up either
-/// way.
+/// Calls command 1 (`BPF_MAP_LOOKUP_ELEM`) with a null attribute. A null or
+/// zero-sized attribute is refused with `EFAULT` or `EINVAL` after the kernel
+/// has entered the syscall, which means the operation is reachable. `EPERM`,
+/// `EACCES` and `ENOSYS` mean a policy or the kernel blocks it before that.
 pub fn bpf_allowed() -> bool {
     let r = unsafe {
         libc::syscall(
@@ -152,7 +151,13 @@ pub fn bpf_allowed() -> bool {
             0 as libc::c_int,
         )
     };
-    r != -1 || last_error().raw_os_error() != Some(libc::EPERM)
+    if r != -1 {
+        return true;
+    }
+    !matches!(
+        last_error().raw_os_error(),
+        Some(libc::EPERM) | Some(libc::EACCES) | Some(libc::ENOSYS)
+    )
 }
 
 /// Whether `SECCOMP_SET_MODE_FILTER` with `SECCOMP_FILTER_FLAG_NEW_LISTENER`
@@ -486,12 +491,8 @@ pub fn setpgid(pid: i32, pgid: i32) -> bool {
     unsafe { libc::setpgid(pid, pgid) == 0 }
 }
 
-pub fn chdir(path: &[u8]) -> bool {
-    let p = match cstr(path) {
-        Some(p) => p,
-        None => return false,
-    };
-    unsafe { libc::chdir(p.as_ptr()) == 0 }
+pub fn fchown(fd: i32, uid: u32, gid: u32) -> bool {
+    unsafe { libc::fchown(fd, uid as libc::uid_t, gid as libc::gid_t) == 0 }
 }
 
 pub fn prctl_set_name(name: &[u8]) -> bool {
@@ -753,14 +754,6 @@ pub fn getcwd(buf: &mut [u8]) -> Option<usize> {
     } else {
         Some(n)
     }
-}
-
-pub fn chown(path: &[u8], uid: u32, gid: u32) -> bool {
-    let p = match cstr(path) {
-        Some(p) => p,
-        None => return false,
-    };
-    unsafe { libc::chown(p.as_ptr(), uid as libc::uid_t, gid as libc::gid_t) == 0 }
 }
 
 /// Free and total bytes on the filesystem holding `path`.
