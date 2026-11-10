@@ -361,6 +361,7 @@ LOAD
       --disk-util MiB write and hold MiB of temp data
   -d, --duration S    stop after S seconds (0 = until killed)
       --force         allow --mem-util above what is available
+  -q, --quiet         suppress the load summary
 
 STOP
       --force           ignore the boot id; a three-field line still checks
@@ -583,7 +584,6 @@ fn applies(sub: Sub, name: &str) -> bool {
                 | "--profile"
                 | "-f"
                 | "--family"
-                | "--repeat-max"
                 | "--sort"
                 | "--no-sort"
                 | "--uniq"
@@ -653,8 +653,6 @@ fn applies(sub: Sub, name: &str) -> bool {
                 | "--busy"
                 | "--cpu"
                 | "--verify"
-                | "-q"
-                | "--quiet"
         ),
         Doctor => matches!(name, "--json" | "--pidfile"),
         Log => matches!(
@@ -1052,9 +1050,27 @@ pub fn parse(args: &[Vec<u8>]) -> Result<Args, ParseError> {
     }
     // The live table is read from /proc, so the synthetic-table options have
     // nothing to filter or seed.
+    // `inject --table` renders the real table after spawning, so the timezone
+    // options mean something there. Without `--table` nothing reads them.
+    if a.sub == Sub::Inject && !a.table {
+        for name in &a.seen {
+            if matches!(*name, "--utc-offset" | "--local") {
+                return Err(format!("{} does not apply to inject without --table", name).into());
+            }
+        }
+    }
     if a.live && a.sub == Sub::Table {
         for name in &a.seen {
-            if matches!(*name, "--family" | "--profile" | "--seed") {
+            if matches!(
+                *name,
+                "--family"
+                    | "--profile"
+                    | "--seed"
+                    | "--repeat-max"
+                    | "--host-mem"
+                    | "--host-pid-max"
+                    | "--host-uptime"
+            ) {
                 return Err(format!("{} does not apply to table --live", name).into());
             }
         }
@@ -1751,7 +1767,7 @@ pub fn run() -> i32 {
             );
             let out = table::render(
                 &rows,
-                table::mem_budget_kb(),
+                fit.mem_kb,
                 start_offset(&args),
                 args.local,
                 sys::page_kb(),
