@@ -2,7 +2,6 @@
 
 use crate::gen::Proc;
 use crate::str::Buf;
-use crate::sys;
 
 fn month(day_index: u64) -> (&'static str, u64, u64) {
     // Howard Hinnant's civil_from_days.
@@ -27,10 +26,11 @@ fn push_two(out: &mut Buf, n: u64) {
     out.push(b'0' + (n % 10) as u8);
 }
 
-fn start_field(out: &mut Buf, age: u64, offset_min: i64, local: bool) {
-    let now = (sys::now_secs() as i64).saturating_add(offset_min.saturating_mul(60));
-    let start = now.saturating_sub(age as i64);
-    let delta = now.saturating_sub(start);
+fn start_field(out: &mut Buf, p: &Proc, offset_min: i64, local: bool) {
+    // The absolute start time, not `now - age`: a second `now` drifts by the
+    // time between the read and the render, which can cross a minute.
+    let start = (p.start_epoch as i64).saturating_add(offset_min.saturating_mul(60));
+    let delta = p.age;
     if local {
         let mut tm: libc::tm = unsafe { std::mem::zeroed() };
         // The parameter type of localtime_r fixes time_t without naming the
@@ -202,7 +202,7 @@ pub fn render(rows: &[Proc], mem_total_kb: u64, offset_min: i64, local: bool, pa
         pad_to(&mut out, row_start, STAT_COL);
         stat_field(&mut out, p);
         pad_to(&mut out, row_start, START_COL);
-        start_field(&mut out, p.age, offset_min, local);
+        start_field(&mut out, p, offset_min, local);
         // TIME is right-aligned in its six columns and COMMAND follows one
         // space later, so COMMAND starts at the header offset whatever the
         // time is.

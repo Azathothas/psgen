@@ -261,6 +261,7 @@ pub fn read_pid(pid: i32, btime: u64, hz: u64, now: u64, mem_total: u64) -> Opti
         cpu,
         flags: 0,
         age,
+        start_epoch,
         pid,
         tmpl: 0,
         parent: None,

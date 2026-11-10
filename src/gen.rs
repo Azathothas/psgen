@@ -22,6 +22,12 @@ pub struct Proc {
     pub cpu: u16,
     pub flags: u8,
     pub age: u64,
+    /// The absolute start time, in seconds since the epoch. `age` is derived
+    /// from it, but the START column must use this value: recomputing
+    /// `now - age` with a second `now` drifts by the time between the two
+    /// reads and can cross a minute boundary, which is what made the live
+    /// table disagree with `ps` by one minute.
+    pub start_epoch: u64,
     pub pid: i32,
     pub tmpl: usize,
     pub parent: Option<usize>,
@@ -481,6 +487,7 @@ fn make_proc(
         Vec::new()
     };
     let age = if uptime == 0 { age } else { age.min(uptime) };
+    let now = sys::now_secs();
     Proc {
         cmd,
         tty,
@@ -492,6 +499,7 @@ fn make_proc(
         cpu: cpu as u16,
         flags: t.flags,
         age,
+        start_epoch: now.saturating_sub(age),
         pid: 0,
         tmpl,
         parent: None,
@@ -1249,6 +1257,7 @@ mod tests {
             cpu: 0,
             flags: 0,
             age: 0,
+            start_epoch: 0,
             pid: 0,
             tmpl: 0,
             parent: None,

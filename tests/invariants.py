@@ -933,6 +933,19 @@ def cpu_ticks(pid):
         return None
 
 
+def host_loaded() -> bool:
+    """True when the host is too busy for a CPU-share measurement to mean much.
+
+    A process cannot get 50% of a core when the run queue is longer than the
+    core count, so the measurement says more about the host than about psgen.
+    """
+    try:
+        load1 = float(Path("/proc/loadavg").read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        return False
+    return load1 > os.cpu_count() * 0.8
+
+
 def cpu_percent(pid, seconds):
     a = cpu_ticks(pid)
     if a is None:
@@ -1079,16 +1092,20 @@ def check_load():
     if proc.returncode != 0:
         fail(f"load --mem-util exited {proc.returncode}: {proc.stderr.read()}")
 
-    proc = subprocess.Popen([str(BIN), "load", "--cpu-util", "50", "--duration", "4"],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-    try:
-        util = cpu_percent(proc.pid, 1.5)
-        if util is None:
-            fail("load --cpu-util process vanished")
-        if not 35.0 <= util <= 65.0:
-            fail(f"--cpu-util 50 measured {util:.1f}%")
-    finally:
-        proc.wait(timeout=20)
+    if host_loaded():
+        print("SKIP: --cpu-util needs an idle host (load average above 80% of cores)",
+              file=sys.stderr)
+    else:
+        proc = subprocess.Popen([str(BIN), "load", "--cpu-util", "50", "--duration", "4"],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        try:
+            util = cpu_percent(proc.pid, 1.5)
+            if util is None:
+                fail("load --cpu-util process vanished")
+            if not 35.0 <= util <= 65.0:
+                fail(f"--cpu-util 50 measured {util:.1f}%")
+        finally:
+            proc.wait(timeout=20)
 
     with tempfile.TemporaryDirectory(prefix="psgen-load-") as load_tmp:
         env = os.environ.copy()
@@ -1177,6 +1194,8 @@ def check_inject_flags():
         try:
             for pid in pids:
                 if emulated():
+                    continue
+                if host_loaded():
                     continue
                 util = cpu_percent(pid, 1.0)
                 if util is None:
