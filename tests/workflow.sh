@@ -105,6 +105,60 @@ if sh -eu -c '
     exit 1
 '; then :; else fail "the publish guard tried to publish a prerelease"; fi
 
+echo "== a tag with no changelog section fails"
+# `notes` falls back to `## Unreleased`; with neither section present it must
+# fail instead of writing notes that describe nothing.
+printf '# Changelog\n\n## 1.0.0\nold\n' > "$TMP/CHANGELOG.md"
+if CHANGELOG=$TMP/CHANGELOG.md sh "$notes" section v9.9.9 \
+        >"$TMP/sec.out" 2>"$TMP/sec.err"; then
+    fail "section v9.9.9 succeeded with no matching section"
+fi
+grep -q 'no CHANGELOG section for v9.9.9' "$TMP/sec.err" ||
+    fail "the missing-section error does not name the tag"
+if CHANGELOG=$TMP/CHANGELOG.md sh "$notes" notes v9.9.9 "$TMP/none.md" \
+        2>"$TMP/notes.err"; then
+    fail "notes v9.9.9 fell back to a section that does not exist"
+fi
+grep -q 'no CHANGELOG section for v9.9.9' "$TMP/notes.err" ||
+    fail "notes did not name the missing section"
+if [ -s "$TMP/none.md" ]; then
+    fail "notes wrote a file without a section"
+fi
+
+echo "== release matrix and job gates"
+python3 - <<'PY'
+import pathlib, re, sys
+text = pathlib.Path(".github/workflows/release.yml").read_text()
+entries = re.findall(r"(?m)^\s*-\s+runner:.*$", text)
+smokes = re.findall(r"(?m)^\s+smoke:\s*true\s*$", text)
+if not entries:
+    sys.exit("release.yml has no matrix entries")
+if len(smokes) != len(entries):
+    sys.exit(f"{len(entries)} matrix entries but {len(smokes)} set smoke: true")
+print(f"   {len(entries)} matrix entries run smoke")
+
+job = re.search(r"(?ms)^  test:\n(.*?)(?=^  [A-Za-z0-9_-]+:)", text)
+if not job:
+    sys.exit("release.yml has no test job")
+body = job.group(1)
+for needle in ("cargo fmt", "cargo clippy", "cargo package", "RuntimeDirectory=psgen"):
+    if needle not in body:
+        sys.exit(f"the release test job does not run {needle!r}")
+print("   the release test job runs fmt, clippy, package and the unit assert")
+
+pub = re.search(r"(?ms)^  release:\n(.*?)(?=^  [A-Za-z0-9_-]+:|\Z)", text)
+if not pub:
+    sys.exit("release.yml has no release job")
+pb = pub.group(1)
+dry = re.search(r"cargo publish --locked --dry-run", pb)
+real = re.search(r"cargo publish --locked(?! --dry-run)", pb)
+if not dry or not real:
+    sys.exit("the publish job lacks a dry run or the real publish")
+if dry.start() > real.start():
+    sys.exit("the publish job publishes before the dry run")
+print("   the publish job dry-runs before publishing")
+PY
+
 echo "== every run: block is shell that parses"
 python3 - "$TMP" <<'PY'
 import re, subprocess, sys, pathlib

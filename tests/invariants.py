@@ -132,6 +132,22 @@ def read_pids(path, root=False):
     return pids
 
 
+def sealed_cfg(blob: bytes):
+    """A memfd config with the seals the stub requires, or None."""
+    import ctypes
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    fd = libc.memfd_create(b"psgen-test", 3)  # CLOEXEC | ALLOW_SEALING
+    if fd < 0:
+        return None
+    os.write(fd, blob)
+    os.lseek(fd, 0, 0)
+    # F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL
+    if libc.fcntl(fd, 1033, 1 | 2 | 8) != 0:  # F_ADD_SEALS
+        os.close(fd)
+        return None
+    return fd
+
+
 def exe_known() -> bool:
     """False when /proc/PID/exe would describe the emulator, not psgen."""
     return not emulated()
@@ -832,6 +848,46 @@ def check_root():
             fail(f"--elevate failure path exited {p.returncode}, wanted 2")
         stop_pidfile(pidfile, root=True)
 
+        # #25: a setgid binary must be refused before any config is read. The
+        # old check only refused euid!=uid, so a setgid copy ran with the
+        # file's group and would act on a config that group could read.
+        group = "daemon"
+        got = subprocess.run(["getent", "group", group],
+                             stdout=subprocess.DEVNULL)
+        if got.returncode != 0:
+            group = "disk"
+        got = subprocess.run(["getent", "group", group],
+                             stdout=subprocess.DEVNULL)
+        if got.returncode != 0:
+            print("SKIP: #25 no non-root group to make a setgid copy",
+                  file=sys.stderr)
+        else:
+            setgid = Path(tmp) / "psgen-setgid"
+            plain = Path(tmp) / "psgen-plain"
+            for dst in (setgid, plain):
+                r = subprocess.run(["sudo", "-n", "cp", str(BIN), str(dst)],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                if r.returncode != 0:
+                    fail(f"#25: cannot stage a copy: {r.stderr.decode().strip()}")
+            subprocess.run(["sudo", "-n", "chown", f"root:{group}", str(setgid)],
+                           check=True)
+            subprocess.run(["sudo", "-n", "chmod", "2755", str(setgid)],
+                           check=True)
+            env = dict(os.environ)
+            env.pop("PSGEN_NONCE", None)
+            q = subprocess.run([str(setgid), "list", "-n", "1"],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, env=env, timeout=30)
+            if q.returncode != 2 or "setuid or setgid" not in q.stderr:
+                fail(f"#25: a setgid copy ran: rc={q.returncode} "
+                     f"stderr={q.stderr.strip()!r}")
+            # The control: the same copy without the bit is accepted.
+            q = subprocess.run([str(plain), "list", "-n", "1"],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, env=env, timeout=30)
+            if q.returncode != 0 or len(q.stdout.splitlines()) != 1:
+                fail(f"#25: the control copy failed: rc={q.returncode}")
+
 
 def check_counts():
     n = len([l for l in run(["list", "-n", "2001", "-s", "1"]).stdout.splitlines() if l])
@@ -1249,27 +1305,45 @@ def check_regressions():
         if "stopped 40 processes" not in out:
             fail(f"F-31/F-35: stop reported {out.strip()!r} for 40 rows")
 
-        # F-13: seccomp filter with a null program is reachable, so DENY here
-        # would be wrong. Only assert the probe returns a known verdict.
+        # F-13: the probe must agree with the syscall it describes. A null
+        # filter program is refused with EFAULT after the kernel has entered
+        # the syscall, which means reachable; EPERM, EACCES and ENOSYS mean a
+        # policy or the kernel blocks it. Accepting either label let the old
+        # inverted verdict pass.
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        ctypes.set_errno(0)
+        r = libc.syscall(317, 1, 8, None)
+        err = ctypes.get_errno()
+        if r != -1:
+            want = "reachable"
+        elif err in (1, 13, 38):  # EPERM, EACCES, ENOSYS
+            want = "blocked"
+        else:
+            want = "reachable"
         j = run(["doctor", "--json"])
         doc = json.loads(j.stdout)
         val = doc.get("probe", {}).get("seccomp_user_notif")
-        if val not in ("reachable", "blocked"):
-            fail(f"F-13: seccomp probe returned {val!r}")
+        if val != want:
+            fail(f"F-13: seccomp probe said {val!r}, the syscall says {want!r} (errno {err})")
 
         # F-12: cargo on PATH must not be reported missing.
         out = run(["check", "--binaries"]).stdout
         if "missing: cargo  <-" in out:
             fail("F-12: check --binaries reported cargo missing")
 
-        # F-23: %MEM is rounded, not truncated.
+        # F-23: %MEM follows procps. Measured against procps-ng 4.0.4,
+        # `ps` prints `rss * 1000 / MemTotal` truncated: an RSS of 1.453%
+        # prints as 1.4, and 0.377% prints as 0.3. `table --live` has to
+        # agree with the `ps` beside it, so the synthetic table uses the
+        # same arithmetic.
         mem = mem_total()
         for line in run(["table", "-n", "40", "-s", "1"]).stdout.splitlines()[1:]:
             m = PS_RE.match(line)
             if not m:
                 continue
             rss = int(m.group("rss"))
-            want = round(rss * 100.0 / mem, 1)
+            want = (rss * 1000 // mem) / 10.0
             got = float(m.group("mem"))
             if abs(got - want) > 0.051:
                 fail(f"F-23: %MEM {got} for RSS {rss} kB, want {want}")
@@ -1991,8 +2065,8 @@ def check_residuals(tmp):
     else:
         staging = Path(tmp) / "hardlink"
         staging.mkdir()
-        run(["inject", "-n", "1", "-s", "5", "--no-user", "--no-mem", "--no-tty",
-             "--no-threads", "--shadow-dir", str(staging),
+        run(["inject", "-n", "1", "-s", "5", "--no-root", "--no-user",
+             "--no-mem", "--no-tty", "--no-threads", "--shadow-dir", str(staging),
              "--pidfile", str(Path(tmp) / "hl.pid")], check=False)
         dirs = list(staging.glob(".psgen-*"))
         if not dirs:
@@ -2039,14 +2113,16 @@ def check_residuals(tmp):
                 w(92, len(self_copy))
                 w(96, len(nonce))
                 blob = bytes(hdr) + comm + self_copy + cmd + b"u" + temp + self_copy + nonce
-                cfg.write_bytes(blob)
+                # A named file is refused before the leaf is reached: nlink
+                # is 1 and it carries no seals. A sealed memfd is the only
+                # shape the stub accepts, and it is what reaches the check.
+                fd = sealed_cfg(blob)
                 env = dict(os.environ, PSGEN_NONCE=nonce.decode())
-                with open(cfg, "rb") as f:
-                    proc = subprocess.Popen(
-                        [str(BIN)], env=env, stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        preexec_fn=lambda: os.dup2(f.fileno(), 3),
-                        pass_fds=(f.fileno(),))
+                proc = None if fd is None else subprocess.Popen(
+                    [str(BIN)], env=env, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    preexec_fn=lambda: os.dup2(fd, 3),
+                    pass_fds=(fd,))
                 time.sleep(1.0)
                 try:
                     exe = os.readlink(f"/proc/{proc.pid}/exe")
@@ -2067,8 +2143,9 @@ def check_residuals(tmp):
         outer = Path(tmp) / "victim-file"
         outer.write_bytes(b"keep me\n")
         pf = Path(tmp) / "disk.pid"
-        run(["inject", "-n", "1", "-s", "5", "--disk", "1", "--no-user",
-             "--no-mem", "--no-tty", "--no-threads", "--shadow-dir", str(staging),
+        run(["inject", "-n", "1", "-s", "5", "--disk", "1", "--no-root",
+             "--no-user", "--no-mem", "--no-tty", "--no-threads",
+             "--shadow-dir", str(staging),
              "--pidfile", str(pf)], check=False)
         dirs = list(staging.glob(".psgen-*"))
         for d in dirs:
@@ -2107,17 +2184,18 @@ def check_residuals(tmp):
             w2(92, 0)
             w2(96, len(nonce))
             blob = bytes(hdr) + comm + cmd + b"u" + temp + nonce
-            cfg.write_bytes(blob)
+            fd = sealed_cfg(blob)
             env = dict(os.environ, PSGEN_NONCE=nonce.decode())
-            with open(cfg, "rb") as f:
-                proc = subprocess.Popen(
-                    [str(BIN)], env=env, stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    preexec_fn=lambda: os.dup2(f.fileno(), 3),
-                    pass_fds=(f.fileno(),))
+            proc = None if fd is None else subprocess.Popen(
+                [str(BIN)], env=env, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                preexec_fn=lambda: os.dup2(fd, 3),
+                pass_fds=(fd,))
             time.sleep(1.2)
-            proc.kill()
-            proc.wait()
+            if proc is not None:
+                proc.kill()
+                proc.wait()
+                os.close(fd)
             if outer.read_bytes() != b"keep me\n":
                 fail("#25: a hardlinked data.bin was truncated")
             data.unlink()
@@ -2191,6 +2269,210 @@ def check_residuals(tmp):
     shutil.rmtree(foreign, ignore_errors=True)
 
 
+def check_review_fixes(tmp):
+    """Regressions for the defects the round-5 review found still open.
+
+    Each one is written to fail on the pre-review head. Where the old
+    behaviour cannot be observed from a black-box run (a timing or a
+    rendering difference), the comment says what the old code did.
+    """
+
+    # #2: no row may have started before the host booted. Old head printed
+    # Oct16 with --host-uptime 0 because only the long-running branch was
+    # bounded; the dev, desk and default ages ignored the uptime.
+    now = time.localtime()
+    now_min = now.tm_hour * 60 + now.tm_min
+    for uptime in (0, 60):
+        text = run(["table", "-n", "60", "-s", "42", "--local",
+                    "--host-uptime", str(uptime)]).stdout
+        for line in text.splitlines()[1:]:
+            m = PS_RE.match(line)
+            if not m:
+                continue
+            start = m.group("start")
+            if not re.fullmatch(r"\d\d:\d\d", start):
+                fail(f"#2: START {start!r} predates boot with "
+                     f"--host-uptime {uptime}")
+            v = int(start[:2]) * 60 + int(start[3:])
+            d = (now_min - v) % 1440
+            if d > 2:
+                fail(f"#2: START {start} is {d} minutes before now with "
+                     f"--host-uptime {uptime}")
+
+    # #2: START must not move when only the wall clock advances. Two
+    # snapshots a second apart used to drift because the age was recomputed
+    # from a fresh uptime against a stale boot epoch.
+    def clock_starts(text):
+        out = {}
+        for line in text.splitlines()[1:]:
+            m = PS_RE.match(line)
+            if m and re.fullmatch(r"\d\d:\d\d", m.group("start")):
+                out[int(m.group("pid"))] = m.group("start")
+        return out
+
+    first = clock_starts(run(["table", "-n", "40", "-s", "42"]).stdout)
+    time.sleep(1.3)
+    second = clock_starts(run(["table", "-n", "40", "-s", "42"]).stdout)
+    common = sorted(set(first) & set(second))
+    if len(common) < 10:
+        print("SKIP: #2 too few comparable START rows", file=sys.stderr)
+    for pid in common:
+        a = int(first[pid][:2]) * 60 + int(first[pid][3:])
+        b = int(second[pid][:2]) * 60 + int(second[pid][3:])
+        d = abs(a - b)
+        if min(d, 1440 - d) > 1:
+            fail(f"#2: START for pid {pid} moved from {first[pid]} to {second[pid]}")
+
+    # #16: --repeat-max 1 means one row per command line. web and sys used to
+    # emit the same command in several rows because the bound was applied per
+    # template and the repeats were drawn from a pool that still held them.
+    for fam in ("web", "sys"):
+        rows = run(["table", "-f", fam, "-n", "200", "--repeat-max", "1"]).stdout
+        cmds = [" ".join(r.split()[10:]) for r in rows.splitlines()[1:]]
+        dup = len(cmds) - len(set(cmds))
+        if dup:
+            fail(f"#16: {fam} --repeat-max 1 emitted {dup} duplicate command lines")
+
+    # #9: an option the chosen command cannot use must be a usage error. The
+    # old parser accepted these and then ignored them.
+    for argv in (
+        ["table", "--live", "--host-uptime", "0"],
+        ["table", "--live", "--host-mem", "512"],
+        ["table", "--live", "--repeat-max", "1"],
+        ["list", "--repeat-max", "1"],
+        ["unit", "-q"],
+        ["inject", "--dry-run", "--utc-offset", "5", "-n", "1"],
+        ["inject", "--dry-run", "--local", "-n", "1"],
+    ):
+        p = run(argv, check=False)
+        if p.returncode != 2:
+            fail(f"#9: {' '.join(argv)} exited {p.returncode}, wanted 2")
+
+    # #3: %MEM truncates at one decimal like procps; it does not round. The
+    # old renderer printed rss*1000/mem rounded to one decimal. --host-mem
+    # makes the denominator exact.
+    text = run(["table", "-f", "web", "-n", "120", "--host-mem", "64"]).stdout
+    budget = 64 * 1024
+    seen = 0
+    for line in text.splitlines()[1:]:
+        m = PS_RE.match(line)
+        if not m:
+            fail(f"#3: a synthetic row did not parse: {line!r}")
+        tenths = int(m.group("mem").replace(".", ""))
+        want = min(999, int(m.group("rss")) * 1000 // budget)
+        if tenths != want:
+            fail(f"#3: %MEM for pid {m.group('pid')} is {m.group('mem')}, "
+                 f"procps would truncate {int(m.group('rss'))} kB to {want / 10:.1f}")
+        seen += 1
+    if not seen:
+        fail("#3: --host-mem produced no rows")
+
+    # #3: the live COMMAND column must keep a final argv space and render
+    # control bytes the way procps does: \r, \v and \f become '?', \n
+    # becomes a space. The old reader stripped every trailing space and kept
+    # the control bytes verbatim.
+    procs = []
+    try:
+        for extra in ("trailing ", "a\rb", "c\vd\fe", "x\ny"):
+            procs.append(subprocess.Popen(
+                [sys.executable, "-c", "import time;time.sleep(30)", extra],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        time.sleep(0.6)
+        live = {}
+        for line in run(["table", "--live"]).stdout.splitlines()[1:]:
+            m = PS_RE.match(line)
+            if m:
+                live[int(m.group("pid"))] = m.group("cmd")
+        for p in procs:
+            out = subprocess.run(["ps", "-o", "args=", "-p", str(p.pid)],
+                                 stdout=subprocess.PIPE, text=True, timeout=30).stdout
+            want = out[:-1] if out.endswith("\n") else out
+            got = live.get(p.pid)
+            if got != want:
+                fail(f"#3: live COMMAND for pid {p.pid} is {got!r}, ps says {want!r}")
+    finally:
+        for p in procs:
+            p.kill()
+
+    # #22: a symlinked template exe (gcc -> x86_64-linux-gnu-gcc-14) made the
+    # one-field form match nothing and report a plain "skip", so a run that
+    # left every row alive could look routine. The bind tier is what produces
+    # that shape, so this run must not use --no-root.
+    pf = Path(tmp) / "sym.pid"
+    one = Path(tmp) / "sym-one.pid"
+    run(["inject", "-f", "dev", "-n", "20", "-s", "1", "--no-user",
+         "--no-mem", "--no-tty", "--no-threads", "--pidfile", str(pf)])
+    pids = read_pids(pf)
+    one.write_text("".join(f"{p}\n" for p in pids))
+    p = run(["stop", "--pidfile", str(one)], check=False)
+    alive_now = [pid for pid in pids if alive(pid)]
+    if exe_known() and alive_now and p.returncode == 0:
+        fail(f"#22: a one-field pidfile reported success with "
+             f"{len(alive_now)} rows alive")
+    silent = set()
+    for line in p.stderr.splitlines():
+        m = re.search(r"skip (\d+) \(identity does not match\)", line)
+        if m:
+            silent.add(int(m.group(1)))
+    missed = [pid for pid in alive_now if pid in silent]
+    if exe_known() and missed:
+        fail(f"#22: a one-field line silently skipped {len(missed)} live "
+             f"bind-tier rows (symlinked exe) instead of naming them")
+    stop_pidfile(pf)
+
+    # #5: a SIGKILLed injector leaves its staging directory behind. Once its
+    # stubs are gone, the next run must prune it instead of keeping it for
+    # ever. The old prune kept every directory that still had an owner marker.
+    staging = Path(tmp) / "crash"
+    staging.mkdir()
+    crash = subprocess.Popen(
+        [str(BIN), "inject", "-n", "4", "-s", "5", "--no-root", "--duration", "1",
+         "--shadow-dir", str(staging), "--pidfile", str(Path(tmp) / "crash.pid")],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.time() + 10
+    old_dirs = []
+    while time.time() < deadline:
+        old_dirs = list(staging.glob(".psgen-*"))
+        if old_dirs:
+            break
+        time.sleep(0.05)
+    if not old_dirs:
+        crash.kill()
+        crash.wait()
+        print("SKIP: #5 no staging directory appeared", file=sys.stderr)
+    else:
+        crash.kill()
+        crash.wait()
+        time.sleep(2.5)
+        q = run(["inject", "-n", "2", "-s", "3", "--no-root", "--duration", "1",
+                 "--shadow-dir", str(staging),
+                 "--pidfile", str(Path(tmp) / "crash2.pid")])
+        if "pruned" not in q.stderr:
+            fail(f"#5: a dead run's staging was not pruned: {q.stderr.strip()!r}")
+        left = set(staging.glob(".psgen-*"))
+        for d in old_dirs:
+            if d in left:
+                fail(f"#5: {d.name} survived the prune")
+
+    # #27: a RuntimeDirectory survives a restart, so inject must succeed again
+    # with the same pidfile after stop. The unit must also be the shape that
+    # creates that directory and names that path.
+    run_dir = Path(tmp) / "run-psgen"
+    run_dir.mkdir()
+    pf = run_dir / "psgen.pid"
+    for _ in range(2):
+        run(["inject", "-n", "4", "-s", "2", "--no-root", "--no-user",
+             "--no-mem", "--no-tty", "--no-threads", "--pidfile", str(pf)])
+        if not read_pids(pf):
+            fail("#27: a restart cycle wrote no PIDs")
+        stop_pidfile(pf)
+    unit = run(["unit"]).stdout
+    for needle in ("RuntimeDirectory=psgen", "RuntimeDirectoryMode=0700",
+                   "--pidfile /run/psgen/psgen.pid"):
+        if needle not in unit:
+            fail(f"#27: the unit lacks {needle!r}")
+
+
 def check_regressions2_tmp():
     with tempfile.TemporaryDirectory(prefix="psgen-res-") as tmp:
         check_residuals(Path(tmp))
@@ -2214,6 +2496,8 @@ def main() -> int:
     check_counts()
     check_regressions()
     check_regressions2_tmp()
+    with tempfile.TemporaryDirectory(prefix="psgen-review-") as tmp:
+        check_review_fixes(Path(tmp))
     if can_root():
         check_root()
     else:
