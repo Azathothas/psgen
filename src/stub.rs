@@ -321,8 +321,9 @@ pub fn build_argv(cmd: &[u8]) -> (Vec<u8>, Vec<*const u8>) {
 ///
 /// Every re-exec a stub performs has to carry it, because the process that
 /// lands on the other side runs `maybe_run()` again and reads the config from
-/// fd 3. It is cleared (`None`) before the final exec that produces the
-/// visible process, so `ps e` and `/proc/PID/environ` do not show it.
+/// fd 3. It is carried into every exec of this run, including the visible
+/// one, so `ps e` and `/proc/PID/environ` can read it for the process
+/// lifetime. It is a run tag, not authentication.
 static NONCE: std::sync::OnceLock<&'static [u8]> = std::sync::OnceLock::new();
 
 fn set_nonce_line(line: &[u8]) {
@@ -337,8 +338,6 @@ fn set_nonce_line(line: &[u8]) {
 /// process was started by `psgen inject`. The fixed list means the injector's
 /// own environment is not inherited.
 pub fn envp() -> Vec<*const u8> {
-    // Written as byte strings rather than C string literals so the crate keeps
-    // building on a toolchain whose MSRV predates `c"..."`.
     #[allow(clippy::manual_c_str_literals)]
     let path = b"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\0";
     #[allow(clippy::manual_c_str_literals)]
@@ -729,10 +728,13 @@ fn fork_children(cfg: &Config) {
 }
 
 /// Whether a config descriptor has the shape this run creates: owned by the
-/// current euid, sealed or unlinked, and not on a FUSE filesystem where those
-/// fields can be forged.
+/// current euid, sealed or unlinked, and not on a FUSE or overlay filesystem
+/// where those fields can be forged.
 fn config_fd_ok(fd: i32) -> bool {
-    if sys::fd_fs_type(fd) == Some(sys::FUSE_SUPER_MAGIC) {
+    if matches!(
+        sys::fd_fs_type(fd),
+        Some(sys::FUSE_SUPER_MAGIC) | Some(sys::OVERLAYFS_SUPER_MAGIC)
+    ) {
         return false;
     }
     let sealed = sys::fd_sealed(fd);
@@ -742,13 +744,15 @@ fn config_fd_ok(fd: i32) -> bool {
 }
 
 pub fn child_entry(fd: i32) -> ! {
-    let child = match read_config(fd) {
+    let mut child = match read_config(fd) {
         Some(c) => c,
         None => sys::exit(1),
     };
-    if child.nonce.is_empty() || child.nonce != env_nonce() || !config_fd_ok(fd) {
+    if child.stage != 0 || child.nonce.is_empty() || child.nonce != env_nonce() || !config_fd_ok(fd)
+    {
         sys::exit(1);
     }
+    child.child_fds.retain(|c| *c != fd && *c != 3);
     sys::prctl_set_name(&child.comm);
     close_unneeded_except(&child, fd);
     if !set_stage(fd, 1) {
@@ -991,21 +995,16 @@ fn write_disk(cfg: &Config) -> bool {
     use std::io::Write;
     let dir = PathBuf::from(OsStr::from_bytes(&cfg.temp));
     let path = dir.join("data.bin");
-    // `create` would follow a symlink a caller placed in the staging
-    // directory, and the truncate would land on the target. O_NOFOLLOW makes
-    // that an error instead.
+    // Open without O_TRUNC first so a pre-existing hardlink placed in the
+    // staging directory cannot be truncated before its link count is checked.
     let fd = sys::open(
         path.as_os_str().as_bytes(),
-        sys::O_WRONLY | sys::O_CREAT | sys::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        sys::O_WRONLY | sys::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         0o644,
     );
     if fd < 0 {
         return false;
     }
-    // `O_NOFOLLOW` refuses a symlink; a hardlink is still a regular file, so
-    // the opened descriptor's link count is the remaining signal. The injector
-    // creates `data.bin` for this run, so a second link means someone else
-    // made one.
     let st = match sys::fd_stat(fd) {
         Some(s) => s,
         None => {
@@ -1014,6 +1013,10 @@ fn write_disk(cfg: &Config) -> bool {
         }
     };
     if !st.is_reg() || st.nlink != 1 || st.uid != sys::geteuid() {
+        sys::close(fd);
+        return false;
+    }
+    if !sys::ftruncate(fd, 0) {
         sys::close(fd);
         return false;
     }
@@ -1030,11 +1033,43 @@ fn write_disk(cfg: &Config) -> bool {
     if f.sync_data().is_err() {
         return false;
     }
-    drop(f);
     if cfg.uid != 0 || cfg.gid != 0 {
-        let _ = sys::chown(path.as_os_str().as_bytes(), cfg.uid, cfg.gid);
+        use std::os::unix::io::AsRawFd;
+        let _ = sys::fchown(f.as_raw_fd(), cfg.uid, cfg.gid);
     }
     true
+}
+
+/// Append this stub's identity to the staging directory's live marker.
+///
+/// The injector writes the marker after the roots exist, but a run that is
+/// killed between creating a staging directory and that write leaves the
+/// directory unmarked, and the prune pass then keeps it for ever. The stub
+/// knows its own PID and starttime, so it records itself before it execs.
+fn record_live(dir: &[u8]) {
+    if dir.is_empty() || !safe_temp(dir) {
+        return;
+    }
+    let start = match crate::live::read_starttime(sys::getpid()) {
+        Some(s) => s,
+        None => return,
+    };
+    let mut line = Vec::new();
+    line.extend_from_slice(sys::getpid().to_string().as_bytes());
+    line.push(b' ');
+    line.extend_from_slice(start.to_string().as_bytes());
+    line.push(b'\n');
+    let mut path = dir.to_vec();
+    path.extend_from_slice(b"/.psgen-live");
+    let fd = sys::open(
+        &path,
+        sys::O_WRONLY | sys::O_CREAT | libc::O_APPEND | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0o600,
+    );
+    if fd >= 0 {
+        sys::write_fd(fd, &line);
+        sys::close(fd);
+    }
 }
 
 fn run(cfg: Config) -> ! {
@@ -1051,7 +1086,6 @@ fn run(cfg: Config) -> ! {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
     sys::prctl_set_name(&cfg.comm);
-    let self_exe = sys::read_link(b"/proc/self/exe").unwrap_or_default();
 
     // Detach a root from the caller's process group before it forks, so a
     // shell job cleanup does not take the tree with it. Session leaders use
@@ -1065,12 +1099,24 @@ fn run(cfg: Config) -> ! {
     }
 
     if cfg.stage == 0 {
+        let mut root_cfg = cfg;
+        root_cfg.child_fds.retain(|c| *c != 3);
         if !set_stage(3, 1) {
-            write_status(&cfg, -1, 0);
+            write_status(&root_cfg, -1, 0);
             sys::exit(1);
         }
-        fork_children(&cfg);
+        fork_children(&root_cfg);
         close_above(6);
+        run_post_fork(root_cfg);
+    }
+    run_post_fork(cfg)
+}
+
+fn run_post_fork(cfg: Config) -> ! {
+    let self_exe = sys::read_link(b"/proc/self/exe").unwrap_or_default();
+    record_live(&cfg.temp);
+    if let Some(parent) = Path::new(OsStr::from_bytes(&cfg.self_copy)).parent() {
+        record_live(parent.as_os_str().as_bytes());
     }
 
     // Arm the lifetime before anything that can block. A busy stub never
@@ -1121,11 +1167,13 @@ fn run(cfg: Config) -> ! {
         dev |= DEV_EXE;
     }
 
-    // Reaching this point means no exec succeeded, so the config fd is no
-    // longer needed and must not stay open in the stub itself.
+    // Reaching this point means no further exec is needed, so the config fd
+    // is retired in the visible stub. The nonce stays in the environment it
+    // was exec'd with; `/proc/PID/environ` reads the initial stack, so an
+    // `unsetenv` here would not hide it.
     sys::close(3);
 
-    sys::chdir(b"/");
+    let _ = std::env::set_current_dir("/");
     if cfg.flags & (corpus::F_SESSION as u32 | corpus::F_TTY as u32) != 0 && cfg.flags & F_ROOT == 0
     {
         sys::setsid();
@@ -1178,9 +1226,9 @@ fn run(cfg: Config) -> ! {
 ///
 /// Three things are checked before the config is acted on:
 ///
-/// 1. A setuid or setgid install is refused outright. A forged config on fd 3
-///    would otherwise be a way to run code as root or with a privileged
-///    group.
+/// 1. Any setuid or setgid install is refused outright. A forged config on
+///    fd 3 would otherwise be a way to run code as root or with a privileged
+///    group (such as `disk` or `shadow`).
 /// 2. The config must carry the nonce this process was started with, which
 ///    the injector passes on `PSGEN_NONCE`. An inherited fd 3 from a supervisor
 ///    or a permissive sudo rule does not know it, so the config is ignored and
@@ -1191,7 +1239,7 @@ fn run(cfg: Config) -> ! {
 ///    An fd opened by an unprivileged caller does not survive `sudo`, so a
 ///    descriptor inherited into a privileged psgen fails the ownership check.
 pub fn maybe_run() {
-    if (sys::geteuid() == 0 && sys::getuid() != 0) || (sys::getegid() == 0 && sys::getgid() != 0) {
+    if sys::geteuid() != sys::getuid() || sys::getegid() != sys::getgid() {
         sys::err(
             b"psgen: refusing to run setuid or setgid; install it without the setuid/setgid bit\n",
         );
@@ -1206,16 +1254,13 @@ pub fn maybe_run() {
         // normal command line, which will reject the stray argument.
         return;
     }
-    // The descriptor must be one this run could have made: it has no name left
-    // (a memfd, or an unlinked temporary file), it is sealed when the kernel
-    // can seal, and it is owned by the same uid that is running this process.
-    // The last check is what closes the `sudo` case: an fd opened by the
-    // caller does not survive the switch to root, so a descriptor inherited
-    // into a privileged psgen is not the injector's.
     let sealed = sys::fd_sealed(3);
     let unlinked = sys::fd_nlink(3) == Some(0);
     let owned = sys::fd_owner(3) == Some(sys::geteuid());
-    if sys::fd_fs_type(3) == Some(sys::FUSE_SUPER_MAGIC) {
+    if matches!(
+        sys::fd_fs_type(3),
+        Some(sys::FUSE_SUPER_MAGIC) | Some(sys::OVERLAYFS_SUPER_MAGIC)
+    ) {
         sys::err(b"psgen: refusing a config descriptor on a FUSE filesystem\n");
         sys::exit(2);
     }
