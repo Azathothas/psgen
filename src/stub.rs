@@ -573,9 +573,12 @@ fn ensure_target(target: &[u8], temp: &[u8]) -> bool {
     for (i, c) in comps.iter().enumerate() {
         cur.push(c);
         if i + 1 == comps.len() {
+            // The leaf is created inside the caller's staging directory. A
+            // symlink planted there must not be followed, and an existing
+            // file must not be reused: O_EXCL makes both an error.
             let fd = sys::open(
                 cur.as_os_str().as_bytes(),
-                sys::O_CREAT | sys::O_WRONLY,
+                sys::O_CREAT | sys::O_WRONLY | sys::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 0o755,
             );
             if fd < 0 {
@@ -1066,10 +1069,19 @@ fn record_live(dir: &[u8]) {
         sys::O_WRONLY | sys::O_CREAT | libc::O_APPEND | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         0o600,
     );
-    if fd >= 0 {
-        sys::write_fd(fd, &line);
-        sys::close(fd);
+    if fd < 0 {
+        return;
     }
+    // O_NOFOLLOW refuses a symlink; a hardlink is still a regular file, so the
+    // opened descriptor's link count is the remaining signal. The injector
+    // creates this file, so a second link means someone else made one.
+    match sys::fd_stat(fd) {
+        Some(st) if st.is_reg() && st.nlink == 1 && st.uid == sys::geteuid() => {
+            sys::write_fd(fd, &line);
+        }
+        _ => {}
+    }
+    sys::close(fd);
 }
 
 fn run(cfg: Config) -> ! {

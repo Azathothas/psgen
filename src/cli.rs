@@ -983,13 +983,26 @@ pub fn parse(args: &[Vec<u8>]) -> Result<Args, ParseError> {
                 b"--host-mem" => {
                     a.seen.push("--host-mem");
                     let v = take_value(args, &mut i, inline).ok_or("missing value for --host-mem")?;
-                    a.host_mem_mb = Some(str::parse_u64(v).ok_or("invalid --host-mem")?);
+                    let n = str::parse_u64(v).ok_or("invalid --host-mem")?;
+                    // 0 means "unknown" inside Fit, so accepting it here would
+                    // silently fall back to this host instead of the one asked
+                    // for. A host with no memory is not a host.
+                    if n == 0 {
+                        return Err("--host-mem must be at least 1 MiB".into());
+                    }
+                    a.host_mem_mb = Some(n);
                 }
                 b"--host-pid-max" => {
                     a.seen.push("--host-pid-max");
                     let v =
                         take_value(args, &mut i, inline).ok_or("missing value for --host-pid-max")?;
-                    a.host_pid_max = Some(str::parse_u64(v).ok_or("invalid --host-pid-max")?);
+                    let n = str::parse_u64(v).ok_or("invalid --host-pid-max")?;
+                    // 0 means "unknown" inside Fit; a host with pid_max 0 has
+                    // no PID at all, which is a different statement.
+                    if n == 0 {
+                        return Err("--host-pid-max must be at least 1".into());
+                    }
+                    a.host_pid_max = Some(n);
                 }
                 b"--host-uptime" => {
                     a.seen.push("--host-uptime");
@@ -1638,6 +1651,7 @@ pub fn run() -> i32 {
             let mut rng = Rng::new(args.seed.unwrap_or(1));
             let opts = Opts {
                 count: 0,
+                seed: args.seed.unwrap_or(1),
                 profile: args.profile.clone(),
                 family: args.family,
                 self_user: b"deploy".to_vec(),
@@ -1684,6 +1698,7 @@ pub fn run() -> i32 {
             };
             let opts = Opts {
                 count: args.count,
+                seed: args.seed.unwrap_or(0),
                 profile: args.profile.clone(),
                 family: args.family,
                 self_user: util::current_user().name,
@@ -1724,9 +1739,12 @@ pub fn run() -> i32 {
                 if limit > 0 && rows.len() > limit {
                     rows.truncate(limit);
                 }
+                // `ps` divides %MEM by MemTotal from /proc/meminfo, which in
+                // a container is the host's total, not the cgroup limit. The
+                // live table has to agree with the `ps` beside it.
                 let out = table::render(
                     &rows,
-                    table::mem_budget_kb(),
+                    util::mem_total_kb(),
                     start_offset(&args),
                     args.local,
                     sys::page_kb(),
@@ -1744,6 +1762,7 @@ pub fn run() -> i32 {
                 } else {
                     args.count.min(5000)
                 },
+                seed: args.seed.unwrap_or(0),
                 profile: args.profile.clone(),
                 family: args.family,
                 self_user: util::current_user().name,
@@ -1821,6 +1840,7 @@ pub fn run() -> i32 {
                 } else {
                     args.count.min(500)
                 },
+                seed: args.seed.unwrap_or(0),
                 profile: args.profile.clone(),
                 family: args.family,
                 self_user: me.name,

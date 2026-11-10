@@ -30,6 +30,8 @@ pub struct Proc {
 
 pub struct Opts {
     pub count: usize,
+    /// The seed the caller used, for reports that have to name it.
+    pub seed: u64,
     /// `--host-uptime`: pretend the host has been up this long. `None` reads
     /// `/proc/uptime`.
     pub uptime: Option<u64>,
@@ -1351,6 +1353,7 @@ mod tests {
             // have.
             let opts = Opts {
                 count: 50,
+                seed: 0,
                 profile: b"server".to_vec(),
                 family: None,
                 self_user: b"root".to_vec(),
@@ -1379,6 +1382,7 @@ mod tests {
     fn a_table_never_repeats_a_pid_when_the_space_is_small() {
         let opts = Opts {
             count: 60,
+            seed: 0,
             profile: b"server".to_vec(),
             family: None,
             self_user: b"root".to_vec(),

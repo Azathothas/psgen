@@ -228,7 +228,12 @@ pub fn run(rng: &mut Rng, opts: &Opts, binaries: bool, require_binaries: bool) -
     }
 
     let mut out = Buf::new();
-    out.push_str("templates: ");
+    // The seed changes which placeholder expansion is checked, so it is part
+    // of the report: without it, `check -s 1` and `check -s 2` print the same
+    // thing and the option looks like a no-op.
+    out.push_str("seed:      ");
+    out.push_u64(opts.seed);
+    out.push_str("\ntemplates: ");
     out.push_u64(corpus::CORPUS.len() as u64);
     if let Some(f) = opts.family {
         out.push_str(" (");

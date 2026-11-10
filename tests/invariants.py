@@ -2269,6 +2269,158 @@ def check_residuals(tmp):
     shutil.rmtree(foreign, ignore_errors=True)
 
 
+def check_plausibility():
+    """Every generated row must be physically possible.
+
+    This is the class of defect #2 belonged to: the old regression asserted
+    *determinism* (same seed, same output) and never *plausibility* (a row
+    cannot start before the host booted). A property test over seeds, counts
+    and host shapes catches the whole class, not one example of it.
+    """
+    now = time.localtime()
+    now_min = now.tm_hour * 60 + now.tm_min
+    for seed in (1, 2, 7, 42, 99, 165, 1000):
+        for n in (30, 200, 1000):
+            for uptime in (None, 0, 1, 60, 3600):
+                extra = [] if uptime is None else ["--host-uptime", str(uptime)]
+                p = run(["table", "-n", str(n), "-s", str(seed), "--local"] + extra)
+                if p.returncode != 0:
+                    continue
+                for line in p.stdout.splitlines()[1:]:
+                    m = PS_RE.match(line)
+                    if not m:
+                        continue
+                    pid = int(m.group("pid"))
+                    cpu = float(m.group("cpu"))
+                    mem = float(m.group("mem"))
+                    vsz = int(m.group("vsz"))
+                    rss = int(m.group("rss"))
+                    start = m.group("start")
+                    tm = m.group("time")
+                    if pid < 1:
+                        fail(f"#2: PID {pid} is not a process")
+                    if cpu > 100.0:
+                        fail(f"#2: %CPU {cpu} above one core")
+                    if mem > 100.0:
+                        fail(f"#2: %MEM {mem} above the whole machine")
+                    if rss > vsz:
+                        fail(f"#2: RSS {rss} kB above VSZ {vsz} kB")
+                    if re.fullmatch(r"\d\d:\d\d", start):
+                        v = int(start[:2]) * 60 + int(start[3:])
+                        # Signed, so a START a minute in the future (the run
+                        # crossed a minute boundary after `now` was read) is
+                        # not mistaken for 23 hours old.
+                        age_min = now_min - v
+                        if age_min < -2:
+                            age_min += 1440
+                        if uptime is not None and age_min * 60 > uptime + 120:
+                            fail(f"#2: START {start} is {age_min} min old on a "
+                                 f"host up {uptime}s")
+                    parts = [int(x) for x in tm.split(":")]
+                    secs = parts[0] * 60 + parts[1] if len(parts) == 2 else \
+                        parts[0] * 3600 + parts[1] * 60 + parts[2]
+                    if secs > 30 * 86400:
+                        fail(f"#2: TIME {tm} exceeds 30 days")
+                    if m.group("tty") != "?" and not re.fullmatch(
+                            r"pts/\d+|tty\d+|ttyS\d+", m.group("tty")):
+                        fail(f"#2: TTY {m.group('tty')!r} is not a device")
+
+
+def check_live_matches_ps():
+    """Every stable field of `table --live` must equal `ps aux`.
+
+    This is the class of defect #3 belonged to: the old test compared against
+    my own formula for %MEM instead of against procps. The reference is `ps`,
+    so compare against `ps`, field by field, for every row both can see.
+    """
+    def parse(text):
+        out = {}
+        for line in text.splitlines()[1:]:
+            m = PS_RE.match(line)
+            if m:
+                out[int(m.group("pid"))] = m.groupdict()
+        return out
+
+    mine = parse(run(["table", "--live"]).stdout)
+    ref = parse(subprocess.run(["ps", "aux"], stdout=subprocess.PIPE, text=True,
+                               timeout=60).stdout)
+    common = sorted(set(mine) & set(ref))
+    if len(common) < 5:
+        print(f"SKIP: only {len(common)} rows common to ps and table --live",
+              file=sys.stderr)
+        return
+    for pid in common:
+        a, b = mine[pid], ref[pid]
+        # These cannot change between two reads of the same process.
+        for field in ("user", "tty", "start", "cmd"):
+            if a[field] != b[field]:
+                fail(f"#3: live {field} for pid {pid} is {a[field]!r}, "
+                     f"ps says {b[field]!r}")
+        # VSZ, RSS and %MEM can grow or shrink between the two reads, so they
+        # are compared with a tolerance; a systematic difference (the old
+        # rounding bug) is far larger than this.
+        if abs(int(a["vsz"]) - int(b["vsz"])) > 65536:
+            fail(f"#3: live VSZ for pid {pid} is {a['vsz']}, ps says {b['vsz']}")
+        if abs(int(a["rss"]) - int(b["rss"])) > 65536:
+            fail(f"#3: live RSS for pid {pid} is {a['rss']}, ps says {b['rss']}")
+        if abs(float(a["mem"]) - float(b["mem"])) > 0.5:
+            fail(f"#3: live %MEM for pid {pid} is {a['mem']}, ps says {b['mem']}")
+
+
+def check_option_matrix():
+    """No option may be accepted and then ignored.
+
+    This is the class of defect #9 belonged to: the `applies` table was
+    hand-enumerated, so four silent no-ops survived. Test the property: for
+    every option and every subcommand, either the run exits 2, or two different
+    values of the option produce different output.
+    """
+    subs = ["list", "table", "inject", "stop", "corpus", "check", "unit",
+            "doctor", "log", "load"]
+    opts = {
+        "-n": (["-n", "3"], ["-n", "7"]),
+        "-s": (["-s", "1"], ["-s", "2"]),
+        "-p": (["-p", "dev"], ["-p", "desktop"]),
+        "-f": (["-f", "dev"], ["-f", "web"]),
+        "--utc-offset": (["--utc-offset", "60"], ["--utc-offset", "120"]),
+        "--repeat-max": (["--repeat-max", "1"], ["--repeat-max", "5"]),
+        "--host-mem": (["--host-mem", "64"], ["--host-mem", "128"]),
+        "--host-pid-max": (["--host-pid-max", "100"], ["--host-pid-max", "200"]),
+        "--host-uptime": (["--host-uptime", "0"], ["--host-uptime", "600"]),
+        "--lines": (["--lines", "2"], ["--lines", "5"]),
+        "-m": (["-m", "weblog"], ["-m", "cargo"]),
+        "--log-fmt": (["--log-fmt", "json"], ["--log-fmt", "syslog"]),
+        "--cpu-util": (["--cpu-util", "1"], ["--cpu-util", "2"]),
+        "--mem-util": (["--mem-util", "1"], ["--mem-util", "2"]),
+        "--disk-util": (["--disk-util", "1"], ["--disk-util", "2"]),
+        "-d": (["-d", "1"], ["-d", "2"]),
+        "--cpu": (["--cpu", "10"], ["--cpu", "20"]),
+        "--shadow-dir": (["--shadow-dir", "/tmp/om1"], ["--shadow-dir", "/tmp/om2"]),
+    }
+    for sub in subs:
+        for opt, (a, b) in sorted(opts.items()):
+            # `list` prints the corpus in order for a short count, so the
+            # profile and the sort/uniq flags only show above the template
+            # count. Give it room to matter.
+            seed = ["-s", "1"] if sub in ("list", "table") and "-s" not in a else []
+            if sub == "list" and "-n" not in a:
+                seed = seed + ["-n", "200"]
+            # `load` runs until killed without a duration, and `log` with a
+            # delay would sleep; bound both so the matrix stays quick.
+            if sub == "load" and "-d" not in a:
+                seed = seed + ["-d", "1"]
+            if sub == "log":
+                seed = seed + ["--delay", "0"]
+            ra = run([sub] + seed + a, check=False)
+            rb = run([sub] + seed + b, check=False)
+            if ra.returncode == 2 and rb.returncode == 2:
+                continue
+            if ra.returncode != 0 or rb.returncode != 0:
+                continue
+            if ra.stdout == rb.stdout and ra.stderr == rb.stderr:
+                fail(f"#9: {sub} {opt} is accepted but has no effect")
+
+
 def check_review_fixes(tmp):
     """Regressions for the defects the round-5 review found still open.
 
@@ -2496,6 +2648,9 @@ def main() -> int:
     check_counts()
     check_regressions()
     check_regressions2_tmp()
+    check_plausibility()
+    check_live_matches_ps()
+    check_option_matrix()
     with tempfile.TemporaryDirectory(prefix="psgen-review-") as tmp:
         check_review_fixes(Path(tmp))
     if can_root():

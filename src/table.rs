@@ -134,9 +134,14 @@ pub fn round_up(v: u64, page_kb: u64) -> u64 {
     v.div_ceil(page_kb) * page_kb
 }
 
-/// The memory `%MEM` is a percentage of: MemTotal, lowered to the cgroup
-/// limit when that is smaller. A container with a 1 GiB limit reports `%MEM`
-/// against 1 GiB, which is what `ps` does there too.
+/// The memory a *synthetic* table's `%MEM` is a percentage of: MemTotal,
+/// lowered to the cgroup limit when that is smaller, because a generated table
+/// is a model of the machine the tool is running on.
+///
+/// The live table must not use this: `ps` divides by `MemTotal` from
+/// `/proc/meminfo`, which in a container is the host's total, not the cgroup
+/// limit. `table --live` therefore passes `util::mem_total_kb()` directly, so
+/// its `%MEM` agrees with the `ps` beside it.
 pub fn mem_budget_kb() -> u64 {
     let mut mem = crate::util::mem_total_kb();
     let cg = crate::util::cgroup_mem_limit_kb();
