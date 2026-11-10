@@ -2,6 +2,45 @@
 
 ## Unreleased
 
+### Review round 6
+
+The round-5 review found seven defects. They were not seven bugs but six
+recurring mistakes in how the work was verified, and each had more instances
+than the review hit. This round fixes the classes.
+
+- A regression that cannot fail: #2's test masked START, the only column that
+  changes. `check_plausibility` is now a property over seeds, counts and host
+  shapes (no START before boot, no %CPU or %MEM above 100, no RSS above VSZ, no
+  TIME above 30 days, no TTY that is not a device).
+- Comparing against my own formula instead of the reference: #3's %MEM was
+  asserted against my formula, never `ps`. `check_live_matches_ps` compares
+  every stable field of `table --live` against `ps aux` for every row.
+- A hand-enumerated option table: #9 left four silent no-ops.
+  `check_option_matrix` tests every option against every subcommand.
+- Fixing one site, not every site with the same shape: `--repeat-max` in the
+  main loops, and the release workflow's gates.
+- A check after the destructive act: `ensure_target` created a leaf with
+  `O_CREAT|O_WRONLY` (following a symlink planted in the staging directory) and
+  `record_live` appended to a hardlinked `.psgen-live`. Both now open with
+  `O_NOFOLLOW` and check the descriptor first.
+- A narrow predicate generalised from one case: `--host-mem 0` and
+  `--host-pid-max 0` were accepted and silently fell back to this host, because
+  zero means "unknown" inside `Fit`. Both are usage errors now.
+
+Also found while auditing:
+
+- `table --live` divided `%MEM` by the cgroup-lowered budget, but `ps` divides
+  by `MemTotal`; the live table now uses `MemTotal`.
+- `START` was `now - age` recomputed with a second `now`, so it could drift a
+  minute from `ps`; `Proc` now carries the absolute start time.
+- The live `TIME` column is the real `utime+stime`, not `age x %CPU`.
+- `--wait` removed a staging directory a non-reporting stub still used; it now
+  asks the live marker, like `stop`.
+- `check -s` was accepted with no observable effect; the report names the seed.
+- The CPU-share checks skip on a host whose load average is above 80% of its
+  cores, with a printed reason.
+
+
 ### Review round 5
 
 Independent review of the second-round branch. Each item was reproduced on the

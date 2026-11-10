@@ -77,7 +77,10 @@ scope, and `table --live` defaults to every process on the host.
 
 `table --live` renders the same columns as `ps aux`. `%MEM` is `rss * 1000 /
 MemTotal` truncated to one decimal, which is what procps prints, not a rounded
-percentage. COMMAND is read up to 512 KiB of `/proc/PID/cmdline`; a final argv
+percentage, and the denominator is `MemTotal` from `/proc/meminfo` — not the
+cgroup limit, which is what a container's `ps` also uses. `START` is the
+process's own start time and `TIME` is its real `utime+stime`, so neither drifts
+from the `ps` beside it. COMMAND is read up to 512 KiB of `/proc/PID/cmdline`; a final argv
 element that ends in a space keeps it, a newline becomes a space, and other
 control bytes (including `\r`, `\v` and `\f`) become `?`, matching `ps`. The
 live table rejects `--repeat-max` and `--host-mem`, `--host-pid-max` and
@@ -108,7 +111,8 @@ the numbers:
   vary. `--repeat-max` is the explicit override there.
 
 `--host-mem MiB`, `--host-pid-max N` and `--host-uptime S` generate a table for
-a named host instead of this one. They exist so the fit rules can be exercised
+a named host instead of this one. A value of 0 is a usage error: zero means
+"unknown" internally, so accepting it would silently fall back to this host. They exist so the fit rules can be exercised
 end to end — including the ones only a tiny container or a freshly booted host
 would hit — and so a table can be produced for a machine that is not the one
 running the tool.
