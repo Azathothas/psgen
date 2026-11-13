@@ -1,9 +1,19 @@
 [package]
 name = "psgen"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 description = "Generate realistic Linux process lists and inject them into the real process table"
 license = "0BSD"
+repository = "https://github.com/Azathothas/psgen"
+homepage = "https://github.com/Azathothas/psgen"
+readme = "README.md"
+keywords = ["procfs", "process-table", "monitoring", "linux", "testing"]
+categories = ["command-line-utilities", "development-tools::testing"]
+rust-version = "1.79"
+# The crate carries the program and its corpus. The test harness, the
+# benchmark inputs and the release plumbing describe this repository, not the
+# published artefact, and nothing in the crate reads them at build time.
+exclude = [".github/", "bench/", "tests/", "scripts/", "Makefile"]
 
 [[bin]]
 name = "psgen"

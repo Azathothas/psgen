@@ -31,19 +31,24 @@ pub const MAP_NORESERVE: i32 = libc::MAP_NORESERVE;
 
 pub const MADV_DONTNEED: i32 = libc::MADV_DONTNEED;
 
-
 pub const SIGKILL: i32 = libc::SIGKILL;
 
 pub const CLONE_NEWNS: i32 = libc::CLONE_NEWNS;
 pub const CLONE_NEWUSER: i32 = libc::CLONE_NEWUSER;
 
-pub const MS_BIND: u64 = libc::MS_BIND as u64;
-pub const MS_REC: u64 = libc::MS_REC as u64;
-pub const MS_PRIVATE: u64 = libc::MS_PRIVATE as u64;
+// These constants are `c_ulong` on some targets and already `u64` on others,
+// so the cast is required on the first kind and redundant on the second.
+#[allow(clippy::unnecessary_cast)]
+mod consts {
+    pub const MS_BIND: u64 = libc::MS_BIND as u64;
+    pub const MS_REC: u64 = libc::MS_REC as u64;
+    pub const MS_PRIVATE: u64 = libc::MS_PRIVATE as u64;
+    pub const TIOCSPTLCK: u64 = libc::TIOCSPTLCK as u64;
+    pub const TIOCGPTN: u64 = libc::TIOCGPTN as u64;
+    pub const TIOCSCTTY: u64 = libc::TIOCSCTTY as u64;
+}
 
-pub const TIOCSPTLCK: u64 = libc::TIOCSPTLCK as u64;
-pub const TIOCGPTN: u64 = libc::TIOCGPTN as u64;
-pub const TIOCSCTTY: u64 = libc::TIOCSCTTY as u64;
+pub use consts::{MS_BIND, MS_PRIVATE, MS_REC, TIOCGPTN, TIOCSCTTY, TIOCSPTLCK};
 
 pub fn cstr(path: &[u8]) -> Option<CString> {
     let body = path.strip_suffix(&[0]).unwrap_or(path);
@@ -54,8 +59,44 @@ fn path_of(path: &[u8]) -> &Path {
     Path::new(OsStr::from_bytes(path.strip_suffix(&[0]).unwrap_or(path)))
 }
 
+/// Write to stdout and exit non-zero when the write fails for any reason other
+/// than a closed pipe.
+///
+/// A dropped `ENOSPC` or `EIO` made a truncated table look like a complete one:
+/// the caller saw exit 0 and short output. `EPIPE` is not an error — a
+/// `| head` exits before the writer does — so it is the one case that stays
+/// silent, and the generator that cares stops through `out_checked`.
 pub fn out(buf: &[u8]) {
-    let _ = io::stdout().write_all(buf);
+    match io::stdout()
+        .write_all(buf)
+        .and_then(|()| io::stdout().flush())
+    {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {}
+        Err(e) => out_failed(e),
+    }
+}
+
+fn out_failed(e: io::Error) -> ! {
+    let mut msg = b"psgen: cannot write to stdout: ".to_vec();
+    msg.extend_from_slice(e.to_string().as_bytes());
+    msg.push(b'\n');
+    let _ = io::stderr().write_all(&msg);
+    std::process::exit(1)
+}
+
+/// Write to stdout, reporting whether the reader is still there.
+///
+/// A generator that keeps formatting after its reader exited (a `| head`, a
+/// closed pipe) is wasted work; `EPIPE` is the signal to stop.
+pub fn out_checked(buf: &[u8]) -> bool {
+    match io::stdout().write_all(buf) {
+        Ok(()) => true,
+        Err(e) => {
+            let _ = io::stdout().flush();
+            e.kind() != io::ErrorKind::BrokenPipe
+        }
+    }
 }
 
 pub fn err(buf: &[u8]) {
@@ -68,6 +109,16 @@ pub fn exit(code: i32) -> ! {
 
 pub fn last_error() -> io::Error {
     io::Error::last_os_error()
+}
+
+/// The errno of the failure that just happened, captured immediately.
+///
+/// `last_error()` reads the thread's errno at the moment it is called, so any
+/// intervening call — a `close`, a `remove_dir_all`, a `format!` that allocates,
+/// or the `eprintln` cleanup in a caller — can replace it. A syscall wrapper
+/// that fails should return this, or nothing at all.
+pub fn errno() -> i32 {
+    io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
 
 pub fn read_file(path: &[u8], buf: &mut [u8]) -> Option<usize> {
@@ -107,29 +158,51 @@ pub fn read_link(path: &[u8]) -> Option<Vec<u8>> {
         .map(|p| p.as_os_str().as_bytes().to_vec())
 }
 
-/// Whether the `bpf` syscall is reachable at all.
+/// Whether `bpf(BPF_MAP_CREATE)` is permitted for this caller.
 ///
-/// Calls command 1 (`BPF_MAP_LOOKUP_ELEM`) with a null attribute. The probe
-/// treats any result other than `EPERM` as reachable; `EPERM` means a seccomp
-/// filter or the kernel policy blocks the syscall. Nothing is looked up either
-/// way.
+/// The command is a well-formed `BPF_MAP_CREATE` of an empty array map, because
+/// the permission check (`unprivileged_bpf_disabled`, `CAP_BPF`) runs *after*
+/// the kernel has copied and validated the attribute. The previous probe passed
+/// `BPF_MAP_LOOKUP_ELEM` with a null attribute and size 0; the kernel rejected
+/// that with `EINVAL` before reaching any permission check, so every uid saw
+/// `allowed`, including one that `unprivileged_bpf_disabled=2` forbids from
+/// creating a map at all.
+///
+/// `EPERM`, `EACCES` and `ENOSYS` mean a policy, the sysctl, or the kernel
+/// refuses the call; anything else — `EINVAL` for an attribute the kernel would
+/// not accept, `E2BIG` for too small a buffer — is a verdict about the
+/// attribute, which can only be reached once the permission check has passed.
 pub fn bpf_allowed() -> bool {
+    // struct bpf_attr for BPF_MAP_CREATE: map_type (u32), key_size, value_size,
+    // max_entries, map_flags, ... The kernel copies the caller's byte count, so
+    // a padded buffer is accepted as long as the named fields are valid.
+    let mut attr = [0u8; 48];
+    attr[0..4].copy_from_slice(&2u32.to_ne_bytes()); // BPF_MAP_TYPE_ARRAY
+    attr[4..8].copy_from_slice(&4u32.to_ne_bytes()); // key_size
+    attr[8..12].copy_from_slice(&4u32.to_ne_bytes()); // value_size
+    attr[12..16].copy_from_slice(&1u32.to_ne_bytes()); // max_entries
     let r = unsafe {
         libc::syscall(
             libc::SYS_bpf,
-            1 as libc::c_int,
-            core::ptr::null::<libc::c_void>(),
             0 as libc::c_int,
+            attr.as_ptr(),
+            attr.len() as libc::c_uint,
         )
     };
-    r != -1 || last_error().raw_os_error() != Some(libc::EPERM)
+    if r >= 0 {
+        // Success returns a descriptor this probe has no use for.
+        close(r as i32);
+        return true;
+    }
+    !matches!(errno(), libc::EPERM | libc::EACCES | libc::ENOSYS)
 }
 
 /// Whether `SECCOMP_SET_MODE_FILTER` with `SECCOMP_FILTER_FLAG_NEW_LISTENER`
 /// is reachable.
 ///
-/// A null program is refused; the errno says whether the call was blocked
-/// before the argument was inspected.
+/// A null program is refused with `EFAULT` or `EINVAL` after the kernel has
+/// inspected the arguments, which means the operation is reachable. `EPERM`,
+/// `EACCES` and `ENOSYS` mean a policy or the kernel blocks it before that.
 pub fn seccomp_user_notif() -> bool {
     let r = unsafe {
         libc::syscall(
@@ -139,8 +212,13 @@ pub fn seccomp_user_notif() -> bool {
             core::ptr::null::<libc::c_void>(),
         )
     };
-    let err = last_error().raw_os_error();
-    r != -1 || !matches!(err, Some(libc::EPERM) | Some(libc::EFAULT))
+    if r != -1 {
+        return true;
+    }
+    !matches!(
+        last_error().raw_os_error(),
+        Some(libc::EPERM) | Some(libc::EACCES) | Some(libc::ENOSYS)
+    )
 }
 
 pub fn read_fd(fd: i32, buf: &mut [u8]) -> isize {
@@ -195,6 +273,128 @@ pub fn open(path: &[u8], flags: i32, mode: u32) -> i32 {
     unsafe { libc::open(p.as_ptr(), flags, mode as libc::c_uint) }
 }
 
+/// `st_nlink` of the object a descriptor refers to, or None when fstat fails.
+///
+/// A memfd and an unlinked temporary file both report 0, which is how the stub
+/// tells "this file has no name anyone else can open" from a named file handed
+/// in by a supervisor.
+pub fn fd_nlink(fd: i32) -> Option<u64> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return None;
+    }
+    Some(st.st_nlink as u64)
+}
+
+/// The seals the stub requires: the size cannot change and no further seals
+/// can be added or removed.
+///
+/// `F_SEAL_WRITE` is deliberately not used: the stub writes its progress
+/// marker into the config after it starts, and a write seal would make that
+/// fail on every row.
+fn seal_mask() -> i32 {
+    libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL
+}
+
+/// Everything about one inode that the stub has to trust or not.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Stat {
+    pub dev: u64,
+    pub ino: u64,
+    pub mode: u32,
+    pub nlink: u64,
+    pub uid: u32,
+    pub size: u64,
+}
+
+impl Stat {
+    pub fn is_reg(&self) -> bool {
+        self.mode & libc::S_IFMT == libc::S_IFREG
+    }
+}
+
+// The field types are `dev_t`, `ino_t`, `nlink_t` and `uid_t`, whose widths
+// differ per target; the cast makes them one type for the comparison.
+#[allow(clippy::unnecessary_cast)]
+fn stat_to(st: &libc::stat) -> Stat {
+    Stat {
+        dev: st.st_dev as u64,
+        ino: st.st_ino as u64,
+        mode: st.st_mode,
+        nlink: st.st_nlink as u64,
+        uid: st.st_uid as u32,
+        size: st.st_size as u64,
+    }
+}
+
+/// `fstat` of an open descriptor.
+pub fn fd_stat(fd: i32) -> Option<Stat> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return None;
+    }
+    Some(stat_to(&st))
+}
+
+/// The filesystem type of the object a descriptor refers to, or None when
+/// fstatfs fails.
+pub fn fd_fs_type(fd: i32) -> Option<i64> {
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatfs(fd, &mut st) } != 0 {
+        return None;
+    }
+    Some(st.f_type as i64)
+}
+
+/// The filesystem type of a path, or None when statfs fails.
+pub fn path_fs_type(path: &[u8]) -> Option<i64> {
+    let p = cstr(path)?;
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(p.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    Some(st.f_type as i64)
+}
+
+/// `FUSE_SUPER_MAGIC`: a FUSE filesystem can report a forged owner and link
+/// count, so a config descriptor or staging path on one is never trusted by a
+/// root run.
+pub const FUSE_SUPER_MAGIC: i64 = 0x6573_5546;
+
+/// `OVERLAYFS_SUPER_MAGIC`: an overlay can present a merged view whose upper
+/// layer an unprivileged user controls, so it is treated like FUSE for a root
+/// staging leaf.
+pub const OVERLAYFS_SUPER_MAGIC: i64 = 0x794c_7630;
+
+/// The owner uid of the object a descriptor refers to, or None when fstat
+/// fails.
+pub fn fd_owner(fd: i32) -> Option<u32> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return None;
+    }
+    Some(st.st_uid as u32)
+}
+
+/// Whether a descriptor carries the seals the stub requires.
+pub fn fd_sealed(fd: i32) -> bool {
+    let r = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
+    if r < 0 {
+        return false;
+    }
+    r & seal_mask() == seal_mask()
+}
+
+/// Apply the size seals to a memfd created with `MFD_ALLOW_SEALING`.
+pub fn fd_add_seals(fd: i32) -> bool {
+    unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, seal_mask()) == 0 }
+}
+
+/// Flush a file descriptor to stable storage, reporting failure.
+pub fn fsync_fd(fd: i32) -> bool {
+    unsafe { libc::fsync(fd) == 0 }
+}
+
 pub fn close(fd: i32) {
     unsafe {
         libc::close(fd);
@@ -211,6 +411,15 @@ pub fn fcntl_dup(fd: i32, min: i32) -> i32 {
 
 pub fn pipe2(fds: &mut [i32; 2], flags: i32) -> bool {
     unsafe { libc::pipe2(fds.as_mut_ptr(), flags) == 0 }
+}
+
+/// Like `pipe2`, but returns the errno of the failure instead of a bool.
+pub fn pipe2_checked(fds: &mut [i32; 2], flags: i32) -> Result<(), i32> {
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), flags) } == 0 {
+        Ok(())
+    } else {
+        Err(errno())
+    }
 }
 
 pub fn fork() -> i32 {
@@ -319,12 +528,8 @@ pub fn setpgid(pid: i32, pgid: i32) -> bool {
     unsafe { libc::setpgid(pid, pgid) == 0 }
 }
 
-pub fn chdir(path: &[u8]) -> bool {
-    let p = match cstr(path) {
-        Some(p) => p,
-        None => return false,
-    };
-    unsafe { libc::chdir(p.as_ptr()) == 0 }
+pub fn fchown(fd: i32, uid: u32, gid: u32) -> bool {
+    unsafe { libc::fchown(fd, uid as libc::uid_t, gid as libc::gid_t) == 0 }
 }
 
 pub fn prctl_set_name(name: &[u8]) -> bool {
@@ -415,6 +620,24 @@ pub fn madvise(ptr: *mut u8, len: usize, advice: i32) -> bool {
     unsafe { libc::madvise(ptr as *mut libc::c_void, len, advice) == 0 }
 }
 
+/// An anonymous file of `size` bytes that can still be sealed later, or -1.
+///
+/// Only a memfd can be sealed; the caller falls back to an unlinked temporary
+/// file, which has no name to reopen but cannot be sealed either. The seals
+/// are added after the contents are written, because `F_SEAL_WRITE` makes the
+/// file unwritable from that point on.
+pub fn anon_sealable_file(name: &[u8], size: u64) -> i32 {
+    let fd = memfd_create(name, libc::MFD_ALLOW_SEALING);
+    if fd < 0 {
+        return -1;
+    }
+    if !ftruncate(fd, size) {
+        close(fd);
+        return -1;
+    }
+    fd
+}
+
 pub fn memfd_create(name: &[u8], flags: u32) -> i32 {
     let n = match cstr(name) {
         Some(n) => n,
@@ -443,11 +666,12 @@ pub fn anon_file(name: &[u8], size: u64) -> i32 {
         }
         close(fd);
     }
-    let mut bases: Vec<PathBuf> = Vec::with_capacity(4);
-    bases.push(std::env::temp_dir());
-    bases.push(PathBuf::from("/tmp"));
-    bases.push(PathBuf::from("/dev/shm"));
-    bases.push(PathBuf::from("."));
+    let bases: Vec<PathBuf> = vec![
+        std::env::temp_dir(),
+        PathBuf::from("/tmp"),
+        PathBuf::from("/dev/shm"),
+        PathBuf::from("."),
+    ];
     for base in bases {
         if let Some(fd) = temp_anon_fd(&base, size) {
             return fd;
@@ -483,12 +707,20 @@ pub fn unshare(flags: i32) -> bool {
 }
 
 pub fn mount(source: &[u8], target: &[u8], fstype: &[u8], flags: u64, data: &[u8]) -> bool {
-    let s = if source.is_empty() { None } else { cstr(source) };
+    let s = if source.is_empty() {
+        None
+    } else {
+        cstr(source)
+    };
     let t = match cstr(target) {
         Some(t) => t,
         None => return false,
     };
-    let f = if fstype.is_empty() { None } else { cstr(fstype) };
+    let f = if fstype.is_empty() {
+        None
+    } else {
+        cstr(fstype)
+    };
     let d = if data.is_empty() { None } else { cstr(data) };
     let sp = s.as_ref().map(|x| x.as_ptr()).unwrap_or(std::ptr::null());
     let fp = f.as_ref().map(|x| x.as_ptr()).unwrap_or(std::ptr::null());
@@ -561,14 +793,6 @@ pub fn getcwd(buf: &mut [u8]) -> Option<usize> {
     }
 }
 
-pub fn chown(path: &[u8], uid: u32, gid: u32) -> bool {
-    let p = match cstr(path) {
-        Some(p) => p,
-        None => return false,
-    };
-    unsafe { libc::chown(p.as_ptr(), uid as libc::uid_t, gid as libc::gid_t) == 0 }
-}
-
 /// Free and total bytes on the filesystem holding `path`.
 pub fn statvfs(path: &[u8]) -> Option<(u64, u64)> {
     let p = cstr(path)?;
@@ -578,7 +802,11 @@ pub fn statvfs(path: &[u8]) -> Option<(u64, u64)> {
         return None;
     }
     // The statvfs fields are u64 on 64-bit targets and u32 on 32-bit ones.
-    let unit = if st.f_frsize > 0 { st.f_frsize } else { st.f_bsize } as u64;
+    let unit = if st.f_frsize > 0 {
+        st.f_frsize
+    } else {
+        st.f_bsize
+    } as u64;
     let free = (st.f_bavail as u64).saturating_mul(unit);
     let total = (st.f_blocks as u64).saturating_mul(unit);
     Some((free, total))
@@ -608,6 +836,113 @@ pub fn is_dir(path: &[u8]) -> bool {
         return false;
     }
     st.st_mode & libc::S_IFMT == libc::S_IFDIR
+}
+
+/// The device a path's inode lives on, or None when `lstat` fails.
+pub fn path_dev(path: &[u8]) -> Option<u64> {
+    let p = cstr(path)?;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::lstat(p.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    Some(st.st_dev as u64)
+}
+
+/// The device `path`'s parent directory's inode lives on.
+///
+/// A bind mount reports the mounted filesystem's `st_dev`, so a directory whose
+/// device differs from the directory containing it is a mount point or has had
+/// something mounted over it. `remove_dir_all` recurses *through* such a
+/// mount and deletes the files behind it.
+pub fn parent_dev(path: &[u8]) -> Option<u64> {
+    let p = Path::new(OsStr::from_bytes(path.strip_suffix(&[0]).unwrap_or(path)));
+    let parent = p.parent()?;
+    path_dev(parent.as_os_str().as_bytes())
+}
+
+/// Whether `path` is a mount point, a bind mount, or on a different filesystem
+/// from its parent.
+///
+/// Both halves matter: a bind mount of a directory on the same filesystem has
+/// the same `st_dev` as its parent, so the device comparison alone misses it,
+/// and a directory on a different filesystem is not necessarily mounted.
+pub fn is_mount_point(path: &[u8]) -> bool {
+    if let (Some(a), Some(b)) = (path_dev(path), parent_dev(path)) {
+        if a != b {
+            return true;
+        }
+    }
+    let t = match cstr(path) {
+        Some(t) => t,
+        None => return true,
+    };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::lstat(t.as_ptr(), &mut st) } != 0 {
+        return true;
+    }
+    let want = (st.st_dev as u64, st.st_ino as u64);
+    let mounts = match std::fs::read_to_string("/proc/self/mountinfo") {
+        Ok(s) => s,
+        Err(_) => return true,
+    };
+    for line in mounts.lines() {
+        // mountinfo: id parent major:minor root mount-point options ...
+        let mut it = line.split(' ');
+        let (Some(_id), Some(_parent), Some(dev)) = (it.next(), it.next(), it.next()) else {
+            continue;
+        };
+        let Some(_root) = it.next() else { continue };
+        let Some(mp) = it.next() else { continue };
+        let Some((maj, min)) = dev.split_once(':') else {
+            continue;
+        };
+        let (Ok(maj), Ok(min)) = (maj.parse::<u64>(), min.parse::<u64>()) else {
+            continue;
+        };
+        if libc::makedev(maj as u32, min as u32) as u64 != want.0 {
+            continue;
+        }
+        if unescape_mount_path(mp).as_os_str().as_bytes() == t.as_bytes() {
+            return true;
+        }
+    }
+    false
+}
+
+fn unescape_mount_path(raw: &str) -> PathBuf {
+    let b = raw.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' && i + 3 < b.len() {
+            let oct = &b[i + 1..i + 4];
+            if oct.iter().all(|c| (b'0'..=b'7').contains(c)) {
+                let v = (oct[0] - b'0') * 64 + (oct[1] - b'0') * 8 + (oct[2] - b'0');
+                out.push(v);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    PathBuf::from(OsStr::from_bytes(&out))
+}
+
+/// Delete a staging directory, refusing anything that is not an ordinary
+/// directory on the filesystem its parent is on.
+///
+/// `remove_dir_all` follows a bind mount: a directory the caller mounted over a
+/// `.psgen-N-N-N` name reports the mounted filesystem's root metadata, which can
+/// be root-owned `0700` and pass every other arm, and the recursion then deletes
+/// files the caller never owned. A staging directory this tool made is never a
+/// mount point, so refusing one costs nothing legitimate.
+pub fn remove_staging_dir(path: &Path) -> bool {
+    let bytes = path.as_os_str().as_bytes();
+    if is_mount_point(bytes) {
+        return false;
+    }
+    std::fs::remove_dir_all(path).is_ok()
 }
 
 /// Decode a raw `waitpid` status into success, and the child's exit code.

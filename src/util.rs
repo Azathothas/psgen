@@ -58,6 +58,35 @@ pub fn mem_total_kb() -> u64 {
     0
 }
 
+/// `MemAvailable` in kB, or 0 when the kernel does not report it.
+pub fn mem_available_kb() -> u64 {
+    let mut buf = [0u8; 8192];
+    let n = match sys::read_file(b"/proc/meminfo", &mut buf) {
+        Some(n) => n,
+        None => return 0,
+    };
+    for line in buf[..n].split(|b| *b == b'\n') {
+        if str::starts_with(line, b"MemAvailable:") {
+            let rest = str::trim(&line[13..]);
+            let mut end = 0;
+            while end < rest.len() && rest[end].is_ascii_digit() {
+                end += 1;
+            }
+            return str::parse_u64(&rest[..end]).unwrap_or(0);
+        }
+    }
+    0
+}
+
+/// `/proc/sys/kernel/pid_max`, or 0 when it cannot be read.
+pub fn pid_max() -> u64 {
+    let mut buf = [0u8; 64];
+    match sys::read_file(b"/proc/sys/kernel/pid_max", &mut buf) {
+        Some(n) => str::parse_u64(str::trim(&buf[..n])).unwrap_or(0),
+        None => 0,
+    }
+}
+
 pub fn uptime_secs() -> u64 {
     let mut buf = [0u8; 256];
     let n = match sys::read_file(b"/proc/uptime", &mut buf) {

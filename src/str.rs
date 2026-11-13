@@ -102,21 +102,11 @@ impl Buf {
         self.v.push(b'0' + frac as u8);
     }
 
-    pub fn push_time(&mut self, secs: u64) {
-        let h = secs / 3600;
-        let m = (secs % 3600) / 60;
-        let s = secs % 60;
-        if h > 0 {
-            self.push_u64(h);
-            self.push(b':');
-            self.push_two(m);
-            self.push(b':');
-            self.push_two(s);
-        } else {
-            self.push_u64(m);
-            self.push(b':');
-            self.push_two(s);
-        }
+    /// One decimal place, no padding: `0.4`.
+    pub fn push_tenths_plain(&mut self, tenths: u32) {
+        self.push_u64((tenths / 10) as u64);
+        self.v.push(b'.');
+        self.v.push(b'0' + (tenths % 10) as u8);
     }
 
     /// Two decimal digits, zero padded.
@@ -176,7 +166,7 @@ pub fn parse_u64(a: &[u8]) -> Option<u64> {
     let mut i = 0;
     while i < a.len() {
         let c = a[i];
-        if !(b'0'..=b'9').contains(&c) {
+        if !c.is_ascii_digit() {
             return None;
         }
         n = n.checked_mul(10)?.checked_add((c - b'0') as u64)?;

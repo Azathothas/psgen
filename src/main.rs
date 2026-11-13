@@ -19,6 +19,7 @@ mod table;
 mod unit;
 mod users;
 mod util;
+mod version;
 
 fn main() {
     stub::maybe_run();

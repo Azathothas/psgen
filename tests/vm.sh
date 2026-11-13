@@ -5,19 +5,29 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+. "$ROOT/tests/helpers/gate.sh"
 BIN="$ROOT/dist/psgen-x86_64-unknown-linux-musl"
+# The version comes from Cargo.toml, so a bump cannot leave the assertion
+# pinned to a literal that no build ever produces.
+VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)
+[ -n "$VERSION" ] || { echo "vm: no version in Cargo.toml" >&2; exit 1; }
 KERNEL=$(ls /boot/vmlinuz-* 2>/dev/null | head -1 || true)
 BUSYBOX=$(command -v busybox || true)
 QEMU=$(command -v qemu-system-x86_64 || true)
 
-if [ ! -x "$BIN" ] || [ -z "$KERNEL" ] || [ -z "$BUSYBOX" ] || [ -z "$QEMU" ]; then
-    echo "vm: skipped (need dist binary, /boot/vmlinuz-*, busybox, qemu-system-x86_64)" >&2
+# A VM check needs every part at once, so the first missing one ends the run:
+# `skip` returns when the capability is optional, and the exit is what makes
+# the rest of this script unreachable.
+missing() {
+    skip "$@"
     exit 0
-fi
-if [ ! -e /dev/kvm ]; then
-    echo "vm: skipped (no /dev/kvm)" >&2
-    exit 0
-fi
+}
+
+[ -x "$BIN" ] || missing "vm needs the static x86_64 musl binary at $BIN"
+[ -n "$KERNEL" ] || missing "vm needs a /boot/vmlinuz-* kernel"
+[ -n "$BUSYBOX" ] || missing "vm needs busybox on PATH"
+[ -n "$QEMU" ] || missing "vm needs qemu-system-x86_64 on PATH"
+[ -e /dev/kvm ] || missing "vm needs /dev/kvm"
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -62,7 +72,7 @@ timeout 120 "$QEMU" -enable-kvm -m 2048 -smp 2 -kernel "$KERNEL" \
     -nographic -no-reboot > "$TMP/out" 2>&1 || true
 
 cat "$TMP/out"
-grep -q 'psgen 0.0.1' "$TMP/out" || { echo "vm: version missing" >&2; exit 1; }
+grep -q "^psgen $VERSION\$" "$TMP/out" || { echo "vm: version missing" >&2; exit 1; }
 grep -q 'spawned 6' "$TMP/out" || { echo "vm: inject did not spawn 6" >&2; exit 1; }
 grep -q '/usr/sbin/nginx' "$TMP/out" || { echo "vm: nginx exe missing" >&2; exit 1; }
 grep -q '/usr/bin/flanneld' "$TMP/out" || { echo "vm: flanneld exe missing" >&2; exit 1; }

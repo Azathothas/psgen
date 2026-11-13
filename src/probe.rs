@@ -4,7 +4,6 @@
 //! before it promises anything. Every check that would change process state
 //! runs in a forked child, so probing never modifies the caller.
 
-use crate::str::Buf;
 use crate::sys;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
@@ -77,40 +76,68 @@ where
 }
 
 fn check_pty() -> Check {
-    let fd = sys::open(b"/dev/ptmx", sys::O_RDWR | sys::O_NOCTTY | sys::O_CLOEXEC, 0);
-    if fd < 0 {
-        return Check::new("pty", false, errno(), b"/dev/ptmx open failed");
-    }
-    sys::close(fd);
-    let slave = sys::access(b"/dev/pts", sys::X_OK);
+    // A seccomp policy that returns KILL for an unexpected syscall must kill
+    // the probe child, not psgen. The parent then reports DENY.
+    let (ok, e) = in_child(|| {
+        let fd = sys::open(
+            b"/dev/ptmx",
+            sys::O_RDWR | sys::O_NOCTTY | sys::O_CLOEXEC,
+            0,
+        );
+        if fd < 0 {
+            return Err(errno());
+        }
+        sys::close(fd);
+        if sys::access(b"/dev/pts", sys::X_OK) {
+            Ok(())
+        } else {
+            Err(errno())
+        }
+    });
     Check::new(
         "pty",
-        slave,
-        if slave { 0 } else { errno() },
-        if slave {
+        ok,
+        e,
+        if ok {
             b"/dev/ptmx and /dev/pts"
         } else {
-            b"/dev/ptmx ok, /dev/pts unreachable"
+            b"/dev/ptmx or /dev/pts unavailable"
         },
     )
 }
 
+/// Whether the host can produce the config descriptor the stub requires.
+///
+/// The descriptor is a `memfd` created with `MFD_ALLOW_SEALING` and then sealed
+/// with the size seals. A `memfd` without the flag can never be sealed, so
+/// `inject` refuses to start rather than spawn stubs with a config nothing may
+/// act on; probing plain `memfd_create` reported that host as capable and moved
+/// the failure to every row. The probe therefore performs the exact sequence
+/// the injector does.
 fn check_memfd() -> Check {
-    let fd = sys::memfd_create(b"psgen-probe", 0);
-    if fd < 0 {
-        return Check::new("memfd", false, errno(), b"memfd_create failed");
-    }
-    let sz = sys::ftruncate(fd, 4096);
-    let e = if sz { 0 } else { errno() };
-    sys::close(fd);
+    let (ok, e) = in_child(|| {
+        let fd = sys::memfd_create(b"psgen-probe", libc::MFD_ALLOW_SEALING);
+        if fd < 0 {
+            return Err(errno());
+        }
+        let sized = sys::ftruncate(fd, 4096);
+        let sealed = sized && sys::fd_add_seals(fd);
+        let e = if sized && sealed { 0 } else { errno() };
+        sys::close(fd);
+        if sized && sealed {
+            Ok(())
+        } else {
+            Err(e)
+        }
+    });
     Check::new(
         "memfd",
-        sz,
+        ok,
         e,
-        if sz {
-            b"memfd_create and ftruncate"
+        if ok {
+            b"memfd_create with MFD_ALLOW_SEALING, ftruncate and F_ADD_SEALS"
         } else {
-            b"memfd_create ok, ftruncate failed"
+            b"memfd_create with MFD_ALLOW_SEALING, ftruncate or F_ADD_SEALS unavailable"
         },
     )
 }
@@ -232,7 +259,16 @@ fn check_user_switch() -> Check {
 
 fn check_fork() -> Check {
     let (ok, e) = in_child(|| Ok(()));
-    Check::new("fork", ok, e, if ok { b"child exited 0" } else { b"fork failed" })
+    Check::new(
+        "fork",
+        ok,
+        e,
+        if ok {
+            b"child exited 0"
+        } else {
+            b"fork failed"
+        },
+    )
 }
 
 fn check_prctl() -> Check {
@@ -247,7 +283,11 @@ fn check_prctl() -> Check {
         "prctl_name",
         ok,
         e,
-        if ok { b"PR_SET_NAME" } else { b"PR_SET_NAME denied" },
+        if ok {
+            b"PR_SET_NAME"
+        } else {
+            b"PR_SET_NAME denied"
+        },
     )
 }
 
@@ -269,7 +309,11 @@ fn check_cwd() -> Check {
                 "cwd",
                 ok,
                 if ok { 0 } else { errno() },
-                if ok { b"cwd writable" } else { b"cwd not writable" },
+                if ok {
+                    b"cwd writable"
+                } else {
+                    b"cwd not writable"
+                },
             )
         }
         None => Check::new("cwd", false, errno(), b"getcwd failed"),
@@ -282,7 +326,11 @@ fn check_proc_stat() -> Check {
         "proc_stat",
         ok,
         if ok { 0 } else { errno() },
-        if ok { b"/proc/PID/stat readable" } else { b"/proc/PID/stat unreadable" },
+        if ok {
+            b"/proc/PID/stat readable"
+        } else {
+            b"/proc/PID/stat unreadable"
+        },
     )
 }
 
@@ -301,6 +349,32 @@ pub fn checks() -> Vec<Check> {
     v.push(check_cwd());
     v.push(check_proc_stat());
     v
+}
+
+/// Whether the `bpf` syscall is reachable, probed in a child so a seccomp
+/// KILL policy cannot take down the caller.
+pub fn bpf_allowed() -> bool {
+    in_child(|| {
+        if sys::bpf_allowed() {
+            Ok(())
+        } else {
+            Err(errno())
+        }
+    })
+    .0
+}
+
+/// Whether `SECCOMP_SET_MODE_FILTER` is reachable, probed in a child for the
+/// same reason.
+pub fn seccomp_user_notif() -> bool {
+    in_child(|| {
+        if sys::seccomp_user_notif() {
+            Ok(())
+        } else {
+            Err(errno())
+        }
+    })
+    .0
 }
 
 /// The facts `inject` needs to choose its strategy, from one probe pass.
@@ -341,86 +415,326 @@ fn pidfile_parent(path: &[u8]) -> &[u8] {
     }
 }
 
+/// How many temporary-name shapes `write_pidfile` will try. The first is the
+/// most collision-resistant; the later ones are strictly shorter, so a
+/// pidfile whose basename is close to `NAME_MAX` still has somewhere to go:
+/// `.tmp.<pid>.<16 hex>`, `.t<pid><6 hex>`, `.tmp.<pid>`, `.t<pid>`.
+pub fn pidfile_temp_levels() -> usize {
+    4
+}
+
+/// How many times one temporary-name shape is retried before the next, shorter
+/// shape is tried. The writer and the preflight share this so neither can test
+/// fewer collisions than the other tolerates.
+pub const PIDFILE_RETRIES: u64 = 16;
+
+/// An upper bound on the pidfile body, for the caller that cannot know the
+/// exact size before the rows exist.
+///
+/// The pre-spawn preflight runs before any PID is known, so it proves the
+/// largest body the writer can emit: a header, a `# temp` line per staging
+/// directory, and 500 rows at the maximum comm length (about 50 KiB). It is an
+/// upper bound, so a filesystem that fits a real run is never refused for a
+/// body the writer would never emit; and it is the size the post-spawn write
+/// must fit, so a filesystem that cannot hold it fails before the first fork.
+pub const PIDFILE_PROBE_BYTES: usize = 64 * 1024;
+
+/// The temporary name `write_pidfile` creates for `path` at `level`.
+///
+/// `pidfile_creatable` and `write_pidfile` both call this, so the preflight
+/// can never test a different name from the one the writer uses.
+pub fn pidfile_temp_name(path: &[u8], level: usize, nonce: u64) -> Vec<u8> {
+    let mut cand = path.to_vec();
+    cand.push(b'.');
+    match level {
+        0 => cand.extend_from_slice(format!("tmp.{}.{:016x}", sys::getpid(), nonce).as_bytes()),
+        1 => cand
+            .extend_from_slice(format!("t{}{:06x}", sys::getpid(), nonce & 0xff_ffff).as_bytes()),
+        2 => cand.extend_from_slice(format!("tmp.{}", sys::getpid()).as_bytes()),
+        _ => cand.extend_from_slice(format!("t{}", sys::getpid()).as_bytes()),
+    }
+    cand
+}
+
+/// Why a pidfile path cannot be used, when it cannot.
+pub enum TargetProblem {
+    /// The path could not be examined at all: `ENAMETOOLONG` for a component
+    /// above `NAME_MAX` or a path above `PATH_MAX`, `EACCES` for a directory
+    /// the caller cannot search, and so on.
+    Unreadable(i32),
+    /// The object exists but is not an absent path, an empty file, or a psgen
+    /// pidfile.
+    Foreign,
+}
+
 /// Whether a pidfile may replace the object at `path`.
 ///
-/// `write_pidfile` renames a temporary file over the target, so a device, a
-/// FIFO, a socket or a symlink would be replaced by a regular file. An absent
-/// path and an empty regular file are fine; a non-empty regular file must
-/// already start with the psgen header.
-pub fn pidfile_target_ok(path: &[u8]) -> bool {
+/// `pidfile_target_ok` is the boolean form; this one says why, so the error
+/// message can name the real cause instead of asserting the usual one.
+///
+/// `Unreadable` carries the errno of the operation that would fail, which is
+/// not always an examination: a file another user owns inside a sticky
+/// directory can be read, and only the rename that would replace it is denied
+/// with `EPERM`.
+pub fn pidfile_target(path: &[u8]) -> Result<(), TargetProblem> {
     let path = path.strip_suffix(&[0]).unwrap_or(path);
     let p = Path::new(OsStr::from_bytes(path));
     let meta = match std::fs::symlink_metadata(p) {
         Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
-        Err(_) => return false,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(TargetProblem::Unreadable(
+                e.raw_os_error().unwrap_or(libc::EIO).abs(),
+            ))
+        }
     };
     if !meta.file_type().is_file() {
-        return false;
+        return Err(TargetProblem::Foreign);
     }
-    if meta.len() == 0 {
-        return true;
+    if meta.len() > 0 {
+        let prefix = crate::version::PIDFILE_PREFIX;
+        let mut buf = [0u8; 16];
+        match sys::read_file(path, &mut buf) {
+            Some(n) if n >= prefix.len() && &buf[..prefix.len()] == prefix => {}
+            _ => return Err(TargetProblem::Foreign),
+        }
     }
-    let mut buf = [0u8; 16];
-    match sys::read_file(path, &mut buf) {
-        Some(n) => n >= 9 && &buf[..9] == b"# psgen ",
-        None => false,
+    if !pidfile_replaceable(path) {
+        return Err(TargetProblem::Unreadable(libc::EPERM));
     }
+    Ok(())
 }
 
-/// Whether a pidfile at `path` could be written.
+pub fn pidfile_target_ok(path: &[u8]) -> bool {
+    pidfile_target(path).is_ok()
+}
+
+/// The errno that stopped the preflight, or 0 when the pidfile can be written.
 ///
-/// `inject` writes a temporary file beside `path` and renames it into place,
-/// so the parent directory must exist and be writable. An existing file's own
-/// mode does not matter, but its type and content do: `pidfile_target_ok`
-/// refuses anything that is not an absent path, an empty regular file, or an
-/// existing psgen pidfile. This only inspects the tree, which is what
-/// `doctor` needs; `pidfile_creatable` proves a write works.
-pub fn pidfile_writable(path: &[u8]) -> bool {
+/// `inject` writes a temporary file beside `path`, fills it with the body it
+/// will commit, renames it over `path`, and proves the rename target is one it
+/// may replace. A preflight that only creates a zero-byte file proves a
+/// smaller write than the writer performs: a full filesystem, a quota or an
+/// `RLIMIT_FSIZE` passes it and then fails after the stubs exist, leaving a
+/// header-only pidfile that `stop` reports as a clean stop of nothing.
+///
+/// The rename is exercised for real, into a second temporary name, because
+/// `rename(2)` is the operation that fails in a sticky directory when the
+/// caller owns the temporary file but the target belongs to another user.
+pub fn pidfile_creatable_errno(path: &[u8]) -> i32 {
     let path = path.strip_suffix(&[0]).unwrap_or(path);
     if path.is_empty() {
-        return false;
+        return libc::EINVAL;
     }
-    if !pidfile_target_ok(path) {
-        return false;
+    match pidfile_shape_errno(path) {
+        Ok(()) => {}
+        Err(e) => return e,
     }
-    let parent = pidfile_parent(path);
-    sys::is_dir(parent) && sys::access(parent, sys::W_OK)
+    pidfile_write_errno(path)
 }
 
-/// Whether `inject` can create and replace a pidfile at `path`.
-///
-/// `access(W_OK)` succeeds for root on a read-only filesystem and on /proc, so
-/// this creates a uniquely named file in the parent and removes it again. The
-/// write itself creates a unique temporary file beside the path with `O_EXCL`
-/// and renames it into place.
-pub fn pidfile_creatable(path: &[u8]) -> bool {
-    if !pidfile_writable(path) {
-        return false;
-    }
+/// The reasons a pidfile path is unusable that do not depend on writing: an
+/// absent target, an empty one, or a psgen pidfile, in a directory the caller
+/// may create files in and rename over.
+pub fn pidfile_shape_errno(path: &[u8]) -> Result<(), i32> {
     let path = path.strip_suffix(&[0]).unwrap_or(path);
+    if path.is_empty() {
+        return Err(libc::EINVAL);
+    }
+    match pidfile_target(path) {
+        Ok(()) => {}
+        Err(TargetProblem::Unreadable(e)) => return Err(e),
+        Err(TargetProblem::Foreign) => return Err(libc::EEXIST),
+    }
     let parent = pidfile_parent(path);
-    let mut name = parent.to_vec();
-    if !name.ends_with(b"/") {
-        name.push(b'/');
+    if !sys::is_dir(parent) {
+        return Err(libc::ENOENT);
     }
-    let mut b = Buf::new();
-    b.push_str(".psgen-probe-");
-    b.push_u64(sys::getpid() as u64);
-    b.push(b'-');
-    b.push_u64(sys::monotonic_ns());
-    name.extend_from_slice(b.as_bytes());
+    if !sys::access(parent, sys::W_OK) {
+        return Err(libc::EACCES);
+    }
+    if !pidfile_replaceable(path) {
+        return Err(libc::EPERM);
+    }
+    Ok(())
+}
+
+/// The reasons the write itself would fail, proved by performing it.
+fn pidfile_write_errno(path: &[u8]) -> i32 {
     let flags = sys::O_WRONLY | sys::O_CREAT | sys::O_EXCL | sys::O_NOFOLLOW;
-    let fd = sys::open(&name, flags, 0o600);
-    if fd < 0 {
-        return false;
+    let body = [0u8; 4096];
+    for level in 0..pidfile_temp_levels() {
+        let mut too_long = false;
+        for retry in 0..PIDFILE_RETRIES {
+            let nonce = sys::monotonic_ns() ^ retry.wrapping_mul(0x9e3779b97f4a7c15);
+            let name = pidfile_temp_name(path, level, nonce);
+            let fd = sys::open(&name, flags, 0o600);
+            if fd < 0 {
+                match sys::last_error().raw_os_error() {
+                    Some(libc::EEXIST) => continue,
+                    Some(libc::ENAMETOOLONG) => {
+                        too_long = true;
+                        break;
+                    }
+                    Some(e) => return e.abs(),
+                    None => return libc::EIO,
+                }
+            }
+            let errno = probe_pidfile_body(fd, &body, path, level, nonce);
+            sys::close(fd);
+            let _ = std::fs::remove_file(Path::new(OsStr::from_bytes(&name)));
+            return errno;
+        }
+        if !too_long {
+            return libc::EEXIST;
+        }
     }
-    sys::close(fd);
-    let _ = std::fs::remove_file(Path::new(OsStr::from_bytes(&name)));
-    true
+    libc::ENAMETOOLONG
+}
+
+/// Fill and rename one probe file, returning 0 or the errno that failed.
+fn probe_pidfile_body(fd: i32, body: &[u8], path: &[u8], level: usize, nonce: u64) -> i32 {
+    let mut left = PIDFILE_PROBE_BYTES;
+    while left > 0 {
+        let n = left.min(body.len());
+        if !sys::write_fd(fd, &body[..n]) {
+            return sys::last_error().raw_os_error().unwrap_or(libc::EIO).abs();
+        }
+        left -= n;
+    }
+    // `write` returning is not the same as the space being there, and the
+    // writer fsyncs what it wrote, so the same failure has to be provable here.
+    if !sys::fsync_fd(fd) {
+        return sys::last_error().raw_os_error().unwrap_or(libc::EIO).abs();
+    }
+    // Prove the rename itself, into a second name beside the target. The
+    // probe file is still open, so this is the same operation the writer will
+    // perform; a rename *onto* the target is additionally covered by
+    // `pidfile_replaceable`, which cannot create new state in the target.
+    let dst = pidfile_temp_name(path, level, nonce ^ 0xa5a5_a5a5_a5a5_a5a5);
+    let src = pidfile_temp_name(path, level, nonce);
+    let renamed = std::fs::rename(
+        Path::new(OsStr::from_bytes(&src)),
+        Path::new(OsStr::from_bytes(&dst)),
+    );
+    match renamed {
+        Ok(()) => {
+            let _ = std::fs::remove_file(Path::new(OsStr::from_bytes(&dst)));
+            0
+        }
+        Err(e) => e.raw_os_error().unwrap_or(libc::EIO).abs(),
+    }
+}
+
+/// Whether `rename(2)` may replace whatever is at `path`.
+///
+/// `access(W_OK)` on the parent is not enough: a directory with the sticky
+/// bit set (`/tmp`) lets a user create files and rename their own, but not
+/// replace a file another user owns. The caller can read such a file and so
+/// passes every earlier check, and only the rename fails.
+fn pidfile_replaceable(path: &[u8]) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let parent = pidfile_parent(path);
+    let pmeta = match std::fs::symlink_metadata(Path::new(OsStr::from_bytes(parent))) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    if pmeta.mode() & 0o1000 == 0 {
+        return true;
+    }
+    match std::fs::symlink_metadata(Path::new(OsStr::from_bytes(path))) {
+        // Absent: nothing to replace, and the caller may create here.
+        Err(_) => true,
+        Ok(t) => t.uid() == sys::geteuid() || sys::geteuid() == 0,
+    }
+}
+
+pub fn pidfile_creatable(path: &[u8]) -> bool {
+    pidfile_creatable_errno(path) == 0
 }
 
 /// Total and free bytes on the filesystem that holds `dir`.
 pub fn space(dir: &[u8]) -> Option<(u64, u64)> {
     sys::statvfs(dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pidfile_target_accepts_what_psgen_writes() {
+        // The header is eight bytes; an eight-byte comparison is what made a
+        // pidfile psgen had just written look foreign.
+        let dir = std::env::temp_dir().join(format!(".psgen-test-{}-a", sys::getpid()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("p.pid");
+        let body = format!("# psgen {} boot abc\n1\t2\tcomm\n", crate::version::VERSION);
+        std::fs::write(&path, body.as_bytes()).unwrap();
+        let bytes = path.as_os_str().as_bytes().to_vec();
+        assert!(pidfile_target_ok(&bytes));
+        // An empty file is fine too.
+        std::fs::write(&path, b"").unwrap();
+        assert!(pidfile_target_ok(&bytes));
+        // Something that is not a psgen pidfile is not.
+        std::fs::write(&path, b"hello world, not a header\n").unwrap();
+        assert!(!pidfile_target_ok(&bytes));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pidfile_temp_name_grows_shorter_by_level() {
+        let path = b"/tmp/psgen.pid";
+        let mut prev = usize::MAX;
+        for level in 0..pidfile_temp_levels() {
+            let n = pidfile_temp_name(path, level, 0x1234_5678_9abc_def0);
+            assert!(
+                n.len() < prev,
+                "level {} ({}) is not shorter than the previous ({})",
+                level,
+                n.len(),
+                prev
+            );
+            prev = n.len();
+        }
+        assert_ne!(
+            pidfile_temp_name(path, 0, 1),
+            pidfile_temp_name(path, 0, 2),
+            "different nonces must yield different names"
+        );
+    }
+
+    #[test]
+    fn the_temp_name_of_a_near_name_max_basename_fits() {
+        // The last level is `.t<pid>`; the boundary the preflight accepts is
+        // exactly what that shape leaves. Both sides use the same function, so
+        // this pins the count the documentation describes.
+        let name = vec![b'd'; 255 - (".t".len() + sys::getpid().to_string().len())];
+        let mut path = b"/tmp/".to_vec();
+        path.extend_from_slice(&name);
+        let last = pidfile_temp_name(&path, pidfile_temp_levels() - 1, 0);
+        assert!(
+            last.len() <= 4096,
+            "the last temporary name must stay within PATH_MAX"
+        );
+    }
+
+    #[test]
+    fn a_foreign_owner_in_a_sticky_directory_is_not_replaceable() {
+        // The review's case: an empty root-owned file in /tmp. The check has to
+        // deny it for an unprivileged caller, because only rename(2) would fail
+        // and a preflight that does not predict that fails after the fork.
+        if sys::geteuid() == 0 {
+            return;
+        }
+        let dir = Path::new("/tmp");
+        let probe = dir.join(format!(".psgen-sticky-test-{}.pid", sys::getpid()));
+        let bytes = probe.as_os_str().as_bytes().to_vec();
+        // Own the file: replaceable.
+        std::fs::write(&probe, b"").unwrap();
+        assert!(pidfile_replaceable(&bytes));
+        let _ = std::fs::remove_file(&probe);
+        // An absent target is replaceable too.
+        assert!(pidfile_replaceable(&bytes));
+    }
 }

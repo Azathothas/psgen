@@ -79,8 +79,11 @@ pub fn current() -> User {
     if let Some((name, gid)) = lookup_uid(uid) {
         return User { name, uid, gid };
     }
+    // `ps` prints the numeric uid when it cannot resolve one, and the injected
+    // stub keeps the caller's uid, so the synthetic table has to agree with
+    // the `ps` output the same rows produce.
     User {
-        name: b"user".to_vec(),
+        name: uid.to_string().into_bytes(),
         uid,
         gid: sys::getgid(),
     }
@@ -101,7 +104,8 @@ pub fn valid_name(name: &[u8]) -> bool {
 
 /// Look up a user, optionally creating it with `useradd` when it is missing.
 /// Returns the uid and gid, whether this call created the account, and the
-/// error text when creation failed.
+/// error text when creation failed or the create succeeded without NSS
+/// noticing.
 pub fn ensure(name: &[u8], create: bool) -> (Option<(u32, u32)>, bool, Option<String>) {
     if let Some((uid, gid)) = lookup_name(name) {
         return (Some((uid, gid)), false, None);
@@ -116,7 +120,14 @@ pub fn ensure(name: &[u8], create: bool) -> (Option<(u32, u32)>, bool, Option<St
         Ok(s) => s,
         Err(_) => return (None, false, Some("invalid user name".to_string())),
     };
-    let attempts: [&[&str]; 2] = [
+    // Ordered from most to least specific. The first attempt creates the
+    // group with the user; the third uses a group that already exists, which
+    // is the state of a host whose package was removed but whose group
+    // survived. The first error is reported: the later attempts exist because
+    // an earlier one cannot work here, so their text describes a different
+    // failure (often an option a shim does not know), and the caller is shown
+    // the first message the real `useradd` produced.
+    let attempts: [&[&str]; 4] = [
         &[
             "--system",
             "--badname",
@@ -136,8 +147,33 @@ pub fn ensure(name: &[u8], create: bool) -> (Option<(u32, u32)>, bool, Option<St
             "/usr/sbin/nologin",
             "--user-group",
         ],
+        // A host can have the group without the user, for example after a
+        // package was removed but its group survived. --user-group fails
+        // there, so use the existing group by name.
+        &[
+            "--system",
+            "--badname",
+            "--no-create-home",
+            "--home-dir",
+            "/nonexistent",
+            "--shell",
+            "/usr/sbin/nologin",
+            "--gid",
+            name_str,
+        ],
+        // busybox's useradd shim wants -G for the group and no --badname.
+        &[
+            "-S",
+            "-H",
+            "-h",
+            "/nonexistent",
+            "-s",
+            "/usr/sbin/nologin",
+            "-G",
+            name_str,
+        ],
     ];
-    let mut last_error = String::new();
+    let mut first_error = String::new();
     for opts in attempts.iter() {
         let mut cmd = std::process::Command::new("useradd");
         for o in opts.iter() {
@@ -150,23 +186,34 @@ pub fn ensure(name: &[u8], create: bool) -> (Option<(u32, u32)>, bool, Option<St
                     if let Some((uid, gid)) = lookup_name(name) {
                         return (Some((uid, gid)), true, None);
                     }
-                    last_error = "useradd succeeded but the user is not visible".to_string();
-                } else {
-                    last_error = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    // The account now exists but NSS cannot see it. Retrying
+                    // the create would only fail with "already exists", hide
+                    // the real explanation and try to add the account twice.
+                    return (
+                        None,
+                        true,
+                        Some(
+                            "useradd succeeded but the account is not visible through NSS"
+                                .to_string(),
+                        ),
+                    );
+                }
+                let e = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                if first_error.is_empty() && !e.is_empty() {
+                    first_error = e;
                 }
             }
             Err(e) => {
-                last_error = e.to_string();
+                if first_error.is_empty() {
+                    first_error = e.to_string();
+                }
             }
         }
     }
-    (
-        None,
-        false,
-        Some(if last_error.is_empty() {
-            "useradd failed".to_string()
-        } else {
-            last_error
-        }),
-    )
+    let msg = if !first_error.is_empty() {
+        first_error
+    } else {
+        "useradd failed".to_string()
+    };
+    (None, false, Some(msg))
 }

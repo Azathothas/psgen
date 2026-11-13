@@ -13,9 +13,81 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: unit tests
+        run: cargo test --locked --release
+      - name: package
+        run: cargo package --locked --no-verify
+      - name: unit
+        # `systemd-analyze verify` catches an ExecStart/ExecStop that names a
+        # program the host does not have, and a Requires=/Wants= on a unit that
+        # does not exist. It does *not* catch an unknown name in `After=`: an
+        # unit with `After=proc-fs-nets.target` verifies clean, because a
+        # missing ordering dependency is only logged at transaction time. That
+        # is why the greps below, not the analyzer, gate the job; the analyzer
+        # is advisory when it is not installed.
+        run: |
+          set -eu
+          cargo build --locked --release
+          ./target/release/psgen unit > /tmp/psgen.service
+          if command -v systemd-analyze >/dev/null 2>&1; then
+            if ! systemd-analyze verify /tmp/psgen.service; then
+              echo "systemd-analyze rejected the printed unit" >&2
+              exit 1
+            fi
+          fi
+          if grep -q 'proc-fs-nets.target' /tmp/psgen.service; then
+            echo "unit names a nonexistent target" >&2
+            exit 1
+          fi
+          if ! grep -q '^RuntimeDirectory=psgen$' /tmp/psgen.service; then
+            echo "the unit has no RuntimeDirectory=psgen" >&2
+            exit 1
+          fi
+          # `grep -q '^ExecStop=-'` is satisfied by the `/bin/rm` cleanup line
+          # whatever the psgen stop looks like, so these two assertions name
+          # the psgen stop directive itself: it must exist, and every
+          # `ExecStop=` line that runs it must carry a guard — the `-` prefix,
+          # or the `/bin/sh -c` test for the pidfile that the shipped unit uses
+          # because `-` cannot tell an absent pidfile from a foreign boot id.
+          # An unguarded stop reports every such failure as a failed stop.
+          if ! grep -q '^ExecStop=.* stop --pidfile' /tmp/psgen.service; then
+            echo "the unit has no ExecStop line that runs the psgen stop" >&2
+            exit 1
+          fi
+          if grep '^ExecStop=.* stop --pidfile' /tmp/psgen.service | grep -v -E '^ExecStop=(-|/bin/sh -c )' | grep -q .; then
+            echo "the unit's psgen stop is unguarded: an absent pidfile fails the stop" >&2
+            exit 1
+          fi
+          if ! grep -q '^ConditionPathExists=/proc/1/stat$' /tmp/psgen.service; then
+            echo "the unit's ConditionPathExists does not name /proc/1/stat" >&2
+            exit 1
+          fi
+      - name: workflow
+        run: sh tests/workflow.sh
+
   test:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    env:
+      # tests/smoke.sh, tests/workflow.sh and tests/invariants.py all skip a
+      # check the host cannot run. This runner has every capability they need,
+      # so a skip here would mean the check quietly stopped covering anything.
+      PSGEN_REQUIRE_ALL: "1"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:

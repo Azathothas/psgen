@@ -24,6 +24,10 @@ jobs:
   test:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    env:
+      # A skip means the check stopped covering anything on a runner that has
+      # every capability the suite asks for, so a skip fails here.
+      PSGEN_REQUIRE_ALL: "1"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -32,13 +36,65 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
+          components: rustfmt, clippy
           targets: x86_64-unknown-linux-musl
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: unit tests
+        run: cargo test --locked --release
+      - name: package
+        run: cargo package --locked --no-verify
       - name: build
         run: cargo build --locked --release --target x86_64-unknown-linux-musl
       - name: stage binary
         run: |
           mkdir -p target/release
           cp target/x86_64-unknown-linux-musl/release/psgen target/release/psgen
+      - name: unit
+        # This is the same gate as ci.yml's `unit` step. `systemd-analyze
+        # verify` catches an ExecStart/ExecStop that names a program the host
+        # does not have, and a Requires=/Wants= on a unit that does not exist.
+        # It does *not* catch an unknown name in `After=`, which is why the
+        # greps below, and not the analyzer, decide the job; the analyzer is
+        # advisory when it is not installed.
+        run: |
+          set -eu
+          ./target/release/psgen unit > /tmp/psgen.service
+          if command -v systemd-analyze >/dev/null 2>&1; then
+            if ! systemd-analyze verify /tmp/psgen.service; then
+              echo "systemd-analyze rejected the printed unit" >&2
+              exit 1
+            fi
+          fi
+          if grep -q 'proc-fs-nets.target' /tmp/psgen.service; then
+            echo "unit names a nonexistent target" >&2
+            exit 1
+          fi
+          if ! grep -q '^RuntimeDirectory=psgen$' /tmp/psgen.service; then
+            echo "the unit has no RuntimeDirectory=psgen" >&2
+            exit 1
+          fi
+          # `grep -q '^ExecStop=-'` is satisfied by the `/bin/rm` cleanup line
+          # whatever the psgen stop looks like, so these two assertions name
+          # the psgen stop directive itself: it must exist, and every
+          # `ExecStop=` line that runs it must carry a guard — the `-` prefix,
+          # or the `/bin/sh -c` test for the pidfile that the shipped unit uses
+          # because `-` cannot tell an absent pidfile from a foreign boot id.
+          # An unguarded stop reports every such failure as a failed stop.
+          if ! grep -q '^ExecStop=.* stop --pidfile' /tmp/psgen.service; then
+            echo "the unit has no ExecStop line that runs the psgen stop" >&2
+            exit 1
+          fi
+          if grep '^ExecStop=.* stop --pidfile' /tmp/psgen.service | grep -v -E '^ExecStop=(-|/bin/sh -c )' | grep -q .; then
+            echo "the unit's psgen stop is unguarded: an absent pidfile fails the stop" >&2
+            exit 1
+          fi
+          if ! grep -q '^ConditionPathExists=/proc/1/stat$' /tmp/psgen.service; then
+            echo "the unit's ConditionPathExists does not name /proc/1/stat" >&2
+            exit 1
+          fi
       - name: test
         run: sh tests/smoke.sh
 
@@ -47,35 +103,50 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # `native` selects the build path: `cargo build` on a runner of the
+        # target's own arch, `cargo zigbuild` elsewhere. `qemu` names the binfmt
+        # handler the job registers; it is required exactly when the runner
+        # cannot execute the produced binary, and it is what makes the `smoke`
+        # step below run the cross binary rather than pass without it. `i686`
+        # is the one cross entry with `qemu: ""`: x86_64 runs 32-bit ELF
+        # directly through IA32 emulation, so it needs a cross *compiler* but
+        # not an emulator, and `check emulator` is skipped for it by design.
         include:
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-musl
             native: true
             qemu: ""
+            smoke: true
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             native: true
             qemu: ""
+            smoke: true
           - runner: ubuntu-24.04
             target: riscv64gc-unknown-linux-musl
             native: false
             qemu: riscv64
+            smoke: true
           - runner: ubuntu-24.04
             target: i686-unknown-linux-musl
             native: false
             qemu: ""
+            smoke: true
           - runner: ubuntu-24.04
             target: armv7-unknown-linux-musleabihf
             native: false
             qemu: arm
+            smoke: true
           - runner: ubuntu-24.04
             target: loongarch64-unknown-linux-musl
             native: false
             qemu: loong64
+            smoke: true
           - runner: ubuntu-24.04
             target: powerpc64le-unknown-linux-musl
             native: false
             qemu: ppc64le
+            smoke: true
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:
@@ -105,24 +176,97 @@ jobs:
         if: matrix.native == true
         run: cargo build --locked --release --target ${{ matrix.target }}
       - name: static check
+        # The binary this job built is the only `target/*/release/psgen`, so the
+        # check names it from the tree rather than from an expression the shell
+        # has to trust. `test -f` comes first: a pipeline under `if` cannot tell
+        # a static binary from one that was never built, because `readelf` fails
+        # on a missing path and `grep -q` fails with it, which is the same exit
+        # status as "no NEEDED found". `grep -q` also exits 0 as soon as it
+        # matches, so the error branch needs the `|| true` to keep `set -e` from
+        # ending the shell before the message is printed.
         run: |
           set -eu
-          b="target/${{ matrix.target }}/release/psgen"
-          command -v readelf >/dev/null || { echo "readelf missing"; exit 1; }
-          if readelf -d "$b" | grep -q NEEDED; then
-            echo "dynamic dependencies in $b"
-            exit 1
-          fi
-          if readelf -l "$b" | grep -q INTERP; then
-            echo "dynamic interpreter in $b"
-            exit 1
-          fi
+          set -- target/*/release/psgen
+          [ "$#" -eq 1 ] || { echo "expected one built target, found $#: $*" >&2; exit 1; }
+          b=$1
+          test -f "$b" || { echo "missing $b: the build produced no binary" >&2; exit 1; }
+          command -v readelf >/dev/null || { echo "readelf missing" >&2; exit 1; }
+          dynamic=$(readelf -d "$b") || { echo "readelf -d failed on $b" >&2; exit 1; }
+          printf '%s\n' "$dynamic" | grep -q NEEDED && { echo "dynamic dependencies in $b" >&2; exit 1; } || true
+          program=$(readelf -l "$b") || { echo "readelf -l failed on $b" >&2; exit 1; }
+          printf '%s\n' "$program" | grep -q INTERP && { echo "dynamic interpreter in $b" >&2; exit 1; } || true
           file "$b"
       - name: register qemu
         if: matrix.qemu != ''
         run: docker run --privileged --rm tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0 --install "${{ matrix.qemu }}"
+      - name: check emulator
+        # The smoke step below runs the cross binary. When the matrix names an
+        # emulator, prove the kernel has the handler enabled, so a missing
+        # registration fails here instead of leaving `version` to run something
+        # else. The handler name is what tonistiigi/binfmt registers, which is
+        # the qemu binary's basename, and it differs from the `--install`
+        # architecture for loong64.
+        if: matrix.qemu != ''
+        run: |
+          set -eu
+          case "${{ matrix.qemu }}" in
+            loong64) handler=qemu-loongarch64 ;;
+            *) handler="qemu-${{ matrix.qemu }}" ;;
+          esac
+          entry="/proc/sys/fs/binfmt_misc/$handler"
+          [ -e "$entry" ] || {
+            echo "binfmt handler $handler is not registered" >&2
+            exit 1
+          }
+          grep -q '^enabled' "$entry" || {
+            echo "binfmt handler $handler is not enabled" >&2
+            exit 1
+          }
+          grep -q '^interpreter ' "$entry" || {
+            echo "binfmt handler $handler has no interpreter" >&2
+            exit 1
+          }
       - name: version
-        run: "target/${{ matrix.target }}/release/psgen --version"
+        # Executes the built binary and compares its version to the crate's, so
+        # a missing emulator, a zero-byte artefact or a fallback to the runner's
+        # own psgen cannot pass: `--version` would fail or print another
+        # version.
+        run: |
+          set -eu
+          set -- target/*/release/psgen
+          [ "$#" -eq 1 ] || { echo "expected one built target, found $#: $*" >&2; exit 1; }
+          b=$1
+          test -f "$b" || { echo "missing $b: the build produced no binary" >&2; exit 1; }
+          want=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ -n "$want" ] || { echo "no version in Cargo.toml" >&2; exit 1; }
+          got=$("$b" --version)
+          [ "$got" = "psgen $want" ] || {
+            echo "the built binary reports '$got', wanted 'psgen $want'" >&2
+            exit 1
+          }
+      - name: smoke
+        if: matrix.smoke
+        # `tests/smoke.sh` reads target/release/psgen, so the cross binary is
+        # staged there first. That is what makes this a smoke of the *cross*
+        # binary and not of whatever the job built for the runner's own arch.
+        # `smoke.sh` also runs `cargo test`, which rebuilds target/release/psgen
+        # for the runner's arch whenever a Rust integration test exists, so the
+        # checksum is compared again afterwards: a replaced binary means the
+        # rest of the suite tested the host binary, not this one.
+        run: |
+          set -eu
+          set -- target/*/release/psgen
+          [ "$#" -eq 1 ] || { echo "expected one built target, found $#: $*" >&2; exit 1; }
+          test -f "$1" || { echo "missing $1: nothing to smoke" >&2; exit 1; }
+          mkdir -p target/release
+          cp "$1" target/release/psgen
+          staged=$(sha256sum target/release/psgen | cut -d' ' -f1)
+          sh tests/smoke.sh
+          now=$(sha256sum target/release/psgen | cut -d' ' -f1)
+          [ "$staged" = "$now" ] || {
+            echo "smoke.sh replaced the staged binary: the suite tested $now, not the staged $staged" >&2
+            exit 1
+          }
       - name: package
         run: |
           set -eu
@@ -166,12 +310,56 @@ jobs:
       - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: dist/*
+      - name: verify tag
+        # The tag must be `v<version>` and that version must be the one in
+        # Cargo.toml. Both rules live in scripts/release-notes.sh, which
+        # tests/workflow.sh exercises; this step only wires the tag to them.
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: sh scripts/release-notes.sh tag-matches "$TAG"
       - name: publish
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           set -eu
+          # The rules live in scripts/release-notes.sh so they can be run and
+          # tested outside GitHub (tests/workflow.sh); this step only wires the
+          # tag to them.
+          sh scripts/release-notes.sh notes "$TAG" /tmp/notes.md
           pre=""
-          case "$TAG" in *-*) pre="--prerelease" ;; esac
-          gh release create "$TAG" $pre --verify-tag --title "psgen $TAG" --notes-file .github/release-notes.md dist/*
+          if [ "$(sh scripts/release-notes.sh prerelease "$TAG")" = yes ]; then
+            pre="--prerelease"
+          fi
+          gh release create "$TAG" $pre --verify-tag --title "psgen $TAG" \
+            --notes-file /tmp/notes.md dist/*
+      - name: publish-crate
+        # The crate is published after the release assets exist, so a failed
+        # upload leaves nothing on crates.io. The decision belongs to
+        # scripts/release-notes.sh; its exit status distinguishes "no" from "the
+        # tag was refused", and only a successful "yes" publishes. The tag is
+        # re-checked here as well, because this is the step that cannot be
+        # undone: a version published from the wrong tag stays on crates.io. A
+        # fork without the secret skips instead of failing the release.
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -eu
+          status=0
+          decision=$(sh scripts/release-notes.sh publish "$TAG") || status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "release-notes.sh refused $TAG (status $status); not publishing" >&2
+            exit "$status"
+          fi
+          if [ "$decision" != yes ]; then
+            echo "a prerelease does not publish the crate"
+            exit 0
+          fi
+          sh scripts/release-notes.sh tag-matches "$TAG" >/dev/null
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "CARGO_REGISTRY_TOKEN is not set; skipping cargo publish"
+            exit 0
+          fi
+          cargo publish --locked --dry-run
+          cargo publish --locked
