@@ -5604,7 +5604,18 @@ def check_security_markers(tmp):
         for e in exes:
             if not e:
                 continue
-            st = os.stat(e)
+            # Under qemu-user `/proc/PID/exe` is the emulator, so the object
+            # identity of this binary is not what the kernel reports. The
+            # comm assertion above is the identity check that survives there.
+            if emulated():
+                continue
+            try:
+                st = os.stat(e)
+            except OSError:
+                # The link target can be replaced between the read and the
+                # stat; a target that no longer exists is not an exec of this
+                # binary, and the comm assertion has already run.
+                continue
             if (st.st_dev, st.st_ino) != (bin_id.st_dev, bin_id.st_ino):
                 fail(f"#25: {label} executed {e}")
         if rc == 0:
@@ -5705,7 +5716,12 @@ def check_security_markers(tmp):
         for e in exes:
             if not e:
                 continue
-            st = os.stat(e)
+            if emulated():
+                continue
+            try:
+                st = os.stat(e)
+            except OSError:
+                continue
             if (st.st_dev, st.st_ino) != (bin_id.st_dev, bin_id.st_ino):
                 fail(f"#25: a forged config on a {label} executed {e}")
         if rc == 0:
