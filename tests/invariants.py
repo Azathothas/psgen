@@ -5271,22 +5271,38 @@ def check_security_markers(tmp):
     # processes here, so a host prune used to delete a live run's staging.
     ns_tmp = tmp / "ns"
     ns_tmp.mkdir()
+    ns_tmp.chmod(0o777)
     ns_shadow = tmp / "ns-shadow"
+    ns_shadow.mkdir()
+    ns_shadow.chmod(0o777)
     inner = tmp / "ns-run.sh"
     inner.write_text(
         "#!/bin/sh\n"
-        f"cd {ns_tmp} && export TMPDIR={ns_tmp}/t\n"
+        f"cd {ns_tmp} && mkdir -p {ns_tmp}/t && chmod 0777 {ns_tmp}/t\n"
+        f"export TMPDIR={ns_tmp}/t\n"
         f"exec {BIN} inject -n 2 -s 7 -d 120 --disk 1 --no-root --no-user "
         f"--no-mem --no-tty --no-threads --shadow-dir {ns_shadow} "
         f"--pidfile {ns_tmp}/a.pid -q\n")
     inner.chmod(0o755)
     ns = None
     try:
-        pid_flags = (["-Up", "--mount-proc", "--fork"] if os.geteuid() == 0
-                     else ["-Ur", "-Up", "--mount-proc", "--fork"])
-        ns = subprocess.Popen(["unshare"] + pid_flags + [str(inner)],
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                              text=True)
+        # A PID namespace needs CAP_SYS_ADMIN. Root has it outright; an
+        # unprivileged caller needs a user namespace, which Ubuntu restricts,
+        # so a host with root goes through sudo rather than guessing.
+        # A PID namespace needs CAP_SYS_ADMIN, and `--mount-proc` needs a
+        # mount namespace, so root uses `-mp`; an unprivileged caller needs a
+        # user namespace, which Ubuntu restricts, so a host with root goes
+        # through sudo rather than guessing.
+        flags = ["-mp", "--fork", "--mount-proc"]
+        if os.geteuid() == 0:
+            cmd = ["unshare"] + flags + [str(inner)]
+        elif can_root():
+            cmd = as_root(["unshare"] + flags + [str(inner)])
+        else:
+            cmd = ["unshare", "-Ur", "-Up", "--mount-proc", "--fork",
+                   str(inner)]
+        ns = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True)
     except (FileNotFoundError, PermissionError):
         ns = None
     started = False
@@ -5333,6 +5349,13 @@ def check_security_markers(tmp):
             ns_tmp_pf = ns_tmp / "a.pid"
             if ns_tmp_pf.exists():
                 ns_tmp_pf.unlink()
+            # A root run creates root-owned staging inside these two, which
+            # the caller cannot remove. Take the trees out as root so the
+            # suite leaves no trace behind.
+            if can_root():
+                subprocess.run(as_root(["rm", "-rf", str(ns_tmp), str(ns_shadow)]),
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=60)
 
     # #5: the live marker is append-only. The injector rewrote it with only the
     # rows that reported a status record, which erased a stub that had recorded
