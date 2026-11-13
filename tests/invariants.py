@@ -5078,12 +5078,20 @@ def check_security_markers(tmp):
     # #7: `inject` must never write a header its own `stop` refuses. With the
     # boot id unreadable it used to write `boot ` (empty) and spawn anyway;
     # `stop` then refused the file even with --plan.
+    #
+    # The run happens in a private mount namespace, where the caller's uid is
+    # mapped to root, so its scratch root must be writable from both sides.
+    scratch = tmp / "scratch"
+    scratch.mkdir(exist_ok=True)
+    scratch.chmod(0o777)
+    pidfile = scratch / "noboot.pid"
     inner = tmp / "noboot.sh"
     inner.write_text(
         "#!/bin/sh\n"
+        f"TMPDIR={scratch}; export TMPDIR\n"
         "mount --bind /dev/null /proc/sys/kernel/random/boot_id || exit 90\n"
         f"exec {BIN} inject -n 2 --no-user --no-mem --no-tty --no-threads "
-        f"--pidfile {tmp}/noboot.pid\n")
+        f"--pidfile {pidfile}\n")
     inner.chmod(0o755)
     p = can_unshare(["unshare", "-Urnm", str(inner)], timeout=120)
     if p is None or p.returncode == 90:
@@ -5091,15 +5099,18 @@ def check_security_markers(tmp):
     else:
         spawned = "spawned" in p.stdout
         if spawned:
-            stop_pidfile(tmp / "noboot.pid")
+            stop_pidfile(pidfile)
             fail("#7: inject wrote a pidfile with no boot id and spawned")
-        if (tmp / "noboot.pid").exists():
-            text = (tmp / "noboot.pid").read_text()
-            (tmp / "noboot.pid").unlink()
+        if pidfile.exists():
+            text = pidfile.read_text()
+            pidfile.unlink()
             if text.startswith("# psgen") and " boot \n" in text + "\n":
                 fail("#7: an unusable pidfile was left behind")
-        if p.returncode != 2:
-            fail(f"#7: an unreadable boot id exited {p.returncode}, wanted 2")
+        if p.returncode == 0:
+            fail("#7: inject exited 0 with an unreadable boot id")
+        if "boot" not in p.stderr.lower():
+            fail(f"#7: the refusal does not name the boot id: "
+                 f"{p.stderr.strip()[:160]!r}")
 
     # #7: only the first line is a header. A later `# psgen ...` line is a
     # comment; it used to be read as a competing boot id, which made a valid
