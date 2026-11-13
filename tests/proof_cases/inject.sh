@@ -467,7 +467,27 @@ case_14() {
 
 # The commands `-f db` draws are the postmaster and the `postgres: 17/main:`
 # workers. A draw that contains no worker cannot demonstrate anything.
+# A cross binary runs under qemu-user in the release smoke, where /proc reports
+# the emulator's argv rather than the command psgen set. The cases that match a
+# planned row with a live one cannot do that there, so they say so instead of
+# failing on the emulator's shape.
+emulated() {
+	[ "$(uname -m)" = "unknown" ] && return 1
+	have readelf || return 1
+	_m=$(readelf -h "$BIN" 2>/dev/null | sed -n 's/^ *Machine: *//p' | head -1)
+	case "$(uname -m):$_m" in
+	x86_64:Advanced*Micro*Devices*X86-64) return 1 ;;
+	aarch64:AArch64) return 1 ;;
+	i686:Intel*80386|i386:Intel*80386) return 1 ;;
+	*) return 0 ;;
+	esac
+}
+
 case_18_1() {
+	if emulated; then
+		skip_c "the emulator rewrites argv, so a planned row cannot be matched"
+		return
+	fi
 	_tbl=$(tmo 60 "$BIN" table -f db -n 20 -s 1 2>"$TMP/18t.err")
 	_rc=$?
 	if [ "$_rc" -ne 0 ]; then
@@ -516,6 +536,10 @@ case_18_1() {
 }
 
 case_18_2() {
+	if emulated; then
+		skip_c "the emulator rewrites argv, so a planned row cannot be matched"
+		return
+	fi
 	_pf=$TMP/18.pid
 	_err=$(tmo 60 "$BIN" inject -f db -n 12 -s 1 --no-root --no-user --no-mem \
 		--no-tty --no-threads --pidfile "$_pf" -q 2>&1 >/dev/null)
