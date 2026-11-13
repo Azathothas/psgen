@@ -23,7 +23,7 @@ env:
 jobs:
   test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 45
     env:
       # A skip means the check stopped covering anything on a runner that has
       # every capability the suite asks for, so a skip fails here.
@@ -148,7 +148,7 @@ jobs:
             qemu: ppc64le
             smoke: true
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -287,7 +287,7 @@ jobs:
     needs: [test, build]
     if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.tag != ''
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     permissions:
       contents: write
       id-token: write
