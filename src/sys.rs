@@ -434,8 +434,11 @@ pub fn execve(path: &[u8], argv: &[*const u8], envp: &[*const u8]) -> isize {
     unsafe {
         libc::execve(
             p.as_ptr(),
-            argv.as_ptr() as *const *const libc::c_char,
-            envp.as_ptr() as *const *const libc::c_char,
+            // `libc::c_char` is `i8` on x86 and `u8` on aarch64, so a cast is
+            // needed on one and redundant on the other; `cast` is the form
+            // that is correct on both and that clippy accepts either way.
+            argv.as_ptr().cast::<*const libc::c_char>(),
+            envp.as_ptr().cast::<*const libc::c_char>(),
         ) as isize
     }
 }

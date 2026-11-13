@@ -1824,6 +1824,13 @@ def check_regressions():
         # policy or the kernel blocks it. Accepting either label let the old
         # inverted verdict pass.
         import ctypes
+        # 317 is `seccomp` on x86-64. The number is architecture-specific and
+        # the probe under test is the binary's own; on another ELF target the
+        # comparison would be about this host's syscall table, not the
+        # binary's, so it is not run there.
+        if elf_machine(BIN) != ELF_MACHINES["x86_64"]:
+            skip("F-13 the seccomp syscall number is x86-64 specific")
+            return
         libc = ctypes.CDLL("libc.so.6", use_errno=True)
         ctypes.set_errno(0)
         r = libc.syscall(317, 1, 8, None)
@@ -2552,6 +2559,9 @@ def check_residuals(tmp):
         # The other half: a failure inside spawn, after the header-only pidfile
         # exists. Nothing may be spawned and the header must be removed.
         pf = Path(tmp) / "pipe2.pid"
+        if emulated():
+            skip("#14 the pipe2 denial is compiled for the host, not the emulator")
+            return
         p = subprocess.run([str(helper), "pipe2", str(BIN), "inject", "-n", "2",
                             "--no-user", "--no-mem", "--no-tty", "--no-threads",
                             "--pidfile", str(pf)],

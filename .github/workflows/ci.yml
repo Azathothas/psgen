@@ -22,7 +22,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          toolchain: stable
+          toolchain: 1.99.1
           components: rustfmt, clippy
       - name: fmt
         run: cargo fmt --all -- --check
@@ -94,7 +94,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          toolchain: stable
+          toolchain: 1.99.1
           targets: x86_64-unknown-linux-musl
       - name: build
         run: cargo build --locked --release --target x86_64-unknown-linux-musl

@@ -35,7 +35,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          toolchain: stable
+          toolchain: 1.99.1
           components: rustfmt, clippy
           targets: x86_64-unknown-linux-musl
       - name: fmt
@@ -156,7 +156,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          toolchain: stable
+          toolchain: 1.99.1
           targets: ${{ matrix.target }}
       - name: build static (zig)
         if: matrix.native == false
