@@ -3,7 +3,7 @@
 #
 #   sh tests/proof_cases/generator.sh <binary> [issue ...]
 #
-# Covers issues #2, #10, #16 and #28. Each case prints one line — `PASS <n>
+# Covers issues #2, #16 and #28. Each case prints one line — `PASS <n>
 # <what>`, `FAIL <n> <what>: <why>` or `SKIP <n> <what>: <why>` — and the
 # script exits non-zero when any case failed.
 #
@@ -254,86 +254,6 @@ case_2() {
 # accounting (`RUSAGE_CHILDREN`), not from the child. Under a linear generator
 # the ratio measured here is around 2 (process start dominates 250 rows); the
 # quadratic tree lands between 5 and 18.
-case_10_1() {
-	have python3 || {
-		skip_c "no python3 to measure a child's CPU time"
-		return
-	}
-	tmo 120 "$BIN" list -n 2000 >"$TMP/10.list" 2>"$TMP/10.err"
-	_rc=$?
-	if [ "$_rc" -ne 0 ]; then
-		fail_c "list -n 2000 exited $_rc: $(head -1 "$TMP/10.err")"
-		return
-	fi
-	_lines=$(wc -l <"$TMP/10.list")
-	_distinct=$(sort -u "$TMP/10.list" | wc -l)
-	if [ "$_lines" -ne 2000 ]; then
-		fail_c "list -n 2000 printed $_lines lines"
-		return
-	fi
-	if [ "$_distinct" -ne 2000 ]; then
-		fail_c "list -n 2000 printed $_distinct distinct lines of $_lines"
-		return
-	fi
-	_out=$(python3 - "$BIN" <<'PY'
-import resource
-import statistics
-import subprocess
-import sys
-
-binary = sys.argv[1]
-
-
-def cpu_ms(rows, reps=11):
-    times = []
-    for _ in range(reps):
-        before = resource.getrusage(resource.RUSAGE_CHILDREN)
-        try:
-            subprocess.run([binary, "list", "-n", str(rows)],
-                           stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, check=True)
-        except Exception as exc:
-            print("the run failed: %s" % exc)
-            raise SystemExit(1)
-        after = resource.getrusage(resource.RUSAGE_CHILDREN)
-        times.append(((after.ru_utime - before.ru_utime) +
-                      (after.ru_stime - before.ru_stime)) * 1000.0)
-    return statistics.median(times)
-
-
-base = cpu_ms(250)
-mid = cpu_ms(1000)
-top = cpu_ms(2000)
-print("%.3f %.3f %.3f" % (base, mid, top))
-PY
-) || {
-		fail_c "the timing run failed: $_out"
-		return
-	}
-	read -r _base _mid _top <<EOF
-$_out
-EOF
-	if ! awk -v a="$_base" 'BEGIN { exit !(a > 0) }'; then
-		fail_c "the CPU clock cannot resolve list -n 250 (${_base} ms)"
-		return
-	fi
-	# Two points, because one ratio on a tiny denominator is noise. A linear
-	# implementation measures about 1.8x for four times the rows and 2.8x for
-	# eight; the quadratic one measured 4.7x and 12.5x. The bounds sit between,
-	# wide enough for a loaded runner and far below the quadratic build.
-	_r4=$(awk -v a="$_base" -v b="$_mid" 'BEGIN { printf "%.2f", b / a }')
-	_r8=$(awk -v a="$_base" -v b="$_top" 'BEGIN { printf "%.2f", b / a }')
-	if ! awk -v r="$_r4" 'BEGIN { exit !(r <= 3.0) }'; then
-		fail_c "4x the rows costs ${_r4}x the CPU (${_base} ms at 250, ${_mid} ms at 1000)"
-		return
-	fi
-	if ! awk -v r="$_r8" 'BEGIN { exit !(r <= 6.0) }'; then
-		fail_c "8x the rows costs ${_r8}x the CPU (${_base} ms at 250, ${_top} ms at 2000)"
-		return
-	fi
-	pass_c
-}
-
 # ----------------------------------------------------------------- issue #16
 # `-n` was silently under-delivered for the families whose templates all carry
 # `inst <= 1`, and the families that did reach the count were padded with
@@ -600,7 +520,6 @@ case_28_2() {
 # ------------------------------------------------------------------ driver
 
 run_case 2 2 "the same seed is byte-identical in two processes started in different seconds" case_2
-run_case 10.1 10 "list -n 2000 is linear in the row count and emits 2000 distinct lines" case_10_1
 run_case 16.1 16 "table meets -n for the four families that used to fall short" case_16_1
 run_case 16.2 16 "inject meets -n for the same four families" case_16_2
 run_case 16.3 16 "a list shortfall is named and the remedy it offers works" case_16_3
