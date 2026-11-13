@@ -698,7 +698,28 @@ case_13_12() {
 # The seccomp verdict must be the errno the syscall returns, classified by the
 # rule the function documents: EPERM/EACCES/ENOSYS are blocked, anything else
 # (EFAULT for a null program, EINVAL for a malformed one) is reachable.
+# A cross binary runs under qemu-user in the release smoke. That matters here
+# for two reasons: qemu proxies syscalls, so a raw-syscall probe measures the
+# emulator rather than the binary; and qemu needs a large address space and JIT
+# buffer of its own, so a case that imposes RLIMIT_AS or RLIMIT_DATA cannot run
+# the binary at all. Those cases say so instead of failing on qemu's shape.
+emulated() {
+	[ "$(uname -m)" = "unknown" ] && return 1
+	have readelf || return 1
+	_m=$(readelf -h "$BIN" 2>/dev/null | sed -n 's/^ *Machine: *//p' | head -1)
+	case "$(uname -m):$_m" in
+	x86_64:Advanced*Micro*Devices*X86-64) return 1 ;;
+	aarch64:AArch64) return 1 ;;
+	i686:Intel*80386|i386:Intel*80386) return 1 ;;
+	*) return 0 ;;
+	esac
+}
+
 case_19() {
+	if emulated; then
+		skip_c "the emulator proxies the syscall, so the probe cannot be compared"
+		return
+	fi
 	have python3 || {
 		skip_c "no python3 to poke the syscall and read the JSON"
 		return
@@ -1121,6 +1142,10 @@ in_fake_host() {
 }
 
 case_23_1() {
+	if emulated; then
+		skip_c "qemu needs an address space of its own, so the budget cannot be tested"
+		return
+	fi
 	have_sudo || {
 		skip_c "needs sudo to mount a private /proc/meminfo"
 		return
@@ -1154,6 +1179,10 @@ case_23_1() {
 }
 
 case_23_2() {
+	if emulated; then
+		skip_c "qemu needs an address space of its own, so the budget cannot be tested"
+		return
+	fi
 	have_sudo || {
 		skip_c "needs sudo to mount a private /proc/meminfo"
 		return
@@ -1186,6 +1215,10 @@ case_23_2() {
 # Inside a cgroup the budget is the cgroup's, not the host's: 20% of a 512 MiB
 # limit is 102 MiB, and that is the number the refusal must carry.
 case_23_3() {
+	if emulated; then
+		skip_c "qemu needs an address space of its own, so the budget cannot be tested"
+		return
+	fi
 	have_sudo || {
 		skip_c "needs sudo for a cgroup scope and a private /proc/meminfo"
 		return
@@ -1226,6 +1259,10 @@ case_23_3() {
 # `--lines` must bound the output rather than only the event count.
 
 case_24_1() {
+	if emulated; then
+		skip_c "qemu cannot run under the address-space limit this case imposes"
+		return
+	fi
 	have timeout || {
 		skip_c "no timeout(1) to bound the case"
 		return
@@ -1302,6 +1339,10 @@ case_24_2() {
 # `--lines` bounds what is emitted, not just how many events are formatted: an
 # absurd count must be capped and say so, and the output must stay bounded.
 case_24_3() {
+	if emulated; then
+		skip_c "qemu cannot run under the address-space limit this case imposes"
+		return
+	fi
 	have timeout || {
 		skip_c "no timeout(1) to bound the case"
 		return
