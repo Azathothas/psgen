@@ -381,7 +381,10 @@ plan_vs_proc() {
 				printf "plan row %d says user=%s, ps shows %s\n", i - 1, pu[i], ru[m]
 				bad = 1
 			}
-			dc = pc[i] - rc[m]; if (dc < 0) dc = -dc
+			# The plan states the share the stub will ask for. A busy host
+			# delivers less than that -- eight stubs each asking 40% cannot
+			# all get it from two cores -- so only an *excess* is a defect.
+			dc = rc[m] - pc[i]
 			if (dc > cputol) {
 				printf "plan row %d says cpu=%s, ps measures %s\n", i - 1, pc[i], rc[m]
 				bad = 1
@@ -716,6 +719,14 @@ case_12_1() {
 	_nrows=$(awk '$1 == "row"' "$_w/plan" | wc -l)
 	if [ "$_nrows" -ne 8 ]; then
 		fail_c "the plan named $_nrows rows for -n 8"
+		return
+	fi
+	# The plan states the share the run was asked for, whatever the host can
+	# deliver of it, so this is deterministic where the measured value is not.
+	_badcpu=$(awk '$1 == "row" { for (i = 1; i <= NF; i++) if ($i ~ /^cpu=/) print $i }' \
+		"$_w/plan" | grep -v '^cpu=40\.0$' | head -2)
+	if [ -n "$_badcpu" ]; then
+		fail_c "the plan does not state the requested --cpu 40: $(printf '%s' "$_badcpu" | tr '\n' ' ')"
 		return
 	fi
 	plan_tsv plan "$_w/plan" "$_w/plan.tsv"
