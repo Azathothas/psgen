@@ -301,24 +301,34 @@ def cpu_ms(rows, reps=11):
     return statistics.median(times)
 
 
-small = cpu_ms(250)
-large = cpu_ms(2000)
-print("%.3f %.3f" % (small, large))
+base = cpu_ms(250)
+mid = cpu_ms(1000)
+top = cpu_ms(2000)
+print("%.3f %.3f %.3f" % (base, mid, top))
 PY
 ) || {
 		fail_c "the timing run failed: $_out"
 		return
 	}
-	read -r _small _large <<EOF
+	read -r _base _mid _top <<EOF
 $_out
 EOF
-	if ! awk -v a="$_small" -v b="$_large" 'BEGIN { exit !(a > 0) }'; then
-		fail_c "the CPU clock cannot resolve list -n 250 (${_small} ms)"
+	if ! awk -v a="$_base" 'BEGIN { exit !(a > 0) }'; then
+		fail_c "the CPU clock cannot resolve list -n 250 (${_base} ms)"
 		return
 	fi
-	_ratio=$(awk -v a="$_small" -v b="$_large" 'BEGIN { printf "%.2f", b / a }')
-	if ! awk -v r="$_ratio" 'BEGIN { exit !(r <= 5.0) }'; then
-		fail_c "8x the rows costs ${_ratio}x the CPU (${_small} ms at 250, ${_large} ms at 2000)"
+	# Two points, because one ratio on a tiny denominator is noise. A linear
+	# implementation measures about 1.8x for four times the rows and 2.8x for
+	# eight; the quadratic one measured 4.7x and 12.5x. The bounds sit between,
+	# wide enough for a loaded runner and far below the quadratic build.
+	_r4=$(awk -v a="$_base" -v b="$_mid" 'BEGIN { printf "%.2f", b / a }')
+	_r8=$(awk -v a="$_base" -v b="$_top" 'BEGIN { printf "%.2f", b / a }')
+	if ! awk -v r="$_r4" 'BEGIN { exit !(r <= 3.0) }'; then
+		fail_c "4x the rows costs ${_r4}x the CPU (${_base} ms at 250, ${_mid} ms at 1000)"
+		return
+	fi
+	if ! awk -v r="$_r8" 'BEGIN { exit !(r <= 6.0) }'; then
+		fail_c "8x the rows costs ${_r8}x the CPU (${_base} ms at 250, ${_top} ms at 2000)"
 		return
 	fi
 	pass_c
