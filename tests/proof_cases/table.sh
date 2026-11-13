@@ -697,7 +697,28 @@ compare_run() { # compare_run <plan.tsv> <real.tsv> <label>
 # and a busy CPU target so the per-row CPU is a value the kernel can confirm.
 # The default two-column preview has to keep the exact format bench/measure.py
 # splits on a tab, which is why the plan is a separate switch.
+# A cross binary runs under qemu-user in the release smoke, where /proc
+# describes the emulator: its exe is `/usr/bin/qemu-<arch>`, its address space
+# includes the JIT buffer, and its command line is rewritten. The cases that
+# compare a planned row with the live process cannot do that there, so they say
+# so instead of failing on the emulator's shape.
+emulated() {
+	[ "$(uname -m)" = "unknown" ] && return 1
+	have readelf || return 1
+	_m=$(readelf -h "$BIN" 2>/dev/null | sed -n 's/^ *Machine: *//p' | head -1)
+	case "$(uname -m):$_m" in
+	x86_64:Advanced*Micro*Devices*X86-64) return 1 ;;
+	aarch64:AArch64) return 1 ;;
+	i686:Intel*80386|i386:Intel*80386) return 1 ;;
+	*) return 0 ;;
+	esac
+}
+
 case_12_1() {
+	if emulated; then
+		skip_c "the emulator's address space and exe are its own, so a planned row cannot be matched"
+		return
+	fi
 	_w=$TMP/12_1
 	mkdir -p "$_w"
 	_flags='-f sys -n 8 -s 4 --cpu 40'
@@ -763,6 +784,10 @@ case_12_1() {
 # 12.2: the JSON plan. One object, the same rows, and the parent links checked
 # against the kernel's PPid rather than against the plan itself.
 case_12_2() {
+	if emulated; then
+		skip_c "the emulator's address space and exe are its own, so a planned row cannot be matched"
+		return
+	fi
 	have python3 || {
 		skip_c "no python3 to parse the JSON plan"
 		return
@@ -822,6 +847,10 @@ case_12_2() {
 # itself; a plan that said `bind` there would send a caller looking for a
 # spoofed exe that never appears.
 case_12_3() {
+	if emulated; then
+		skip_c "the emulator's address space and exe are its own, so a planned row cannot be matched"
+		return
+	fi
 	_w=$TMP/12_3
 	mkdir -p "$_w"
 	_binexe=$(readlink -f "$BIN" 2>/dev/null)
@@ -873,6 +902,10 @@ case_12_3() {
 # count before anything is written; the filesystem is what says whether the
 # run wrote that much in that many places.
 case_12_4() {
+	if emulated; then
+		skip_c "the emulator's address space and exe are its own, so a planned row cannot be matched"
+		return
+	fi
 	_w=$TMP/12_4
 	mkdir -p "$_w/tmp"
 	_d=$_w/tmp
