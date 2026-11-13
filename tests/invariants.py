@@ -5069,6 +5069,26 @@ def memfd_blob(blob: bytes, flags: int):
     return fd
 
 
+def unshare_mount(script: str, timeout: int = 120):
+    """Run `script` in a private mount namespace, or None when none is allowed.
+
+    A private *user* namespace is the portable form, but Ubuntu restricts it
+    for unprivileged callers, so a host with root uses a plain mount namespace
+    instead. The script signals a failed mount with exit 90.
+    """
+    if can_root():
+        p = subprocess.run(as_root(["unshare", "-m", script]),
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           text=True, timeout=timeout)
+        if p.returncode != 0 and "Operation not permitted" in p.stderr:
+            return None
+        return p
+    p = can_unshare(["unshare", "-Urnm", script], timeout=timeout)
+    if p is not None and "Operation not permitted" in p.stderr:
+        return None
+    return p
+
+
 def check_security_markers(tmp):
     """Regressions for the pidfile, staging, fd 3, user and check defects."""
     tmp = Path(tmp)
@@ -5093,7 +5113,7 @@ def check_security_markers(tmp):
         f"exec {BIN} inject -n 2 --no-user --no-mem --no-tty --no-threads "
         f"--pidfile {pidfile}\n")
     inner.chmod(0o755)
-    p = can_unshare(["unshare", "-Urnm", str(inner)], timeout=120)
+    p = unshare_mount(str(inner), timeout=120)
     if p is None or p.returncode == 90:
         skip("#7 a private mount namespace is needed to hide the boot id")
     else:
@@ -5235,7 +5255,9 @@ def check_security_markers(tmp):
     inner.chmod(0o755)
     ns = None
     try:
-        ns = subprocess.Popen(["unshare", "-Ur", "-Up", "--mount-proc", "--fork", str(inner)],
+        pid_flags = (["-Up", "--mount-proc", "--fork"] if os.geteuid() == 0
+                     else ["-Ur", "-Up", "--mount-proc", "--fork"])
+        ns = subprocess.Popen(["unshare"] + pid_flags + [str(inner)],
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               text=True)
     except (FileNotFoundError, PermissionError):
