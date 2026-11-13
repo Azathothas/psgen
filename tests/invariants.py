@@ -4558,26 +4558,23 @@ def check_dry_run_identity():
     """`--dry-run --json` names the identity the real run would use (#12).
 
     The defect was that the JSON reported `would_create: []` and `uid: 0`
-    while the text output said it would create a user: the dry run fell
-    back to the caller's identity instead of reporting the one the run
-    would use.
+    while the text output said it would create a user: the dry run fell back
+    to the caller's identity instead of reporting the one the run would use.
 
-    Which users are missing depends on the host — a CI runner has
-    `postgres`, a minimal host does not — so the check makes the absence
-    itself: it hides a `passwd` without those names from the binary in a
-    private mount namespace. Without that, the check would pass on any
-    host that happens to have every corpus account, which is the "check
-    that cannot fail" shape.
+    Which users are missing depends on the host — a CI runner has `postgres`,
+    a minimal host does not — so the check makes the absence itself: it hides
+    a `passwd` without the family's accounts from the binary in a private
+    mount namespace. Without that, the check would pass on any host that
+    happens to have every corpus account, which is the "cannot fail" shape.
     """
     if not can_root():
         skip("#12 --create-users needs passwordless sudo")
         return
     # The template names come from the corpus, not from the plan: the plan
-    # prints the identity after `prepare` has resolved it, which is the value
-    # under test. Column 2 is the template's user.
+    # prints the identity after `prepare` resolved it, which is the value
+    # under test.
     corpus = run(["corpus"], check=False).stdout
-    wanted = sorted({line.split("\t")[1]
-                     for line in corpus.splitlines()
+    wanted = sorted({line.split("\t")[1] for line in corpus.splitlines()
                      if line.startswith("db\t") and "\t" in line})
     if not wanted:
         skip("#12 the db corpus named no users")
@@ -4589,23 +4586,20 @@ def check_dry_run_identity():
         keep = [l for l in Path("/etc/passwd").read_text().splitlines()
                 if l.split(":")[0] not in wanted]
         passwd.write_text("".join(l + "\n" for l in keep))
-        if Path("/etc/shadow").exists():
-            # `/etc/shadow` is not readable by the caller, so it is read as
-            # root. NSS needs it present and consistent with the passwd copy.
-            sp = subprocess.run(as_root(["cat", "/etc/shadow"]),
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, text=True, timeout=30)
-            keep = [l for l in sp.stdout.splitlines()
-                    if l.split(":")[0] not in wanted]
-            shadow.write_text("".join(l + "\n" for l in keep))
-        else:
-            shadow.write_text("")
+        # `/etc/shadow` is not readable by the caller, so it is read as root.
+        # NSS needs it present and consistent with the passwd copy.
+        sp = subprocess.run(as_root(["cat", "/etc/shadow"]),
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            text=True, timeout=30)
+        keep = [l for l in sp.stdout.splitlines() if l.split(":")[0] not in wanted]
+        shadow.write_text("".join(l + "\n" for l in keep))
         inner = shim / "run.sh"
         inner.write_text(
             "#!/bin/sh\n"
             f"mount --bind {passwd} /etc/passwd || exit 90\n"
             f"mount --bind {shadow} /etc/shadow || exit 91\n"
-            f"exec {BIN} inject -f db -n 2 -s 5 --create-users --dry-run --json\n")
+            f"exec {BIN} inject -f db -n 2 -s 5 --create-users "
+            "--dry-run --json\n")
         inner.chmod(0o755)
         p = subprocess.run(as_root(["unshare", "-m", str(inner)]),
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -4623,7 +4617,7 @@ def check_dry_run_identity():
         names = doc.get("would_create")
         if not isinstance(names, list):
             fail("#12: --dry-run --json has no would_create array")
-        # The run hides every db account, so it must name the ones its rows
+        # Every db account is hidden, so the run must name the ones its rows
         # use. An empty list is the pre-fix bug: the dry run fell back to the
         # caller and reported nothing to create.
         said = sorted({m.group(1) for m in
@@ -4649,6 +4643,1403 @@ def check_dry_run_identity():
                      f"a user that does not exist yet ({r['user']})")
     finally:
         shutil.rmtree(shim, ignore_errors=True)
+
+
+
+
+
+def check_generator_sweep():
+    """Every generated row must be plausible for the host it describes.
+
+    The generator's own unit tests prove the arithmetic; this proves the
+    *rendered* table, so a column format that hides an impossible value cannot
+    pass. It sweeps the host shapes the flags exist for — memory, PID space and
+    uptime — because each cap lives on a different path and a single shape
+    exercises one of them.
+
+    The reference is the geometry of a process table: RSS is part of VSZ,
+    `%MEM` is a fraction of the machine, a PID below `pid_max` exists, a start
+    is inside `[boot, now]`, and no process has burned more CPU time than it has
+    been alive. None of those come from psgen's own formulas.
+    """
+    def rows_of(args):
+        p = run(args, check=False)
+        if p.returncode != 0:
+            fail(f"#28: {' '.join(args)} exited {p.returncode}: {p.stderr.strip()}")
+        out = []
+        for line in p.stdout.splitlines()[1:]:
+            m = PS_RE.match(line)
+            if not m:
+                fail(f"#28: unparsable row from {' '.join(args)}: {line!r}")
+                continue
+            out.append(m.groupdict())
+        return out
+
+    def secs(t):
+        parts = [int(x) for x in t.split(":")]
+        if len(parts) == 2:
+            return parts[0] * 60 + parts[1]
+        return parts[0] * 3600 + parts[1] * 60 + parts[2]
+
+    shapes = [
+        # (mem MiB, pid_max, uptime)
+        (None, None, 1),
+        (None, None, 60),
+        (None, None, 3600),
+        (None, None, 86400),
+        (None, None, 90000),
+        (64, None, 3600),
+        (256, 300, 86400),
+        (512, 1024, 60),
+        (4096, None, 604800),
+    ]
+    for mem, pid_max, uptime in shapes:
+        for seed in (1, 42, 165):
+            for family in (None, "web", "db", "sys"):
+                args = ["table", "-n", "300", "-s", str(seed), "--utc-offset", "0",
+                        "--host-uptime", str(uptime)]
+                if mem is not None:
+                    args += ["--host-mem", str(mem)]
+                if pid_max is not None:
+                    args += ["--host-pid-max", str(pid_max)]
+                if family is not None:
+                    args += ["-f", family]
+                rows = rows_of(args)
+                if not rows:
+                    fail(f"#28: {' '.join(args)} produced no rows")
+                for r in rows:
+                    pid = int(r["pid"])
+                    rss = int(r["rss"])
+                    vsz = int(r["vsz"])
+                    where = f"pid {pid} ({r['cmd'][:40]}) on {' '.join(args)}"
+                    if rss > vsz:
+                        fail(f"#28: RSS {rss} above VSZ {vsz} for {where}")
+                    if float(r["mem"]) > 100.0:
+                        fail(f"#28: %MEM {r['mem']} above the whole machine for {where}")
+                    if pid < 1:
+                        fail(f"#28: PID {pid} is not a process ({where})")
+                    if pid_max is not None and pid >= pid_max:
+                        fail(f"#28: PID {pid} at or above pid_max {pid_max} ({where})")
+                    # The oldest row cannot be older than the host has been up,
+                    # and no row may have more CPU time than it has been alive.
+                    if secs(r["time"]) > uptime + 120:
+                        fail(f"#28: TIME {r['time']} beyond an uptime of {uptime}s ({where})")
+                # The boot-relative rows must actually be boot-relative. A row
+                # that started at the boot has an age close to the uptime, and
+                # the TIME column proves it without a clock: an hour-old daemon
+                # has accumulated CPU time, a daemon "started a minute ago" has
+                # `0:00`. The minute-boundary case cannot help the old code
+                # either: a 90-minute host shows a boot daemon at the current
+                # minute only if its age is under 90 s.
+                if family in (None, "sys") and uptime >= 3600:
+                    init = [r for r in rows if r["cmd"].startswith("/sbin/init")]
+                    if not init:
+                        fail(f"#28: {' '.join(args)} has no /sbin/init row")
+                    # `/sbin/init` claims 0.3% of a core, so on an hour-old host
+                    # it has minutes of CPU; at `now - 90 s` it can show at most
+                    # a second.
+                    if secs(init[0]["time"]) == 0:
+                        fail(f"#28: /sbin/init shows TIME {init[0]['time']} on a host "
+                             f"up {uptime}s: it is not boot-relative ({' '.join(args)})")
+
+    # `--host-uptime 0` and `--host-mem 0` name a host that does not exist: 0
+    # means "unknown" inside, so accepting them would describe this machine
+    # under the name of another. The refusal has to be a *usage* error that
+    # names the flag, not merely a non-zero exit: a crash also exits non-zero,
+    # and a caller who reads the message needs the flag in it.
+    for flag, args in (("--host-uptime", ["--host-uptime", "0"]),
+                       ("--host-mem", ["--host-mem", "0"]),
+                       ("--host-pid-max", ["--host-pid-max", "0"])):
+        p = run(["table", "-n", "3"] + args, check=False)
+        if p.returncode != 2:
+            fail(f"#28: {flag} 0 was accepted (exit {p.returncode}), not a "
+                 f"usage error")
+        if flag not in p.stderr:
+            fail(f"#28: {flag} 0 exited 2 without naming the flag: "
+                 f"{p.stderr.strip()[:120]!r}")
+
+    # The same seed must give the same *rows* seconds apart, START included:
+    # START is the process's start time, and a per-row clock read made the
+    # column move a minute per minute of wall clock.
+    # A run that straddles a minute boundary legitimately differs: the snapshot
+    # instant moves, and START for a row under a day old has minute resolution.
+    # Align the pair to just after a boundary instead of weakening the compare,
+    # then retry a few times so a slow first run cannot poison the sample.
+    def aligned_pair(argv):
+        # Land at the start of a minute so both reads share one.
+        now = time.time()
+        time.sleep(math.ceil(now) % 60 + 0.05 if (now % 60) > 56 else 0.05)
+        a = run(argv, check=False).stdout
+        b = run(argv, check=False).stdout
+        return a, b
+
+    for argv in (["table", "-n", "60", "-s", "42", "--host-uptime", "90000"],
+                 ["list", "-n", "60", "-s", "42"],
+                 ["inject", "--dry-run", "--plan", "-n", "12", "-s", "42"]):
+        for attempt in range(4):
+            a, b = aligned_pair(argv)
+            if a == b:
+                break
+        else:
+            fail(f"#2: {' '.join(argv)} is not byte-identical across minutes")
+
+    # `list --no-uniq` pads every family, not only the ones whose templates
+    # carry a placeholder.
+    for fam in ("mail", "mon", "net", "dev", "sto", "sys", "web", "db", "ctr", "desk"):
+        lines = [l for l in run(["list", "-f", fam, "-n", "50", "--no-uniq"]).stdout.splitlines() if l]
+        if len(lines) != 50:
+            fail(f"#16: list -f {fam} -n 50 --no-uniq produced {len(lines)} lines")
+
+    # The documented pigeonhole bound is `ceil(rows / templates)`, and `web`
+    # broke it by 2.5x before the fill netted off the distinct pass.
+    candidates = {"sys": 6, "web": 7, "db": 2, "mon": 7, "net": 6,
+                  "mail": 5, "sto": 5, "desk": 5, "dev": 33, "ctr": 6}
+    for fam, k in candidates.items():
+        rows = rows_of(["table", "-f", fam, "-n", "200", "-s", "2", "--host-uptime", "86400"])
+        cmds = [" ".join(r["cmd"].split()) for r in rows]
+        if len(cmds) != 200:
+            fail(f"#16: table -f {fam} -n 200 returned {len(cmds)} rows")
+        top = max(cmds.count(c) for c in set(cmds))
+        bound = max((200 + k - 1) // k, 6)
+        if top > bound:
+            fail(f"#16: table -f {fam} has one command {top} of {len(cmds)} rows, "
+                 f"bound {bound} with {k} templates")
+
+    # A child starts at or after the process that forked it. Postgres, php-fpm
+    # and gunicorn were generated before their masters, which `pstree` cannot
+    # show. The rendered column only orders two rows when both are clock times
+    # on the same day, so the run is pinned inside one day and the comparison is
+    # made only on rows that are, allowing for the minute the table was taken.
+    for argv in (["table", "-f", "db", "-n", "300", "-s", "1", "--host-uptime", "3600"],
+                 ["table", "-f", "web", "-n", "300", "-s", "1", "--host-uptime", "3600"]):
+        rows = rows_of(argv + ["--utc-offset", "0"])
+        pairs = [("/usr/lib/postgresql/17/bin/postgres -D", "postgres: 17/main:"),
+                 ("php-fpm: master process", "php-fpm: pool www"),
+                 ("gunicorn: master", "gunicorn: worker"),
+                 ("nginx: master process", "nginx: worker")]
+        for master_cmd, child_cmd in pairs:
+            masters = [r for r in rows if r["cmd"].startswith(master_cmd)]
+            kids = [r for r in rows if r["cmd"].startswith(child_cmd)]
+            if not masters or not kids:
+                continue
+            m = masters[0]["start"]
+            if not re.fullmatch(r"\d\d:\d\d", m):
+                fail(f"#18: the master on a one-hour host starts at {m!r}, not a clock time")
+            for kid in kids:
+                k = kid["start"]
+                if not re.fullmatch(r"\d\d:\d\d", k):
+                    continue
+                if k < m:
+                    fail(f"#18: {kid['cmd'][:40]!r} starts {k}, before its "
+                         f"master at {m}")
+
+    # The same corpus row must render the same STAT in `table` and after
+    # injection: the `s` and `+` flags were derived twice and diverged. The
+    # base state letter is a separate decision (`F_BUSY` is `R` in the table and
+    # only burns CPU after inject with `--busy`), so the comparison is on the
+    # session and terminal flags, which are what #18 split.
+    def tail_flags(stat):
+        return stat[1:]
+
+    planned = {}
+    for r in rows_of(["table", "-n", "300", "-s", "1"]):
+        planned.setdefault(r["cmd"], tail_flags(r["stat"]))
+    if len(planned) < 100:
+        fail(f"#18: the table named only {len(planned)} distinct commands, so "
+             f"the STAT comparison has no population")
+    with tempfile.TemporaryDirectory(prefix="psgen-stat-") as tmp:
+        pf = Path(tmp) / "stat.pid"
+        # `inject --table -n 300` intermittently exits 1 on a healthy host
+        # ("N did not report"), so one failed run is retried rather than
+        # converted into a pass: the assertion is about STAT parity, and a
+        # failed spawn simply did not observe it. Only a run that never
+        # succeeds is a capability problem, and that goes through `skip()` so
+        # PSGEN_REQUIRE_ALL turns it into a failure instead of a silent pass.
+        p, live = None, {}
+        for attempt in range(4):
+            if attempt:
+                time.sleep(0.5)
+            p = run(["inject", "--table", "-n", "300", "-s", "1",
+                     "--pidfile", str(pf), "--no-user", "--no-mem",
+                     "--duration", "2"], check=False)
+            live = {}
+            if p.returncode == 0:
+                for line in p.stdout.splitlines()[1:]:
+                    m = PS_RE.match(line)
+                    if m:
+                        live.setdefault(m.group("cmd"), tail_flags(m.group("stat")))
+                if len(live) >= 100:
+                    break
+            stop_pidfile(pf)
+        try:
+            if p.returncode != 0 or len(live) < 100:
+                detail = (f"rc={p.returncode} after 4 runs, {len(live)} rows, "
+                          f"{p.stderr.strip()[:120]!r}")
+                skip(f"#18 STAT parity needs a working inject: {detail}")
+                return
+            common = sorted(set(planned) & set(live))
+            if len(common) < 100:
+                fail(f"#18: only {len(common)} of {len(live)} injected rows are "
+                     f"in the table, so STAT parity was never compared")
+            for cmd in common:
+                if planned[cmd] != live[cmd]:
+                    fail(f"#18: {cmd[:50]!r} is {planned[cmd] or '(none)'} in table, "
+                         f"{live[cmd] or '(none)'} after inject")
+        finally:
+            stop_pidfile(pf)
+
+
+def can_unshare(cmd: list[str], timeout: int = 60):
+    """Run `cmd` and return the CompletedProcess, or None when unshare is absent."""
+    try:
+        return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True, timeout=timeout)
+    except (FileNotFoundError, PermissionError):
+        return None
+
+
+def cfg_blob(magic: bytes, version: int, *, stage: int, comm: bytes,
+             exe: bytes, cmd: bytes, user: bytes, temp: bytes,
+             self_copy: bytes, nonce: bytes, disk_kb: int) -> bytes:
+    """A config in the wire format one psgen build reads.
+
+    `bf80156` used `PGCFG021`/version 2 and a 96-byte header; the fixed build
+    uses `PGCFG023`/version 3 and adds a nonce length at offset 96. Encoding
+    both lets a regression ask the same question of either binary: what did
+    the process *do* with this descriptor, not just what did it print.
+    """
+    import struct
+
+    header = 104 if magic == b"PGCFG023" else 96
+    hdr = bytearray(header)
+    hdr[:8] = magic
+
+    def w(off, v):
+        struct.pack_into("<I", hdr, off, v)
+
+    w(8, version)
+    w(40, stage)
+    w(44, len(comm))
+    w(48, len(exe))
+    w(52, len(cmd))
+    w(56, len(user))
+    w(60, len(temp))
+    struct.pack_into("<i", hdr, 72, 5)
+    struct.pack_into("<i", hdr, 76, -1)
+    struct.pack_into("<i", hdr, 80, -1)
+    w(88, disk_kb)
+    w(92, len(self_copy))
+    if header == 104:
+        w(96, len(nonce))
+    blob = bytes(hdr) + comm + exe + cmd + user + temp + self_copy
+    if header == 104:
+        blob += nonce
+    return blob
+
+
+class Fd3:
+    """Makes a descriptor available to a child as exactly descriptor 3.
+
+    `pass_fds` keeps only the numbers it is given, and `os.set_inheritable` is
+    applied to those numbers after `preexec_fn` has run, so `dup2(fd, 3)` is
+    reversed unless 3 itself is in the set. The descriptor must therefore *be*
+    3 in the parent, which means saving and restoring whatever was there.
+    """
+
+    def __init__(self, fd: int):
+        self.own_3 = fd != 3
+        self.saved = None
+        if self.own_3:
+            try:
+                self.saved = os.dup(3)
+            except OSError:
+                pass
+            os.dup2(fd, 3)
+
+    def __enter__(self):
+        return 3
+
+    def __exit__(self, *exc):
+        # When the caller's descriptor already was 3 it stays the caller's to
+        # close; closing it here made the call site's `os.close` fail.
+        if not self.own_3:
+            return
+        os.close(3)
+        if self.saved is not None:
+            os.dup2(self.saved, 3)
+            os.close(self.saved)
+
+
+def fd3_run(fd: int, env_extra=None, timeout=2.0):
+    """Start a CLI invocation with `fd` on 3; watch what the process becomes.
+
+    `/proc/PID/exe` is read in a tight loop: a forged `self_copy` that names a
+    shell exits at once when its argv is a command the shell cannot run, so a
+    single sample can miss the exec that did happen.
+    """
+    rc, exes, err, _, _ = fd3_run_observe(fd, env_extra, timeout)
+    return rc, exes, err
+
+
+def fd3_run_observe(fd: int, env_extra=None, timeout=2.0):
+    """Like `fd3_run`, and also return the process's comm and command line.
+
+    A stub renames its comm before it execs and rewrites its argv after, so
+    those are the effects a forged config produces even when `/proc/PID/exe`
+    is the psgen binary for the whole life of the process.
+    """
+    env = dict(os.environ)
+    if env_extra:
+        env.update(env_extra)
+    with Fd3(fd) as cfg_fd:
+        p = subprocess.Popen([str(BIN), "fake-argv-so-a-stub-would-take-it"],
+                             env=env, pass_fds=(cfg_fd,),
+                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    exes = []
+    comm = ""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            exes.append(os.readlink(f"/proc/{p.pid}/exe"))
+        except OSError:
+            pass
+        try:
+            # Keep the last value seen: the comm of the first sample is still
+            # the CLI's, and the stub sets its own only after it is forked.
+            comm = Path(f"/proc/{p.pid}/comm").read_text().strip()
+        except OSError:
+            pass
+        if p.poll() is not None:
+            break
+        time.sleep(0.01)
+    cmdline = ""
+    try:
+        cmdline = Path(f"/proc/{p.pid}/cmdline").read_bytes().replace(
+            b"\0", b" ").decode()
+    except OSError:
+        pass
+    if p.poll() is None:
+        p.kill()
+    try:
+        _, err = p.communicate(timeout=10)
+    except Exception:
+        err = b""
+    return p.returncode, exes, err, comm, cmdline
+
+
+def forged_blob(tmp: Path, nonce: bytes):
+    """A config that names a directory to create, plus the path it names.
+
+    Every #25 shape is fed the same bytes, so a refusal can only be about the
+    descriptor and never about the payload.
+    """
+    attack = Path(tmp) / "attack"
+    blob = cfg_blob(b"PGCFG023", 3, stage=1, comm=b"nginx", exe=b"",
+                    cmd=b"sleep 120", user=b"root",
+                    temp=str(attack).encode(), self_copy=b"/bin/sh",
+                    nonce=nonce, disk_kb=0)
+    return attack, blob
+
+
+def ctypes_fcntl():
+    """`fcntl(2)` through libc, so the seal flags need no Python constant."""
+    import ctypes
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    return lambda fd, cmd, arg: libc.fcntl(fd, cmd, arg)
+
+
+def memfd_blob(blob: bytes, flags: int):
+    """A memfd holding `blob`, or None.
+
+    `Fd3` moves the descriptor it is given onto 3 and closes 3 on exit, so a
+    helper that happens to return 3 must not: descriptor 3 stays reserved for
+    the harness so a caller can tell its own descriptor from the child's.
+    """
+    import ctypes
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    fd = libc.memfd_create(b"psgen-test", flags)
+    if fd < 0:
+        return None
+    if fd == 3:
+        moved = os.dup(3)
+        os.close(3)
+        fd = moved
+    os.write(fd, blob)
+    os.lseek(fd, 0, 0)
+    return fd
+
+
+def check_security_markers(tmp):
+    """Regressions for the pidfile, staging, fd 3, user and check defects."""
+    tmp = Path(tmp)
+    me = os.getpid()
+    cur_boot = boot_id()
+
+    # #7: `inject` must never write a header its own `stop` refuses. With the
+    # boot id unreadable it used to write `boot ` (empty) and spawn anyway;
+    # `stop` then refused the file even with --plan.
+    inner = tmp / "noboot.sh"
+    inner.write_text(
+        "#!/bin/sh\n"
+        "mount --bind /dev/null /proc/sys/kernel/random/boot_id || exit 90\n"
+        f"exec {BIN} inject -n 2 --no-user --no-mem --no-tty --no-threads "
+        f"--pidfile {tmp}/noboot.pid\n")
+    inner.chmod(0o755)
+    p = can_unshare(["unshare", "-Urnm", str(inner)], timeout=120)
+    if p is None or p.returncode == 90:
+        skip("#7 a private mount namespace is needed to hide the boot id")
+    else:
+        spawned = "spawned" in p.stdout
+        if spawned:
+            stop_pidfile(tmp / "noboot.pid")
+            fail("#7: inject wrote a pidfile with no boot id and spawned")
+        if (tmp / "noboot.pid").exists():
+            text = (tmp / "noboot.pid").read_text()
+            (tmp / "noboot.pid").unlink()
+            if text.startswith("# psgen") and " boot \n" in text + "\n":
+                fail("#7: an unusable pidfile was left behind")
+        if p.returncode != 2:
+            fail(f"#7: an unreadable boot id exited {p.returncode}, wanted 2")
+
+    # #7: only the first line is a header. A later `# psgen ...` line is a
+    # comment; it used to be read as a competing boot id, which made a valid
+    # pidfile unstoppable and `--force` did not help.
+    pf = tmp / "annotated.pid"
+    pf.write_text(f"# psgen {VERSION} boot {cur_boot}\n"
+                  "# psgen note: boot order is set elsewhere\n"
+                  f"{me}\t0\tpsgen-test-comm\n")
+    p = run(["stop", "--pidfile", str(pf)], check=False)
+    if "conflicting boot ids" in p.stderr:
+        fail("#7: a later '# psgen' line was read as a conflicting header")
+    if p.returncode != 0:
+        fail(f"#7: an annotated psgen pidfile was refused: {p.stderr.strip()!r}")
+
+    # #7: a pidfile with no psgen header is refused, and --force is the
+    # documented escape hatch. Failing open signalled whatever the file named
+    # and removed whatever a `# temp` line named.
+    victim = subprocess.Popen(["sleep", "120"])
+    outside = tmp / "not-ours"
+    outside.mkdir()
+    (outside / "keep").write_text("x\n")
+    try:
+        # Field 22 is the starttime; the tail starts at field 3, so it is 19.
+        fields = stat_fields(victim.pid) or []
+        if len(fields) < 20:
+            fail("#7: cannot read the victim's starttime from /proc")
+        start = int(fields[19])
+        pf = tmp / "headerless.pid"
+        pf.write_text(f"# temp {outside}\n{victim.pid}\t{start}\t{victim.pid}\n")
+        p = run(["stop", "--pidfile", str(pf)], check=False)
+        if p.returncode == 0:
+            fail("#7: a pidfile with no psgen header was accepted")
+        if victim.poll() is not None:
+            fail("#7: a pidfile with no psgen header stopped a live process")
+        if not outside.exists():
+            fail("#7: a pidfile with no psgen header deleted a directory")
+        # The escape hatch still works.
+        run(["stop", "--pidfile", str(pf), "--force"], check=False)
+        if victim.poll() is None:
+            victim.kill()
+    finally:
+        if victim.poll() is None:
+            victim.kill()
+        victim.wait()
+
+    # #26: a sticky-directory EPERM must name the permission, not NAME_MAX.
+    # The directory must belong to someone else as well as being 1777: its owner
+    # may always rename over a file inside it, so /tmp is the shape that denies
+    # an unprivileged caller. Running as root cannot reproduce it at all.
+    if can_root() and os.geteuid() != 0:
+        ro = Path("/tmp") / f"psgen-sticky-{os.getpid()}.pid"
+        subprocess.run(["sudo", "-n", "install", "-m", "644", "/dev/null",
+                        str(ro)], check=True)
+        p = run(["inject", "-n", "1", "--no-user", "--no-mem", "--no-tty",
+                 "--no-threads", "--pidfile", str(ro)], check=False)
+        if p.returncode != 2:
+            stop_pidfile(ro, root=True)
+            subprocess.run(["sudo", "-n", "rm", "-f", str(ro)], check=False)
+            fail(f"#26: a root-owned pidfile in a sticky dir was accepted: "
+                 f"rc={p.returncode}")
+        if "NAME_MAX" in p.stderr:
+            fail("#26: a sticky-directory EPERM was reported as NAME_MAX")
+        if "permitted" not in p.stderr and "permission" not in p.stderr:
+            fail(f"#26: the sticky-directory failure named no permission "
+                 f"cause: {p.stderr.strip()[:200]!r}")
+        subprocess.run(["sudo", "-n", "rm", "-f", str(ro)], check=False)
+    else:
+        # A root caller cannot reproduce a sticky-directory EPERM at all, so
+        # the assertion needs a specific two-uid shape. That is a capability
+        # like any other: `skip()` fails under PSGEN_REQUIRE_ALL, which is the
+        # only way a root CI container can be told it is running the suite as
+        # the wrong shape instead of passing this check unexercised.
+        skip("#26 sticky-dir EPERM needs an unprivileged caller and root")
+
+    # #26: the preflight must prove the body, not a zero-byte create. A size
+    # limit lets the header through and fails on the rows, which used to leave
+    # a header-only pidfile that `stop` called a clean stop of nothing.
+    small = tmp / "small.pid"
+    import resource
+
+    def cap_fsize():
+        resource.setrlimit(resource.RLIMIT_FSIZE, (1500, 1500))
+        import signal
+        signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+
+    p = subprocess.run([str(BIN), "inject", "-n", "60", "--no-user",
+                        "--no-mem", "--no-tty", "--no-threads",
+                        "--pidfile", str(small)],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                       text=True,
+                       env=dict(os.environ, TMPDIR=str(tmp)),
+                       preexec_fn=cap_fsize, timeout=180)
+    if small.exists():
+        rows = [l for l in small.read_text().splitlines()
+                if l and not l.startswith("#")]
+        spawned = len(re.findall(r"\bspawned \d+ processes", p.stdout))
+        if p.returncode == 0 and spawned and len(rows) < 60:
+            stop_pidfile(small)
+            fail(f"#26: a pidfile with {len(rows)} of 60 rows was accepted")
+        if p.returncode != 0 and rows:
+            stop_pidfile(small)
+            fail(f"#26: a failed run left a {len(rows)}-row pidfile behind")
+        if rows:
+            stop_pidfile(small)
+        else:
+            small.unlink()
+
+    # #5: a marker written in another PID namespace must not be judged here.
+    # The first run is real, in a private PID namespace; a second inject on the
+    # host shares its TMPDIR and its shadow root. PIDs there name unrelated
+    # processes here, so a host prune used to delete a live run's staging.
+    ns_tmp = tmp / "ns"
+    ns_tmp.mkdir()
+    ns_shadow = tmp / "ns-shadow"
+    inner = tmp / "ns-run.sh"
+    inner.write_text(
+        "#!/bin/sh\n"
+        f"cd {ns_tmp} && export TMPDIR={ns_tmp}/t\n"
+        f"exec {BIN} inject -n 2 -s 7 -d 120 --disk 1 --no-root --no-user "
+        f"--no-mem --no-tty --no-threads --shadow-dir {ns_shadow} "
+        f"--pidfile {ns_tmp}/a.pid -q\n")
+    inner.chmod(0o755)
+    ns = None
+    try:
+        ns = subprocess.Popen(["unshare", "-Ur", "-Up", "--mount-proc", "--fork", str(inner)],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True)
+    except (FileNotFoundError, PermissionError):
+        ns = None
+    started = False
+    if ns is not None:
+        for _ in range(150):
+            if list(ns_shadow.glob(".psgen-*")) or (ns_tmp / "a.pid").exists():
+                started = True
+                break
+            if ns.poll() is not None:
+                break
+            time.sleep(0.1)
+    if not started:
+        if ns is not None:
+            if ns.poll() is None:
+                ns.kill()
+            ns.wait()
+        skip("#5 a private PID namespace is required by this check")
+    else:
+        time.sleep(1.0)
+        dirs = list(ns_shadow.glob(".psgen-*")) + list((ns_tmp / "t").glob(".psgen-*"))
+        try:
+            host_pf = tmp / "host.pid"
+            p = run(["inject", "-n", "1", "-s", "3", "--no-user", "--no-mem",
+                     "--no-tty", "--no-threads", "--shadow-dir", str(ns_shadow),
+                     "--pidfile", str(host_pf)],
+                    env=dict(os.environ, TMPDIR=str(ns_tmp / "t")), check=False)
+            stop_pidfile(host_pf)
+            if "pruned" in p.stderr:
+                fail("#5: a host prune judged a live run in another PID "
+                     "namespace")
+            if not [d for d in dirs if d.exists()]:
+                fail("#5: the live namespaced run's staging was removed")
+        finally:
+            subprocess.run(["pkill", "-9", "-f", "psgen-stub"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if ns.poll() is None:
+                ns.kill()
+            try:
+                ns.wait(timeout=15)
+            except Exception:
+                pass
+            for d in list(ns_shadow.glob(".psgen-*")) + list((ns_tmp / "t").glob(".psgen-*")):
+                shutil.rmtree(d, ignore_errors=True)
+            ns_tmp_pf = ns_tmp / "a.pid"
+            if ns_tmp_pf.exists():
+                ns_tmp_pf.unlink()
+
+    # #5: the live marker is append-only. The injector rewrote it with only the
+    # rows that reported a status record, which erased a stub that had recorded
+    # itself but had not reported yet; the prune then deleted the directory
+    # that stub still held open. A large --disk makes a row spend long enough
+    # writing that stopping it leaves it recorded and unreported. The data goes
+    # to the run's own directory and is removed with it: a multi-hundred-MiB
+    # write into a shared tmpfs is not a side effect a check may leave behind.
+    late_tmp = tmp / "late"
+    late_tmp.mkdir()
+    env = dict(os.environ, TMPDIR=str(late_tmp))
+    pf = tmp / "late.pid"
+
+    def marker_pids(root):
+        out = set()
+        for d in root.glob(".psgen-*"):
+            f = d / ".psgen-live"
+            if not f.exists():
+                continue
+            for line in f.read_text().splitlines():
+                if line.strip():
+                    out.add(int(line.split()[0]))
+        return out
+
+    import signal
+    lp = subprocess.Popen([str(BIN), "inject", "-n", "3", "-s", "7", "-d", "60",
+                           "--disk", "96", "--no-user", "--no-mem",
+                           "--no-tty", "--no-threads", "--pidfile", str(pf)],
+                          env=env, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, text=True)
+    ever: set = set()
+    stopped: set = set()
+    deadline = time.time() + 40
+    while time.time() < deadline and lp.poll() is None:
+        now = marker_pids(late_tmp)
+        for pid in sorted(now - stopped):
+            if stopped:
+                break
+            try:
+                os.kill(pid, signal.SIGSTOP)
+                stopped.add(pid)
+            except OSError:
+                pass
+        ever |= now
+        time.sleep(0.005)
+    lp.communicate(timeout=180)
+    final = marker_pids(late_tmp)
+    for pid in ever | final:
+        try:
+            os.kill(pid, signal.SIGCONT)
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    stop_pidfile(pf)
+    # The data these stubs wrote is hundreds of MiB; remove it once they are
+    # gone, so a check never leaves a full tmpfs behind.
+    for d in list(late_tmp.glob(".psgen-*")):
+        shutil.rmtree(d, ignore_errors=True)
+    if not stopped:
+        skip("#5 no stub could be stopped mid-record")
+    else:
+        erased = sorted(ever - final)
+        if erased:
+            fail(f"#5: the injector erased live stubs from the marker: {erased}")
+
+    # #5: the prune must cover every shadow root this run can reach. The
+    # default root is `<dir>/.psgen-stubs`, and a run started from a different
+    # directory left its copy outside the scan. The leftover here is a dead
+    # run's default root under the temporary directory the current run uses.
+    default_root = tmp / "shared-tmp" / ".psgen-stubs"
+    stale = default_root / ".psgen-999999-9000-0"
+    stale.mkdir(parents=True)
+    os.chmod(stale, 0o700)
+    (stale / ".psgen-owner").write_text(f"999999 12345 0\n")
+    (stale / ".psgen-live").write_text(f"999998 67890 0\n")
+    (stale / "psgen-stub").write_text("x")
+    shared_tmp = tmp / "shared-tmp"
+    shared_tmp.mkdir(exist_ok=True)
+    env = dict(os.environ, TMPDIR=str(shared_tmp))
+    subprocess.run([str(BIN), "inject", "-n", "1", "-s", "3", "--no-user",
+                    "--no-mem", "--no-tty", "--no-threads",
+                    "--pidfile", str(tmp / "root.pid")],
+                   cwd=str(tmp), env=env, stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL, timeout=180)
+    stop_pidfile(tmp / "root.pid")
+    if stale.exists():
+        fail("#5: a dead run's default shadow root was never reclaimed")
+
+    # #5: a staging directory owned by another uid is refused with a message
+    # naming the uid, and is never deleted. Root sees no other owner, so this
+    # needs an unprivileged caller.
+    if can_root() and os.geteuid() != 0:
+        foreign = shared_tmp / f".psgen-{os.getpid()}-42-0"
+        subprocess.run(["sudo", "-n", "mkdir", "-m", "700", str(foreign)],
+                       check=False)
+        p = run(["inject", "-n", "1", "-s", "3", "--no-user", "--no-mem",
+                 "--no-tty", "--no-threads", "--pidfile", str(tmp / "d.pid")],
+                env=env, check=False)
+        stop_pidfile(tmp / "d.pid")
+        try:
+            if not foreign.exists():
+                fail("#5: a root-owned staging directory was deleted")
+            if "owned by uid" not in p.stderr:
+                fail("#5: a root-owned staging directory was kept silently")
+        finally:
+            subprocess.run(["sudo", "-n", "rm", "-rf", str(foreign)], check=False)
+    else:
+        skip("#5 the foreign-owner case needs an unprivileged caller")
+
+    # #21: the answer must not depend on the caller's working directory. Two
+    # corpus templates have relative commands, and they used to be resolved
+    # against wherever `check` was run.
+    here = run(["check", "--binaries", "-f", "mail"], check=False).stdout
+    there = subprocess.run([str(BIN), "check", "--binaries", "-f", "mail"],
+                           stdout=subprocess.PIPE, text=True, cwd=str(tmp),
+                           timeout=120).stdout
+    if here != there:
+        fail("#21: check --binaries output depends on the caller's cwd")
+
+    # #21: an absolute path that exists is present. `gen` maps the postfix
+    # binaries to /usr/lib/postfix/sbin, and `inject` runs them from there.
+    qmgr = Path("/usr/lib/postfix/sbin/qmgr")
+    installed_dir = False
+    if can_root():
+        r = subprocess.run(["sudo", "-n", "mkdir", "-p", str(qmgr.parent)],
+                           check=False)
+        if r.returncode == 0:
+            subprocess.run(
+                ["sudo", "-n", "sh", "-c",
+                 f"printf '#!/bin/sh\\nexit 0\\n' > {qmgr} && chmod 755 {qmgr}"],
+                check=False)
+            installed_dir = qmgr.is_file()
+    if installed_dir:
+        try:
+            out = run(["check", "--binaries", "-f", "mail"], check=False).stdout
+            if any(l.startswith("missing: qmgr") for l in out.splitlines()):
+                fail("#21: a mapped binary that inject runs was reported missing")
+        finally:
+            subprocess.run(["sudo", "-n", "rm", "-f", str(qmgr)], check=False)
+    else:
+        skip("#21 installing the mapped path needs root")
+
+    # #21: a directory is not an installed binary. `access(X_OK)` is true for a
+    # searchable directory, so a directory at the mapped path was "found".
+    bluetooth = Path("/usr/lib/bluetooth/bluetoothd")
+    if can_root():
+        r = subprocess.run(["sudo", "-n", "mkdir", "-p", str(bluetooth)],
+                           check=False)
+        if r.returncode == 0:
+            try:
+                out = run(["check", "--binaries"], check=False).stdout
+                if not any(l.startswith("missing: /usr/lib/bluetooth/bluetoothd")
+                           for l in out.splitlines()):
+                    fail("#21: a directory was counted as an installed binary")
+            finally:
+                subprocess.run(["sudo", "-n", "rmdir", str(bluetooth)],
+                               check=False)
+    else:
+        # The same rule without root: a directory on PATH named like a bare
+        # template must not satisfy the lookup.
+        # `next` is a bare-name template with no hardcoded location, so the
+        # only way it can be "found" is a PATH lookup; a directory there must
+        # not satisfy it.
+        probe = tmp / "pathdir"
+        probe.mkdir()
+        (probe / "next").mkdir()
+        out = subprocess.run(
+            [str(BIN), "check", "--binaries"],
+            stdout=subprocess.PIPE, text=True,
+            env=dict(os.environ, PATH=f"{probe}:/usr/bin:/bin"),
+            timeout=120).stdout
+        if not any(l.startswith("missing: next") for l in out.splitlines()):
+            fail("#21: a directory on PATH was counted as an installed binary")
+
+    # #21: the totals must account for every row the flag expanded. The count
+    # the resolver answers for must equal found + missing, and every expanded
+    # row must be either checked or explicitly "not a binary" — a row silently
+    # dropped by the resolver is what hid a name-mapped daemon.
+    out = run(["check", "--binaries"], check=False).stdout
+    got = {}
+    for line in out.splitlines():
+        for key in ("expanded", "binaries found", "binaries missing",
+                    "binaries checked", "binaries not a binary"):
+            if line.startswith(key + ":"):
+                got[key] = int(line.split(":", 1)[1].split()[0])
+    for key in ("expanded", "binaries found", "binaries missing",
+                "binaries checked", "binaries not a binary"):
+        if key not in got:
+            fail(f"#21: check --binaries does not report {key!r}")
+    if got["binaries found"] + got["binaries missing"] != got["binaries checked"]:
+        fail(f"#21: found+missing != checked ({got})")
+    if got["binaries checked"] + got["binaries not a binary"] != got["expanded"]:
+        fail(f"#21: checked+not-a-binary != expanded ({got})")
+
+    # #25 block 1: a stray config on fd 3 leaves a CLI invocation, for both wire
+    # formats. `bf80156` reads the older one, so encoding only the new format
+    # made the old bug unreachable rather than absent. The question is what the
+    # process *became*: a stub renames its comm to the config's name, and a CLI
+    # invocation keeps its own. The comparison is against this binary's own
+    # name as read at test time, so a copy called something else still tests the
+    # boundary rather than the filename, and the positive half (the process
+    # really is the binary that was run) is asserted as well, so a process that
+    # never started cannot pass.
+    own_name = os.path.basename(str(BIN))[:15]
+    bin_id = os.stat(str(BIN))
+
+    def stayed_a_cli(label, fd, attack, extra_env=None):
+        """The process kept its own identity and acted on nothing in the config.
+
+        `/proc/PID/exe`'s object identity is compared with this binary, not with
+        a path: a copy under another name, a shadow copy and the real binary are
+        the same bytes, and a path comparison cannot tell an exec of `/bin/sh`
+        from one of psgen when the shell exits before the first sample.
+        """
+        env = {"PSGEN_NONCE": nonce.decode()}
+        if extra_env:
+            env.update(extra_env)
+        rc, exes, err, comm, _ = fd3_run_observe(fd, env)
+        if comm != own_name:
+            fail(f"#25: {label} turned the process into {comm!r}, not "
+                 f"{own_name!r} (rc={rc}, err={err[:120]!r})")
+        if attack.exists():
+            shutil.rmtree(attack)
+            fail(f"#25: {label} created the directory it named")
+        for e in exes:
+            if not e:
+                continue
+            st = os.stat(e)
+            if (st.st_dev, st.st_ino) != (bin_id.st_dev, bin_id.st_ino):
+                fail(f"#25: {label} executed {e}")
+        if rc == 0:
+            fail(f"#25: {label} was acted on")
+
+    nonce = b"deadbeefdeadbeef"
+    for magic, version in ((b"PGCFG023", 3), (b"PGCFG021", 2)):
+        attack = tmp / f"attack-v{version}"
+        blob = cfg_blob(magic, version, stage=1, comm=b"nginx", exe=b"",
+                        cmd=b"sleep 120", user=b"root",
+                        temp=str(attack).encode(), self_copy=b"/bin/sh",
+                        nonce=nonce, disk_kb=0)
+        cfg = tmp / f"stray-{version}.bin"
+        cfg.write_bytes(blob)
+        fd = os.open(str(cfg), os.O_RDWR)
+        os.unlink(cfg)
+        try:
+            stayed_a_cli(f"a stray fd 3 config (v{version})", fd, attack)
+        finally:
+            os.close(fd)
+
+    # #25 block 2: the descriptor is the trust boundary, not the nonce, the
+    # owner or the mode. Every shape below is refused although it carries the
+    # nonce the process was started with and names a directory to create. The
+    # unlinked file and the `O_TMPFILE` descriptor are what an unprivileged
+    # caller can obtain from an inode that already existed — a file root owns
+    # can be opened, unlinked and passed on, and the result is root-owned and
+    # anonymous — so ownership cannot be the proof. The `fchmod` case is why
+    # the mode cannot be the discriminator: `fchmod(0600)` on an unsealable
+    # memfd used to move it into a class that skipped the seal check.
+    def unlinked(blob):
+        cfg = tmp / "shape-unlinked.bin"
+        cfg.write_bytes(blob)
+        fd = os.open(str(cfg), os.O_RDWR)
+        os.unlink(cfg)
+        return fd
+
+    def tmpfile(blob):
+        path = tmp / "shape-tmpdir"
+        path.mkdir(exist_ok=True)
+        fd = os.open(str(path), os.O_RDWR | os.O_TMPFILE, 0o600)
+        os.write(fd, blob)
+        os.lseek(fd, 0, 0)
+        return fd
+
+    def chmod_plain_memfd(blob):
+        fd = memfd_blob(blob, 0)
+        if fd is not None and fd >= 0:
+            os.fchmod(fd, 0o600)
+        return fd
+
+    for label, factory in (
+            ("unsealed memfd", lambda b: memfd_blob(b, 1)),
+            ("sealable memfd with no seals", lambda b: memfd_blob(b, 3)),
+            ("unsealable memfd after fchmod 0600", chmod_plain_memfd),
+            ("unlinked file", unlinked),
+            ("O_TMPFILE descriptor", tmpfile)):
+        attack, blob = forged_blob(tmp, nonce)
+        try:
+            fd = factory(blob)
+        except (AttributeError, OSError):
+            fd = None
+        if fd is None or fd < 0:
+            skip(f"#25 cannot create a {label}")
+            continue
+        try:
+            stayed_a_cli(f"a forged config on a {label}", fd, attack)
+        finally:
+            os.close(fd)
+
+    # #25 block 3: the control. The refusals prove nothing unless the accepted
+    # shape is still acted on, so a *sealed* memfd carrying the same class of
+    # payload must rename the process. It names this binary as `self_copy`, so
+    # the exec stays a psgen process and the comm is the whole effect under
+    # test; no other binary is involved.
+    attack, blob = forged_blob(tmp, nonce)
+    made = sealed_cfg_blob(blob)
+    if made is None:
+        skip("#25 cannot create a sealed memfd for the control")
+    else:
+        fd = made
+        try:
+            rc, exes, err, comm, _ = fd3_run_observe(
+                fd, {"PSGEN_NONCE": nonce.decode()})
+        finally:
+            os.close(fd)
+        if comm != "nginx":
+            # Deliberately not a skip: a control that is refused means the
+            # refusals above prove nothing about the boundary, so a green run
+            # here would be the vacuity this block exists to prevent.
+            fail(f"#25: a sealed memfd config was not acted on, so the "
+                 f"refusals above prove nothing (comm={comm!r}, "
+                 f"rc={rc}, err={err[:200]!r})")
+        if attack.exists():
+            shutil.rmtree(attack)
+            fail(f"#25: a forged config on a {label} created the directory "
+                 f"it named")
+        for e in exes:
+            if not e:
+                continue
+            st = os.stat(e)
+            if (st.st_dev, st.st_ino) != (bin_id.st_dev, bin_id.st_ino):
+                fail(f"#25: a forged config on a {label} executed {e}")
+        if rc == 0:
+            fail(f"#25: a forged config on a {label} was acted on")
+
+    # #25: the control. The refusals prove nothing unless the accepted shape is
+    # still acted on, so a *sealed* memfd carrying the same class of payload
+    # must rename the process. It names this binary as `self_copy`, so the exec
+    # stays a psgen process and the comm is the whole effect under test; no
+    # other binary is involved.
+    attack, blob = forged_blob(tmp, nonce)
+    made = sealed_cfg_blob(blob)
+    if made is None:
+        skip("#25 cannot create a sealed memfd for the control")
+    else:
+        fd = made
+        try:
+            rc, exes, err, comm, _ = fd3_run_observe(
+                fd, {"PSGEN_NONCE": nonce.decode()})
+        finally:
+            os.close(fd)
+        if comm != "nginx":
+            fail(f"#25: a sealed memfd config was not acted on, so the "
+                 f"refusals above prove nothing (comm={comm!r}, "
+                 f"rc={rc}, err={err[:200]!r})")
+        if attack.exists():
+            shutil.rmtree(attack)
+            fail("#25: the control created the directory it named")
+
+    # #14: `load --disk-util` must fall back when getrandom is denied, like
+    # every other caller. It used to return None and blame the disk.
+    helper = seccomp_helper()
+    if helper is not None:
+        p = subprocess.run([str(helper), "getrandom", str(BIN), "load",
+                            "--disk-util", "1", "--duration", "1"],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           text=True, timeout=180,
+                           env=dict(os.environ, TMPDIR=str(tmp)))
+        if p.returncode != 0:
+            fail(f"#14: load --disk-util under a getrandom denial failed: "
+                 f"rc={p.returncode} {p.stderr.strip()[:200]!r}")
+        if "load disk" not in p.stdout:
+            fail(f"#14: load --disk-util under a getrandom denial printed "
+                 f"{p.stdout.strip()[:120]!r}")
+    else:
+        skip("#14 the seccomp helper is unavailable, so a denied getrandom "
+             "cannot be injected")
+
+    # #14/#23: a `TMPDIR` that cannot be measured must be refused, not waved
+    # through. The free-space guard exists so `load` cannot fill the filesystem
+    # it runs on; a missing directory skipped it and then blamed the disk.
+    p = subprocess.run(
+        [str(BIN), "load", "--disk-util", "9000"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120,
+        env=dict(os.environ, TMPDIR=str(tmp / "no-such-dir")))
+    if p.returncode != 1:
+        fail(f"#23: load with an unmeasurable TMPDIR exited {p.returncode}")
+    if "cannot measure" not in p.stderr and "exceeds the free space" not in p.stderr:
+        fail(f"#23: load with an unmeasurable TMPDIR blamed something else: "
+             f"{p.stderr.strip()[:160]!r}")
+
+    # #20: `--create-users --dry-run` must name the identity the run would
+    # use, and must not advise the flag the caller already passed. A shim
+    # `useradd` on PATH is the whole dependency, so this needs no root.
+    shim = tmp / "useradd-shim"
+    shim.mkdir(exist_ok=True)
+    cfg_tmp = tmp / "cfg-tmp"
+    cfg_tmp.mkdir()
+    logged = tmp / "useradd.log"
+    (shim / "useradd").write_text(
+        "#!/bin/sh\n"
+        f"echo \"$@\" >> {logged}\n"
+        "case \"$*\" in\n"
+        "  *--user-group*) echo 'useradd: group haproxy exists' >&2; exit 9;;\n"
+        "esac\n"
+        "exit 1\n")
+    (shim / "useradd").chmod(0o755)
+    p = subprocess.run(
+        # The mail family names users that a minimal host does not have
+        # (`dovecot`, `postfix`), so the missing-user path is reached without
+        # creating anything.
+        [str(BIN), "inject", "-f", "mail", "-n", "30", "-s", "8", "--user",
+         "--create-users", "--no-exe", "--no-mem", "--no-tty", "--no-threads",
+         "--dry-run", "--plan"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        env=dict(os.environ, PATH=f"{shim}:/usr/bin:/bin",
+                 TMPDIR=str(cfg_tmp)), timeout=180)
+    if "pass --create-users" in p.stderr:
+        fail("#20: --create-users --dry-run advised the flag it was given")
+    if "would create" not in p.stderr:
+        fail(f"#20: --create-users --dry-run named no identity: "
+             f"{p.stderr.strip()[:200]!r}")
+    # A dry run creates nothing.
+    if logged.exists() and logged.read_text().strip():
+        fail("#20: --create-users --dry-run ran useradd")
+
+    # #20: the repair must offer an attempt that works when the group already
+    # exists, every attempt must be tried when all of them fail, and a create
+    # that succeeds without NSS seeing the account must not be retried. These
+    # are invariants of the repair rather than deltas against `ddc6f0c`, which
+    # already had all three; the checks keep them from regressing.
+    logged.write_text("")
+    (shim / "useradd").write_text(
+        "#!/bin/sh\n"
+        f"echo \"$@\" >> {logged}\n"
+        "exit 1\n")
+    (shim / "useradd").chmod(0o755)
+    # `sudo` resets PATH and TMPDIR, so the shim and the private scratch
+    # directory have to be placed after it rather than in `env=`.
+    p = subprocess.run(
+        as_root(["env", f"PATH={shim}:/usr/bin:/bin", f"TMPDIR={cfg_tmp}",
+                 BIN, "inject", "-f", "mail", "-n", "30", "-s", "8",
+                 "--create-users", "--user", "--no-exe", "--no-mem",
+                 "--no-tty", "--no-threads", "--pidfile", str(tmp / "u.pid")]),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        timeout=180)
+    stop_pidfile(tmp / "u.pid")
+    if can_root():
+        runs = [l for l in logged.read_text().splitlines() if l.strip()]
+        if not runs:
+            fail("#20: --create-users as root never invoked useradd")
+        # Every attempt is tried when all of them fail.
+        if len(runs) < 2:
+            fail(f"#20: only {len(runs)} useradd attempt was tried, so the "
+                 f"group-only host cannot be repaired")
+        if not any("--gid" in r for r in runs):
+            fail("#20: no attempt used an existing group, so a host with the "
+                 "group but not the user cannot be repaired")
+
+    # #20: a useradd that succeeds but is invisible to NSS must not be retried.
+    logged.write_text("")
+    (shim / "useradd").write_text(
+        "#!/bin/sh\n"
+        f"echo \"$@\" >> {logged}\n"
+        "exit 0\n")
+    (shim / "useradd").chmod(0o755)
+    if can_root():
+        subprocess.run(
+            as_root(["env", f"PATH={shim}:/usr/bin:/bin", f"TMPDIR={cfg_tmp}",
+                     BIN, "inject", "-f", "mail", "-n", "30", "-s", "8",
+                     "--create-users", "--user", "--no-exe", "--no-mem",
+                     "--no-tty", "--no-threads",
+                     "--pidfile", str(tmp / "v.pid")]),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            timeout=180)
+        stop_pidfile(tmp / "v.pid")
+        # One call per distinct missing name: a family names several users,
+        # but the same name must never be retried after its create succeeded,
+        # because the second attempt can only answer "already exists" and hide
+        # the first error.
+        runs = [l for l in logged.read_text().splitlines() if l.strip()]
+        by_name: dict[str, int] = {}
+        for r in runs:
+            name = r.split("--", 1)[-1].strip() if "--" in r else r.split()[-1]
+            by_name[name] = by_name.get(name, 0) + 1
+        retried = {n: c for n, c in by_name.items() if c > 1}
+        if retried:
+            fail(f"#20: a useradd that succeeded was retried: {retried}")
+    else:
+        skip("#20: the --create-users checks need root or passwordless sudo")
+
+def session_and_tty(pid):
+    """`(sid, tty_nr)` from `/proc/PID/stat`, or None when the row is gone.
+
+    The field indices are `proc(5)`'s: after the parenthesised comm, index 3 is
+    the session id and index 4 the terminal device.
+    """
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    fields = raw[raw.rindex(")") + 2:].split()
+    return int(fields[3]), int(fields[4])
+
+
+def check_session_detach(tmp: Path) -> None:
+    """#3: a row without a tty is not in the caller's session or on its tty.
+
+    `--tty` (the default) only lets a template that carries `F_TTY` keep the pty
+    the stub opens for it. Every other row is a daemon, and a daemon does not
+    share a session or a controlling terminal with the shell that started it.
+    The comparison is against the caller's *own* session id and terminal device,
+    not against a rendered column, so a rendering change cannot satisfy it.
+    """
+    if not can_pty():
+        skip("#3: a pty is needed to tell a tty row from a leak")
+        return
+    caller_sid = os.getsid(0)
+    caller = session_and_tty(os.getpid())
+    caller_tty = caller[1] if caller else 0
+    scratch = Path(tmp) / "t"
+    scratch.mkdir(exist_ok=True)
+    env = dict(os.environ, TMPDIR=str(scratch))
+    pf = Path(tmp) / "sess.pid"
+    try:
+        p = run(["inject", "-f", "mon", "-n", "12", "-s", "3", "-d", "60",
+                 "--no-user", "--no-mem", "--pidfile", str(pf), "-q"],
+                env=env, check=False)
+        if p.returncode != 0:
+            fail(f"#3: inject failed: {p.stderr.strip()[:160]}")
+        pids = read_pids(pf)
+        if not pids:
+            fail("#3: inject recorded no rows")
+        leaked = []
+        for pid in pids:
+            got = session_and_tty(pid)
+            if got is None:
+                continue
+            sid, tty = got
+            if sid == caller_sid:
+                leaked.append((pid, "session"))
+            elif tty != 0 and tty == caller_tty:
+                leaked.append((pid, "tty"))
+        if leaked:
+            fail(f"#3: {len(leaked)} injected rows share the caller's session "
+                 f"or terminal (sid={caller_sid}, tty={caller_tty}): "
+                 f"{leaked[:4]}")
+    finally:
+        stop_pidfile(pf)
+
+
+def check_prune_from_another_cwd(tmp: Path) -> None:
+    """#5: a run's shadow copy is not left in a directory no other run scans.
+
+    The default shadow root was `<cwd>/.psgen-stubs`. A run's working directory
+    is not reproducible by any later run — a cage or container gives each run its
+    own — so nothing could ever name that root again, and every shadow-tier run
+    leaked a copy of the binary. The property that closes it is that the default
+    root does not depend on the working directory: a run from anywhere writes to
+    the one root every run of this caller shares.
+
+    The check reaches the shadow tier by denying `unshare` (the bind tier needs
+    no copy), injects from two different directories, and requires that neither
+    left a default root behind while the shared one received both.
+    """
+    helper = seccomp_helper()
+    if helper is None:
+        skip("#5: a C compiler is needed to reach the shadow tier")
+        return
+    root = Path(tmp) / "cwd"
+    shutil.rmtree(root, ignore_errors=True)
+    a = root / "a"
+    b = root / "b"
+    a.mkdir(parents=True)
+    b.mkdir()
+    shared = root / "t"
+    shared.mkdir()
+    env = dict(os.environ, TMPDIR=str(shared))
+
+    def inject(cwd: Path, count: int, pf: Path):
+        return subprocess.run(
+            [str(helper), "unshare", str(BIN), "inject", "-n", str(count),
+             "-s", "7", "--no-user", "--no-mem", "--no-tty", "--no-threads",
+             "--pidfile", str(pf), "-q"],
+            cwd=str(cwd), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=200)
+
+    try:
+        first = inject(a, 2, a / "a.pid")
+        if first.returncode != 0:
+            skip(f"#5: a shadow-tier run failed: {first.stderr.strip()[:160]}")
+            return
+        # Read the roots before the second run, which reclaims a dead run's
+        # directories: a fixed build removes the first run's copy here, so
+        # looking afterwards cannot tell "never written" from "already pruned".
+        left_a = list(a.glob(".psgen-stubs/.psgen-*"))
+        into_shared = list(shared.glob(".psgen-stubs/.psgen-*"))
+        second = inject(b, 1, b / "b.pid")
+        left_b = list(b.glob(".psgen-stubs/.psgen-*"))
+        for pf in (a / "a.pid", b / "b.pid"):
+            subprocess.run([str(BIN), "stop", "--pidfile", str(pf)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    if second.returncode != 0:
+        fail(f"#5: the second run failed: {second.stderr.strip()[:160]}")
+    stray = left_a + left_b
+    if stray:
+        fail(f"#5: a run wrote its shadow copy into a root no other run scans, "
+             f"so it can never be reclaimed: {[str(p) for p in stray]}")
+    if not into_shared:
+        fail("#5: no shadow-tier run wrote into the shared default root, so the "
+             "check never reached the copy it is about")
+
+
+def check_wait_reclaims_unreported(tmp: Path) -> None:
+    """#5: `--wait` removes the staging of a stub that never reported.
+
+    The rows that report a status record are known to the injector; a stub that
+    is frozen, or that calls `setsid` and leaves the root's process group before
+    its record lands, is known only to the live marker. `--wait` used the marker
+    to decide *whether* to remove a directory but the reported PIDs to decide
+    what to kill, so a stub outside that list kept both itself and its directory
+    alive until something else stopped it.
+
+    The check freezes rows that detach from their root, waits for `--wait` to
+    return, and requires that every frozen row is gone and that no staging
+    directory is left. A refusal to freeze anything is a failure, not a skip:
+    the check exists to prove the cleanup reaches an unreported stub, so a run
+    that never produced one has not tested it.
+    """
+    root = Path(tmp) / "wait"
+    shutil.rmtree(root, ignore_errors=True)
+    (root / "t").mkdir(parents=True)
+    (root / "shadow").mkdir()
+    env = dict(os.environ, TMPDIR=str(root / "t"))
+    pf = root / "a.pid"
+    me = os.getpid()
+    proc = subprocess.Popen(
+        [str(BIN), "inject", "-f", "sys", "-n", "30", "-s", "5", "-d", "5",
+         "--disk", "24", "--no-user", "--no-mem",
+         "--shadow-dir", str(root / "shadow"), "--pidfile", str(pf),
+         "--wait", "-q"],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    def marker_pids() -> set:
+        """Every PID the run's live markers name that still has a `/proc` entry.
+
+        A PID with no entry is already gone, so it need not be looked at again;
+        filtering here keeps the polling loop from re-reading the same marker
+        file hundreds of times a second.
+        """
+        out = set()
+        for d in (list((root / "t").glob(".psgen-*"))
+                  + list((root / "shadow").glob(".psgen-*"))):
+            f = d / ".psgen-live"
+            try:
+                text = f.read_text()
+            except OSError:
+                continue
+            for line in text.splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    out.add(int(line.split()[0]))
+                except ValueError:
+                    continue
+        return {pid for pid in out if Path(f"/proc/{pid}").exists()}
+
+    frozen = set()
+    deadline = time.time() + 45
+    try:
+        while time.time() < deadline and proc.poll() is None:
+            for pid in sorted(marker_pids() - frozen):
+                try:
+                    fields = Path(f"/proc/{pid}/stat").read_text()
+                except OSError:
+                    continue
+                f = fields[fields.rindex(")") + 2:].split()
+                sid, ppid = int(f[3]), int(f[1])
+                # A child row that detached into its own session. A root is a
+                # direct child of the injector, and freezing a root would stop
+                # its subtree from existing rather than leave one worker
+                # unreported.
+                if sid == pid and ppid != proc.pid and pid != me:
+                    try:
+                        os.kill(pid, signal.SIGSTOP)
+                        frozen.add(pid)
+                    except OSError:
+                        pass
+            time.sleep(0.002)
+        proc.communicate(timeout=300)
+        # A frozen process cannot report after `--wait` has killed it, but its
+        # exit is still asynchronous: give the kernel the same bounded window
+        # `stop` allows before judging a signal.
+        for _ in range(100):
+            survivors = [pid for pid in frozen if alive(pid)]
+            if not survivors:
+                break
+            time.sleep(0.02)
+        survivors = [pid for pid in frozen if alive(pid)]
+        left = (list((root / "t").glob(".psgen-*"))
+                + list((root / "shadow").glob(".psgen-*")))
+    finally:
+        for pid in frozen:
+            try:
+                os.kill(pid, signal.SIGCONT)
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        shutil.rmtree(root, ignore_errors=True)
+    if not frozen:
+        fail("#5: no detached stub could be frozen, so --wait's cleanup of an "
+             "unreported stub was not exercised")
+    if survivors:
+        fail(f"#5: --wait left {len(survivors)} frozen stub(s) alive: "
+             f"{survivors[:4]}")
+    if left:
+        fail(f"#5: --wait left {len(left)} staging director(ies) behind after "
+             f"the stub was gone: {[str(p) for p in left][:4]}")
+
+
+def check_stop_refuses_mountpoint(tmp: Path) -> None:
+    """#25/DESIGN §7: `stop` never recurses through a bind mount.
+
+    A bind mount over a `.psgen-N-N-N` name reports the mounted filesystem's
+    metadata, so a root-owned `0700` directory passes every ownership, mode and
+    name arm. `remove_dir_all` then deletes the files *behind* the mount, which
+    the caller never owned. A staging directory this tool created is never a
+    mount point, so refusing one costs nothing legitimate.
+    """
+    if not can_root() or os.geteuid() == 0:
+        skip("#25: the bind-mount check needs an unprivileged caller with sudo")
+        return
+    root = Path(tmp) / "mount"
+    subprocess.run(["sudo", "-n", "rm", "-rf", str(root)], check=False,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    real = root / "real"
+    real.mkdir(parents=True)
+    (real / "rootfile").write_text("keep me\n")
+    target = root / f".psgen-{os.getpid()}-0-0"
+    target.mkdir()
+    subprocess.run(["sudo", "-n", "chown", "-R", "root:root", str(real)], check=True)
+    subprocess.run(["sudo", "-n", "chmod", "700", str(real)], check=True)
+    mounted = False
+    try:
+        m = subprocess.run(["sudo", "-n", "mount", "--bind", str(real), str(target)],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if m.returncode != 0:
+            skip(f"#25: cannot create a bind mount: {m.stderr.strip()[:120]}")
+            return
+        mounted = True
+        pf = root / "forged.pid"
+        pf.write_text(f"# psgen {VERSION} boot {boot_id()}\n# temp {target}\n")
+        p = subprocess.run(as_root([BIN, "stop", "--pidfile", str(pf)]),
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           text=True, timeout=120)
+        left = subprocess.run(["sudo", "-n", "ls", str(real)], stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True).stdout.split()
+        if "rootfile" not in left:
+            fail(f"#25: stop deleted the contents of a bind-mounted directory "
+                 f"({p.stdout.strip()!r} {p.stderr.strip()[:120]!r})")
+    finally:
+        if mounted:
+            subprocess.run(["sudo", "-n", "umount", "-l", str(target)], check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["sudo", "-n", "rm", "-rf", str(root)], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def check_new_gates(tmp: Path) -> None:
