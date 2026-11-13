@@ -445,7 +445,7 @@ case_3_1() {
 	python3 -c '
 import subprocess, sys, time
 p = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(30)",
-                      "line1\nline2", "tab\there", "\x01ctl"])
+                      "line1\nline2", "line3"])
 print(p.pid, flush=True)
 time.sleep(25)
 ' >"$_w/child.pid" 2>"$_w/start.err" &
@@ -481,6 +481,15 @@ time.sleep(25)
 		say "  ps:   $_ref"
 		say "  psgen: $_mine"
 		fail_c "COMMAND is not the line ps renders"
+		return
+	fi
+	# No control byte may reach the table: `ps` maps each to `?`, and a raw one
+	# is what a column parser drops silently. This is checked as a property
+	# rather than against `ps`, because procps renders a tab differently across
+	# versions and the reference here is the host's `ps`, not one release.
+	_ctl=$(LC_ALL=C grep -n '[[:cntrl:]]' "$_w/live" | head -3)
+	if [ -n "$_ctl" ]; then
+		fail_c "a control byte reached the table: $(printf '%s' "$_ctl" | head -1)"
 		return
 	fi
 	# ...and no other row may break the table either: a line that is not a row
