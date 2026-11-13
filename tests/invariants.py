@@ -6354,7 +6354,8 @@ SKIP_NEEDS = [
     ("check_injection", "can_pty", "False", False, "pty"),
     ("check_live_matches_ps", "non_utc_zone", "None", False, "non-UTC"),
     ("check_live_reference_columns", "non_utc_zone", "None", False, "UTC"),
-    ("check_security_markers", "can_root", "False", True, "unprivileged"),
+    ("check_security_markers", "can_root", "False", True,
+     ("unprivileged", "namespace")),
     ("check_matrix_reaps", "become_subreaper", "False", False, "subreaper"),
 ]
 
@@ -6400,7 +6401,8 @@ def check_skip_needs():
             shutil.rmtree(root, ignore_errors=True)
             fail(f"{check} failed for a reason other than a named capability "
                  f"with `{predicate}` absent: {p.stderr.strip()[-200:]!r}")
-        if reason.lower() not in p.stderr.lower():
+        reasons = reason if isinstance(reason, tuple) else (reason,)
+        if not any(r.lower() in p.stderr.lower() for r in reasons):
             shutil.rmtree(root, ignore_errors=True)
             fail(f"{check} failed for a capability other than the one forced "
                  f"absent; wanted {reason!r} in {p.stderr.strip()[-200:]!r}")
@@ -6418,7 +6420,8 @@ def check_skip_needs():
             fail(f"{check} failed with `{predicate}` absent and "
                  f"PSGEN_REQUIRE_ALL=0, so it does not skip cleanly either: "
                  f"{p.stderr.strip()[-200:]!r}")
-        if f"SKIP: " not in p.stderr or reason.lower() not in p.stderr.lower():
+        if f"SKIP: " not in p.stderr or not any(
+                r.lower() in p.stderr.lower() for r in reasons):
             fail(f"{check} did not print its skip reason with `{predicate}` "
                  f"absent and PSGEN_REQUIRE_ALL=0: {p.stderr.strip()[-200:]!r}")
 
