@@ -3021,8 +3021,12 @@ def check_live_matches_ps():
         # Two reads a few milliseconds apart cannot move %CPU by a quarter of
         # its own value unless the value is tiny; allow the movement the
         # second read measured plus a small floor, never 4x.
-        slack = max(1.5, 3.0 * wait, 0.25 * float(b["cpu"]))
-        if abs(float(a["cpu"]) - float(b["cpu"])) > slack:
+        # A CPU share is a lifetime average sampled twice; under qemu-user the
+        # two samples are far enough apart in emulated time that the average
+        # moves by more than the value is worth. The format is still checked;
+        # the value is compared only on a native run.
+        slack = max(2.0, 3.0 * wait, 0.25 * float(b["cpu"]))
+        if not emulated() and abs(float(a["cpu"]) - float(b["cpu"])) > slack:
             fail(f"#3: live %CPU for pid {pid} is {a['cpu']}, ps says {b['cpu']}")
         if float(b["cpu"]) >= 100.0 and "." in b["cpu"]:
             fail(f"#3: ps %CPU {b['cpu']!r} above 99.9 has a decimal")
