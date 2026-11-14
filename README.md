@@ -79,9 +79,13 @@ proves the assets you have are the published ones and says nothing about the
 rest. The raw binary is installed the same way, with `psgen-<target>` in place
 of the tarball.
 
-The crate is published from the release workflow for a final tag only, so
-`cargo install psgen` installs the real tool from that point on. Until then
-the crates.io name holds a `0.0.0` reservation.
+The crate is published from the release workflow for a final tag only. The
+workflow fails when the registry token is unset and, after uploading, checks
+that the registry actually serves the tag's version, so a green release can no
+longer skip the publish. `v0.0.2` was released before that check existed and
+was not published: the registry still holds the `0.0.0` name reservation, so
+`cargo install psgen` installs the reservation rather than the tool. Install
+from the release assets until a release publishes a version.
 
 ## Commands
 
@@ -116,11 +120,11 @@ Defaults and caps:
 
 A cap above the limit prints it on stderr and uses it. `-n 0` means the
 default for every command; for `list` the default is one line per in-scope
-template, so `list`, `list -n 0` and `list -n 0 -p <profile>` print 181 lines
-each, and `list -s N` and `list -n 0 -s N` are byte-identical. At `-n 0` every
-template is in scope, so every profile prints the same 181 command lines; `-p`
-changes the order they are drawn in, and therefore which placeholder values each
-line gets. At a finite count `-p` changes which templates are drawn as well:
+template, so `list` and `list -n 0` print 181 lines, and `list -s N` and
+`list -n 0 -s N` are byte-identical. An explicit `-p` excludes a family its
+profile weights at zero: `list -n 0 -p server` prints 163 lines and `-p dev`
+173, and the template order follows the profile weights. At a finite count `-p`
+changes which templates are drawn as well:
 `list -n 40 -s 7 -p server` and `-p desktop` name 10 of the same templates.
 `list` sorts its lines by default; `--no-sort` keeps draw order, which starts
 with `/sbin/init`.
@@ -159,18 +163,17 @@ Two host properties cap a table, and both are reported with the reason and the
 numbers:
 
 - the PID space. A snapshot cannot show two rows with the same PID, and a PID at
-  or above `pid_max` does not exist, so at most `pid_max - 1` rows can appear
-  beside PID 1. `--host-pid-max N` generates for such a host; a host with
-  `pid_max` below 3 leaves the init row alone.
+  or above `pid_max` does not exist, so at most `pid_max - 1` rows can appear in
+  total, including PID 1. `--host-pid-max N` generates for such a host; a host
+  with `pid_max` below 3 leaves the init row alone.
 - the corpus, for a family whose every row is a fixed command line.
   `--repeat-max` is the explicit override there.
 
 `--host-mem MiB`, `--host-pid-max N` and `--host-uptime S` generate a table for
-a named host instead of this one. `--host-mem` and `--host-pid-max` reject 0
-with exit 2, because 0 means "unknown" inside the fit rules and would silently
-describe this machine instead. They exist so the fit rules can be exercised end
-to end, and so a table can be produced for a machine that is not the one
-running the tool.
+a named host instead of this one. All three reject 0 with exit 2, because 0
+means "unknown" inside the fit rules and would silently describe this machine
+instead. They exist so the fit rules can be exercised end to end, and so a
+table can be produced for a machine that is not the one running the tool.
 
 ### Options by command
 
@@ -206,7 +209,7 @@ than being silently ignored. A mode-selected case is rejected the same way —
 The generator options are `-n/--count`, `-s/--seed`, `-p/--profile` (`server`,
 `dev`, `desktop`) and `-f/--family` (`sys`, `web`, `db`, `ctr`, `dev`, `mon`,
 `sto`, `mail`, `desk`, `net`). `-p` weights which templates `list`, `table` and
-`inject` draw; the defaults table above says what it does to a set and to an
+`inject` draw, and excludes a family the profile gives weight zero; the defaults table above says what it does to a set and to an
 order.
 
 ## The table
@@ -277,7 +280,7 @@ Each stub keeps the template argv set at `execve`, so `ps aux` and
   `/proc/PID/exe` and `/proc/PID/maps` show the template path. A missing path
   gets a temporary `.psgen-<pid>-<row>-<n>` directory; `stop` removes it.
 - **shadow**: a copy of the binary in a per-run directory under
-  `./.psgen-stubs` (or `--shadow-dir`), executed by the stub.
+  `<TMPDIR>/.psgen-stubs` (or `--shadow-dir`), executed by the stub.
   `/proc/PID/exe` shows the shadow path. The directory is
   `.psgen-<pid>-9000-<n>`; the copy is `psgen-stub`.
 - **proc-self**: the stub executes `/proc/self/exe`; `/proc/PID/exe` points at
@@ -295,7 +298,8 @@ The tier is chosen once per run, in this order:
 | otherwise | proc-self, with a warning naming what was denied |
 
 A bind denied in a cage that allows mount namespaces leaves the default
-`./.psgen-stubs` in place, so `/proc/PID/exe` still names a plausible path.
+`<TMPDIR>/.psgen-stubs` in place, so `/proc/PID/exe` still names a plausible
+path.
 
 ### Users, tty and threads
 
@@ -369,12 +373,16 @@ run would create, instead of falling back to the caller's identity.
 `--pidfile FILE` records the run:
 
 ```text
-# psgen <version> boot <boot-id>
+# psgen <version> boot <boot-id> nonce <nonce>
 # temp <absolute-temp-dir>
 <pid>\t<starttime>\t<comm>
 ```
 
-The `# temp` line is conditional: `inject` writes one per staging directory the
+The `nonce` field is part of the header `stop` reads: it is the run nonce, and
+a one-field line is identified by carrying it in the process environment. A
+pidfile written before the header recorded a nonce has no `nonce` field, and
+`stop` then refuses its one-field lines rather than guessing. The `# temp` line
+is conditional: `inject` writes one per staging directory the
 run creates, and creates none when nothing in the run needs a directory. A
 proc-self run therefore has a header and its PID lines only, while a bind run
 whose template executables exist has the same, and a shadow run, a bind run
@@ -405,10 +413,12 @@ signalling:
 
 - a three-field line checks starttime and comm;
 - a two-field line checks starttime;
-- a one-field line checks the exe. That form identifies a proc-self row, or a
-  shadow copy inside a staging directory the caller owns. A one-field line
-  naming a bind-tier row is an error, not a silent skip, because accepting the
-  template path would also accept the host's real daemon.
+- a one-field line matches the run nonce from the header against the process
+  environment. That is the identity; it holds for proc-self, shadow and
+  bind-tier rows alike. A header with no nonce refuses every one-field line,
+  and a process whose environment does not carry the nonce is skipped. The
+  executable is only a diagnostic fallback: a bind-tier exe is named in that
+  skip message, and never makes the line match.
 
 PID 1 is never signalled. Lines are processed deepest PID first, a leader's
 process group is killed so children that never reported are reached, and the
@@ -444,8 +454,8 @@ the injector is gone by then and no `stop` ran. Two paths reclaim them:
   PID lines are already gone, so `stop` reports `stopped 0 processes, skipped N`
   and then removes each `# temp` directory whose marker names nothing alive.
 - The next `inject` prunes before it spawns. It scans the temporary directory,
-  `<cwd>/.psgen-stubs` and `<TMPDIR>/.psgen-stubs`, plus this run's
-  `--shadow-dir`. A stub appends its own identity to the directory's live marker
+  `<TMPDIR>/.psgen-stubs`, the old default `<cwd>/.psgen-stubs`, plus this
+  run's `--shadow-dir`. A stub appends its own identity to the directory's live marker
   before it execs, and the prune keeps a directory while any process in that
   marker is alive or while the owner marker names a live injector. A marker
   records the PID namespace inode, the boot id and a run tag, so a PID from
@@ -453,9 +463,11 @@ the injector is gone by then and no `stop` ran. Two paths reclaim them:
   provably over, and a directory whose owner is gone and whose marker is empty
   is removed. A directory owned by a different uid is reported and left alone.
 
-Because the default shadow root is `<cwd>/.psgen-stubs`, a run started from
-another working directory leaves a copy where a later prune never looks; give
-`--shadow-dir` a fixed path if runs are started from different directories.
+The default shadow root is `<TMPDIR>/.psgen-stubs`, so a later run finds it
+whatever its working directory. The `<cwd>/.psgen-stubs` scan is only for
+leftovers written by an older build. A custom `--shadow-dir` outside the
+temporary directory and this run's own value is the one place a later prune
+will not look; give it a fixed path that every run shares.
 
 `--wait` requires a non-zero `--duration` (exit 2 otherwise). It blocks for the
 duration, then kills each root's process group after a starttime check, signals
@@ -616,9 +628,14 @@ own expression evaluation or the network calls.
 - `lint`: `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets --
   -D warnings`, `cargo test --locked --release`, `cargo package --locked
   --no-verify`, `tests/workflow.sh`, and a unit check that runs
-  `systemd-analyze verify` when the tool exists and greps for
-  `RuntimeDirectory=psgen`, `ExecStop=-`, `ConditionPathExists=/proc/1/stat`
-  and the absence of a nonexistent target.
+  `systemd-analyze verify` when the tool exists, rejects a unit naming the
+  nonexistent `proc-fs-nets.target`, requires
+  `RuntimeDirectory=psgen` and `ConditionPathExists=/proc/1/stat`, and requires
+  an `ExecStop=` line that runs `psgen stop --pidfile` with every such line
+  guarded (the
+  `-` prefix or the `/bin/sh -c` pidfile test). It does not grep for
+  `ExecStop=-`: the cleanup `/bin/rm` line satisfies that whatever the psgen
+  stop looks like.
 - `test`: builds `x86_64-unknown-linux-musl`, stages the binary at
   `target/release/psgen` and runs `tests/smoke.sh`.
 
@@ -657,9 +674,11 @@ cage image from `tests/sand/Containerfile`.
   works once the processes it names are gone; the printed unit removes the
   pidfile in `ExecStop` and keeps the `RuntimeDirectory`, so a restart finds the
   directory and no pidfile.
-- A one-field pidfile line can only identify a proc-self row or a shadow copy
-  in a staging directory the caller owns. Bind-tier rows need the three-field
-  form.
+- A one-field pidfile line is identified by the run nonce from the header,
+  carried in the process environment. A pidfile from before the nonce existed
+  has no one-field form, and a process without the nonce is skipped; neither is
+  guessed at. Bind-tier rows need no special case: the nonce identifies them
+  too.
 - An injected row's terminal is not guaranteed to be `?`. `--tty` (default) gives
   a template the corpus marks as a tty row a real pty and makes it that row's
   controlling terminal, so `ps` shows `pts/N`; `--no-tty` clears the tty and

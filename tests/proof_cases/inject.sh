@@ -137,10 +137,11 @@ proc_ppid() { proc_fields "$1" | cut -d' ' -f2; }
 
 proc_sid() { proc_fields "$1" | cut -d' ' -f4; }
 
-# The tool's own definition of alive: a zombie is already dead.
+# The tool's own definition of alive: a zombie is already dead. The local is
+# named for the helper: `_s` belongs to the callers that hold a staging root.
 alive() {
-	_s=$(proc_state "$1")
-	[ -n "$_s" ] && [ "$_s" != Z ]
+	_alive_state=$(proc_state "$1")
+	[ -n "$_alive_state" ] && [ "$_alive_state" != Z ]
 }
 
 row_pids() {
@@ -314,7 +315,9 @@ case_5() {
 	while [ "$_i" -lt 100 ]; do
 		_c_left=0
 		for _p in $(expired_pids); do
-			[ -d "/proc/$_p" ] && _c_left=$((_c_left + 1))
+			# A zombie is already dead: the timed run is reclaimed when no
+			# non-zombie is left, and PID 1 may not reap on this host.
+			alive "$_p" && _c_left=$((_c_left + 1))
 		done
 		[ "$_c_left" -eq 0 ] && break
 		sleep 0.1

@@ -97,8 +97,8 @@ fn auto_phys_budget_kb() -> u64 {
 }
 
 fn scale_rss(rows: &mut [Proc], budget_kb: u64, base_kb: u64, page_kb: u64) -> f64 {
-    let sum: u64 = rows.iter().map(|p| p.rss as u64).sum();
-    let max = rows.iter().map(|p| p.rss as u64).max().unwrap_or(0);
+    let sum: u64 = rows.iter().map(|p| p.rss).sum();
+    let max = rows.iter().map(|p| p.rss).max().unwrap_or(0);
     let ptes = sum / 512;
     let avail = budget_kb.saturating_sub(base_kb);
     let cost = max.saturating_add(ptes);
@@ -113,7 +113,7 @@ fn scale_rss(rows: &mut [Proc], budget_kb: u64, base_kb: u64, page_kb: u64) -> f
     for p in rows.iter_mut() {
         let v = (p.rss as f64 * factor) as u64;
         let v = v.max(floor);
-        p.rss = crate::table::round_up(v, page_kb).min(u32::MAX as u64) as u32;
+        p.rss = crate::table::round_up(v, page_kb);
     }
     factor
 }
@@ -251,8 +251,8 @@ pub fn prepare(rows: &mut [Proc], args: &Args, create_users: bool) -> Prep {
     let page = sys::page_kb();
     for p in rows.iter_mut() {
         if args.mem {
-            p.vsz = crate::table::round_up(p.vsz as u64, page).min(u32::MAX as u64) as u32;
-            p.rss = crate::table::round_up(p.rss as u64, page).min(u32::MAX as u64) as u32;
+            p.vsz = crate::table::round_up(p.vsz, page);
+            p.rss = crate::table::round_up(p.rss, page);
         } else {
             p.vsz = 0;
             p.rss = 0;
@@ -267,16 +267,16 @@ pub fn prepare(rows: &mut [Proc], args: &Args, create_users: bool) -> Prep {
             for p in rows.iter_mut() {
                 // Leave the base reserve below the template's VSZ, and never
                 // claim an RSS the stub cannot find room for.
-                let cap = (p.vsz as u64).saturating_sub(gen::BASE_RESERVE_KB as u64);
+                let cap = p.vsz.saturating_sub(gen::BASE_RESERVE_KB as u64);
                 let v = target.min(cap.max(page));
-                p.rss = crate::table::round_up(v, page).min(u32::MAX as u64) as u32;
+                p.rss = crate::table::round_up(v, page);
             }
         }
     }
 
     if args.mem_cap_mb > 0 && args.mem {
         let cap = args.mem_cap_mb.saturating_mul(1024);
-        let sum: u64 = rows.iter().map(|p| p.rss as u64).sum();
+        let sum: u64 = rows.iter().map(|p| p.rss).sum();
         if sum > cap && !rows.is_empty() {
             // The 4 MiB per-stub reserve is taken off the cap first; what is
             // left is shared in proportion to each row's RSS above it.
@@ -284,24 +284,22 @@ pub fn prepare(rows: &mut [Proc], args: &Args, create_users: bool) -> Prep {
             let base = floor.saturating_mul(rows.len() as u64);
             if base >= cap {
                 warnings.push(format!(
-                    "--mem-cap {} MiB is at or below the {} MiB floor of {} stubs; the reported RSS will be at least {} MiB",
+                    "--mem-cap {} MiB is at or below the {} MiB floor of {} {}; the reported RSS will be at least {} MiB",
                     args.mem_cap_mb,
                     base / 1024,
                     rows.len(),
+                    if rows.len() == 1 { "stub" } else { "stubs" },
                     base / 1024
                 ));
                 for p in rows.iter_mut() {
-                    p.rss = floor.min(u32::MAX as u64) as u32;
+                    p.rss = floor;
                 }
             } else {
                 let extra = cap - base;
-                let weight: u64 = rows
-                    .iter()
-                    .map(|p| (p.rss as u64).saturating_sub(floor))
-                    .sum();
+                let weight: u64 = rows.iter().map(|p| p.rss.saturating_sub(floor)).sum();
                 for p in rows.iter_mut() {
-                    let v = floor + (p.rss as u64).saturating_sub(floor) * extra / weight;
-                    p.rss = crate::table::round_up(v, page).min(u32::MAX as u64) as u32;
+                    let v = floor + p.rss.saturating_sub(floor) * extra / weight;
+                    p.rss = crate::table::round_up(v, page);
                 }
             }
         }
@@ -313,7 +311,7 @@ pub fn prepare(rows: &mut [Proc], args: &Args, create_users: bool) -> Prep {
             // as the biggest RSS target. A fault past RLIMIT_FSIZE kills the
             // stub with SIGXFSZ, so keep the targets below the limit.
             let cap_kb = (limit / 1024).saturating_sub(16 * 1024);
-            let max = rows.iter().map(|p| p.rss as u64).max().unwrap_or(0);
+            let max = rows.iter().map(|p| p.rss).max().unwrap_or(0);
             if cap_kb < page {
                 warnings.push(
                     "RLIMIT_FSIZE is too small for an RSS arena; memory padding disabled"
@@ -330,8 +328,8 @@ pub fn prepare(rows: &mut [Proc], args: &Args, create_users: bool) -> Prep {
                 ));
                 let v = cap_kb / page * page;
                 for p in rows.iter_mut() {
-                    if p.rss as u64 > v {
-                        p.rss = v as u32;
+                    if p.rss > v {
+                        p.rss = v;
                     }
                 }
             }
@@ -347,22 +345,23 @@ pub fn prepare(rows: &mut [Proc], args: &Args, create_users: bool) -> Prep {
     };
     let mut phys_estimate_kb = 0;
     if args.mem && !rows.is_empty() {
-        let sum: u64 = rows.iter().map(|p| p.rss as u64).sum();
-        let max = rows.iter().map(|p| p.rss as u64).max().unwrap_or(0);
+        let sum: u64 = rows.iter().map(|p| p.rss).sum();
+        let max = rows.iter().map(|p| p.rss).max().unwrap_or(0);
         let ptes = sum / 512;
         let est = max.saturating_add(ptes).saturating_add(base_kb);
         phys_estimate_kb = est;
         if budget > 0 && est > budget && max > 0 {
             phys_scale = scale_rss(rows, budget, base_kb, page);
-            let sum2: u64 = rows.iter().map(|p| p.rss as u64).sum();
-            let max2 = rows.iter().map(|p| p.rss as u64).max().unwrap_or(0);
+            let sum2: u64 = rows.iter().map(|p| p.rss).sum();
+            let max2 = rows.iter().map(|p| p.rss).max().unwrap_or(0);
             phys_estimate_kb = max2.saturating_add(sum2 / 512).saturating_add(base_kb);
         }
         if budget > 0 && phys_estimate_kb > budget {
+            // Integer MiB truncation made this sentence compare 30 with 30
+            // when the gap was below 1 MiB. KiB shows the actual difference.
             warnings.push(format!(
-                "the estimated physical cost is about {} MiB, above the {} MiB budget",
-                phys_estimate_kb / 1024,
-                budget / 1024
+                "the estimated physical cost is about {} KiB, above the {} KiB budget",
+                phys_estimate_kb, budget
             ));
         }
     }
@@ -401,7 +400,7 @@ pub fn prepare(rows: &mut [Proc], args: &Args, create_users: bool) -> Prep {
     // An explicit --cpu target replaces every row's duty cycle and forces the
     // row onto the busy path, including rows the corpus does not normally mark.
     if let Some(pct) = args.cpu_pct {
-        let tenths = (pct.saturating_mul(10)).min(u16::MAX as u32) as u16;
+        let tenths = pct.saturating_mul(10);
         for p in rows.iter_mut() {
             p.cpu = tenths;
             if pct == 0 {
@@ -557,12 +556,12 @@ fn make_config(
             } else {
                 0
             },
-        vsz_kb: p.vsz,
-        rss_kb: p.rss,
+        vsz_kb: p.vsz.min(u32::MAX as u64) as u32,
+        rss_kb: p.rss.min(u32::MAX as u64) as u32,
         uid: p.uid,
         gid: p.gid,
         duration: duration_for(p, args),
-        cpu: p.cpu as u32,
+        cpu: p.cpu,
         stage: 0,
         comm: gen::stub_name(&p.cmd).to_vec(),
         exe: if bind {
@@ -717,8 +716,27 @@ fn pidfile_body(pids: &[i32], temps: &[std::path::PathBuf], nonce: &[u8]) -> Opt
 /// after the fork leaves live stubs with no record. Proving the write works
 /// first, and leaving a valid psgen pidfile behind, makes the later rewrite an
 /// overwrite of a file the caller already has.
+/// The header carries a nonce of its own. A run that dies between this write
+/// and the rewrite leaves a file `stop` can identify as psgen's rather than a
+/// bare header, and the same length is what the preflight proves can be
+/// written.
+fn pending_nonce() -> Vec<u8> {
+    format!(
+        "{:016x}",
+        sys::monotonic_ns() ^ ((sys::getpid() as u64) << 32)
+    )
+    .into_bytes()
+}
+
+/// The exact size of the pending pidfile, for the preflight probe.
+pub fn pending_pidfile_len() -> usize {
+    pidfile_body(&[], &[], &pending_nonce())
+        .map(|b| b.v.len())
+        .unwrap_or(0)
+}
+
 pub fn write_pending_pidfile(path: &[u8]) -> bool {
-    write_pidfile(path, &[], &[], &[]).0
+    write_pidfile(path, &[], &[], &pending_nonce()).0
 }
 
 /// Write the pidfile, falling back to shorter temporary names when the target
@@ -785,6 +803,66 @@ fn write_pidfile(
         }
     }
     (false, libc::ENAMETOOLONG)
+}
+
+/// Lock held while this run may rewrite `path`.
+///
+/// Two injections into one pidfile both passed the live check, then both
+/// renamed their own pending file into place: the second erased the first's
+/// rows and left stubs with no record. `flock` is released by the kernel when
+/// the run dies, so a crash cannot leave a lock that blocks every later run.
+pub struct PidfileLock {
+    _file: std::fs::File,
+}
+
+/// Lock `path` for this run, or fail with `WouldBlock` when another run holds
+/// it. The lock lives beside the pidfile, so two runs that name the same path
+/// coordinate whatever their `TMPDIR`.
+pub fn lock_pidfile(path: &[u8]) -> std::io::Result<PidfileLock> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut lock_path = path.to_vec();
+    lock_path.extend_from_slice(b".lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(Path::new(std::ffi::OsStr::from_bytes(&lock_path)))?;
+    let fd = {
+        use std::os::unix::io::AsRawFd;
+        file.as_raw_fd()
+    };
+    if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(PidfileLock { _file: file })
+}
+
+/// Write the spawned rows beside an unwritable pidfile, so a run whose final
+/// write failed still leaves something `stop` can use.
+pub fn write_pid_sidecar(path: &[u8], pids: &[i32]) -> bool {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let buf = match pidfile_body(pids, &[], &pending_nonce()) {
+        Some(b) => b,
+        None => return false,
+    };
+    let mut side = path.to_vec();
+    side.extend_from_slice(b".spawned");
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(Path::new(std::ffi::OsStr::from_bytes(&side)));
+    match f {
+        Ok(mut f) => f
+            .write_all(buf.as_bytes())
+            .and_then(|()| f.sync_all())
+            .is_ok(),
+        Err(_) => false,
+    }
 }
 
 const OWNER_FILE: &[u8] = b".psgen-owner";
@@ -1331,7 +1409,7 @@ pub fn spawn(rows: &[Proc], args: &Args, prep: &Prep) -> Result<SpawnResult, Str
     }
     let bind = tier == ExeTier::Bind;
 
-    let max_rss = rows.iter().map(|p| p.rss as u64).max().unwrap_or(0);
+    let max_rss = rows.iter().map(|p| p.rss).max().unwrap_or(0);
     let mut arena_fd: i32 = -1;
     if args.mem && max_rss > 0 {
         let fd = sys::anon_file(b"cache", max_rss * 1024);
@@ -1643,8 +1721,8 @@ pub fn spawn(rows: &[Proc], args: &Args, prep: &Prep) -> Result<SpawnResult, Str
         // part of its setup missing. Only a negative status excludes a row.
         if args.verify && args.mem && *status >= 0 && (*id as usize) < rows.len() {
             if let Some((vsz, rss)) = live::read_sizes(*pid) {
-                let want_vsz = rows[*id as usize].vsz as u64;
-                let want_rss = rows[*id as usize].rss as u64;
+                let want_vsz = rows[*id as usize].vsz;
+                let want_rss = rows[*id as usize].rss;
                 if vsz.abs_diff(want_vsz) > tol || rss.abs_diff(want_rss) > tol {
                     mismatches.push((*pid, *id, want_vsz, vsz, want_rss, rss));
                 }
@@ -2121,10 +2199,19 @@ fn stop_depths(lines: &[StopLine]) -> std::collections::BTreeMap<i32, usize> {
 /// again; a zombie leader's process group is still signalled, because it can
 /// hold live members. The count is of distinct PIDs, not of lines.
 pub fn stop(path: &[u8], force: bool, plan: bool, quiet: bool) -> i32 {
-    let text = match sys::read_file_nofollow(path, 1 << 20) {
-        Some(t) => t,
-        None => {
-            sys::err(b"psgen: cannot read pidfile\n");
+    let text = match sys::read_file_nofollow_res(path, 1 << 20) {
+        Ok(t) => t,
+        Err(e) => {
+            // A missing file, a mode-000 file and a directory all used to
+            // print the same bytes, so a caller could not tell a stale
+            // pidfile from a permissions problem. Name both the path and the
+            // errno; the exit status stays 1 for every read failure.
+            let msg = format!(
+                "psgen: cannot read pidfile {}: {}\n",
+                String::from_utf8_lossy(path),
+                e
+            );
+            sys::err(msg.as_bytes());
             return 1;
         }
     };
@@ -2145,27 +2232,28 @@ pub fn stop(path: &[u8], force: bool, plan: bool, quiet: bool) -> i32 {
     let mut temp_dirs: Vec<Vec<u8>> = Vec::new();
     let mut lines: Vec<StopLine> = Vec::new();
     let mut malformed = 0usize;
-    // Only the first line may be a psgen header. Every later line is content:
-    // a `# psgen note: ...` annotation is a comment, not a competing boot id,
-    // and treating it as one used to make a valid pidfile unstoppable, even
-    // with --force.
-    let mut first_content = true;
+    // A psgen header may follow leading comment lines, but not content: a
+    // first line that is any other comment is not a header. Taking every
+    // leading `#` as the header turned a `# note` prepended to a valid file
+    // into an empty boot id, which then read as "from another boot".
+    let mut header_seen = false;
+    let mut content_seen = false;
     for raw in text.split(|b| *b == b'\n') {
         if raw.is_empty() {
             continue;
         }
-        let is_header = first_content && raw[0] == b'#';
-        first_content = false;
         if raw[0] == b'#' {
-            if is_header {
+            if !header_seen && !content_seen && raw.starts_with(b"# psgen") {
                 header_boot = Some(crate::version::pidfile_boot_id(raw).unwrap_or_default());
                 header_nonce = crate::version::pidfile_nonce(raw);
+                header_seen = true;
             }
             if let Some(rest) = raw.strip_prefix(b"# temp ") {
                 temp_dirs.push(str::trim(rest).to_vec());
             }
             continue;
         }
+        content_seen = true;
         match parse_stop_line(raw) {
             Some(l) => lines.push(l),
             None => malformed += 1,

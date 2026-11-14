@@ -77,26 +77,51 @@ pub fn out(buf: &[u8]) {
     }
 }
 
-fn out_failed(e: io::Error) -> ! {
+fn out_message(e: &io::Error) -> Vec<u8> {
     let mut msg = b"psgen: cannot write to stdout: ".to_vec();
     msg.extend_from_slice(e.to_string().as_bytes());
     msg.push(b'\n');
-    let _ = io::stderr().write_all(&msg);
+    msg
+}
+
+fn out_failed(e: io::Error) -> ! {
+    let _ = io::stderr().write_all(&out_message(&e));
     std::process::exit(1)
 }
 
-/// Write to stdout, reporting whether the reader is still there.
+/// What a stdout write means to a generator that may write again.
 ///
-/// A generator that keeps formatting after its reader exited (a `| head`, a
-/// closed pipe) is wasted work; `EPIPE` is the signal to stop.
-pub fn out_checked(buf: &[u8]) -> bool {
-    match io::stdout().write_all(buf) {
-        Ok(()) => true,
-        Err(e) => {
-            let _ = io::stdout().flush();
-            e.kind() != io::ErrorKind::BrokenPipe
-        }
+/// The old boolean conflated two questions: whether to keep generating, and
+/// whether the write succeeded. Only `EPIPE` answers the first; every other
+/// error answers the second with a failure the caller must report. A full
+/// filesystem (`ENOSPC`) used to return `true` and exit 0 with the output
+/// silently lost.
+pub enum OutResult {
+    /// The bytes were accepted.
+    Ok,
+    /// The reader closed the pipe. Not an error, but there is no reader left
+    /// to generate for.
+    ReaderGone,
+    /// The write failed for a reason the caller has to report.
+    Failed(io::Error),
+}
+
+/// Write to stdout and say which of the three outcomes happened.
+pub fn out_checked(buf: &[u8]) -> OutResult {
+    match io::stdout()
+        .write_all(buf)
+        .and_then(|()| io::stdout().flush())
+    {
+        Ok(()) => OutResult::Ok,
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => OutResult::ReaderGone,
+        Err(e) => OutResult::Failed(e),
     }
+}
+
+/// Report a stdout failure the way `out()` does and return the exit code.
+pub fn out_failure(e: io::Error) -> i32 {
+    let _ = io::stderr().write_all(&out_message(&e));
+    1
 }
 
 pub fn err(buf: &[u8]) {
@@ -136,20 +161,28 @@ pub fn read_file(path: &[u8], buf: &mut [u8]) -> Option<usize> {
 }
 
 /// Read at most `max` bytes from `path`, without following a symlink and
-/// without blocking on a FIFO.
-pub fn read_file_nofollow(path: &[u8], max: usize) -> Option<Vec<u8>> {
+/// without blocking on a FIFO, keeping the error for the caller.
+pub fn read_file_nofollow_res(path: &[u8], max: usize) -> io::Result<Vec<u8>> {
     use std::os::unix::fs::OpenOptionsExt;
     let f = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path_of(path))
-        .ok()?;
+        .open(path_of(path))?;
     let mut out = Vec::new();
-    f.take(max as u64 + 1).read_to_end(&mut out).ok()?;
+    f.take(max as u64 + 1).read_to_end(&mut out)?;
     if out.len() > max {
-        return None;
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file is larger than the read limit",
+        ));
     }
-    Some(out)
+    Ok(out)
+}
+
+/// Read at most `max` bytes from `path`, without following a symlink and
+/// without blocking on a FIFO.
+pub fn read_file_nofollow(path: &[u8], max: usize) -> Option<Vec<u8>> {
+    read_file_nofollow_res(path, max).ok()
 }
 
 pub fn read_link(path: &[u8]) -> Option<Vec<u8>> {
@@ -564,6 +597,15 @@ pub fn nanosleep(secs: u64, nanos: u64) {
     }
 }
 
+/// Ignore `SIGXFSZ`, so a write past `RLIMIT_FSIZE` returns `EFBIG` to the
+/// caller instead of killing the process. psgen has to report the pidfile
+/// problem and exit, not die mid-run with live stubs and no record.
+pub fn ignore_sigxfsz() {
+    unsafe {
+        libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+    }
+}
+
 pub fn now_secs() -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
@@ -584,6 +626,24 @@ pub fn monotonic_ns() -> u64 {
         libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
     }
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+/// `CLOCK_BOOTTIME` in nanoseconds, or `None` when the syscall fails.
+///
+/// `/proc/PID/stat`'s `starttime` counts ticks since the host boot, and this
+/// is the clock that advances over suspend, so it is the denominator a `%CPU`
+/// needs. `/proc/uptime` is normally the same clock, but a container whose
+/// procfs is virtualized (lxcfs) makes it disagree.
+pub fn boottime_ns() -> Option<u64> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let r = unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) };
+    if r != 0 || ts.tv_sec < 0 {
+        return None;
+    }
+    Some((ts.tv_sec as u64).saturating_mul(1_000_000_000) + ts.tv_nsec as u64)
 }
 
 pub fn hz() -> u64 {

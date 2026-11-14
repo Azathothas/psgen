@@ -1,5 +1,72 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- `log --lines 0` is a usage error instead of a successful run with no output,
+  and the cap warning names events rather than lines.
+- A `load` run with no utilization option, or with every option at zero, is
+  refused with a message that names the missing or useless values.
+- `load --disk-util` measures the temporary directory before it compares the
+  request with `RLIMIT_FSIZE`, so a missing `TMPDIR` is reported as the cause
+  instead of a second limit hiding it.
+- `inject --plan` prints the staging directories as patterns with the fields
+  filled at spawn, and lists a directory a run would create even when `--disk`
+  is absent but a bind-tier executable is missing.
+- A preview (`--dry-run`, `--plan`, `--json`) refuses a pidfile that records
+  live rows exactly when a real run would.
+- `unit` refuses a pidfile whose final component is `.`, `..`, over `NAME_MAX`
+  or a control byte, and a runtime directory name that is non-UTF-8 or carries
+  a quote or backslash. It also refuses a pidfile more than one directory below
+  `/run` instead of printing a unit that fails at boot.
+- `doctor --json` refuses a pidfile path that is not valid UTF-8, because the
+  JSON string encoder cannot represent it without a collision; the text report
+  escapes a control or invalid byte as `\xNN`.
+- `stop` reports an unreadable pidfile with the path and the OS error, and
+  exits 1. A header may follow leading comment lines but must precede every
+  content line.
+- `--host-pid-max` and `--host-uptime` cover the whole PID range: `3` yields one
+  row beside PID 1, and an uptime of `0` is refused instead of printing a table
+  whose START is before the boot.
+- A VSZ or RSS above 4 GiB is printed at full width instead of clamped to
+  `u32::MAX`, a `/proc/PID/status` larger than 8 KiB is read whole, and a tty
+  name is printed only when the device node exists, so a stale `tty_nr` shows
+  `?`.
+- `%CPU` divides by `CLOCK_BOOTTIME`, which is the clock `/proc` start times are
+  relative to, and warns once when `/proc/uptime` disagrees.
+- `load --mem-util` reads the cgroup limit as the denominator when one applies,
+  and refuses when the current usage under that limit cannot be read.
+- A pidfile is written under an exclusive lock beside it, a second injector is
+  refused while the lock is held, and a run past `RLIMIT_FSIZE` fails with
+  `EFBIG` rather than dying with live stubs and no record. A body that cannot be
+  written after spawning removes the pending file, or leaves a `.spawned`
+  sidecar naming the rows, and exits 1.
+- A profile that gives a family weight zero no longer contributes rows to
+  `table`, `inject` or `list`; a fixed template is a fill candidate with room
+  one, and `--repeat-max 1` reaches the in-scope template count instead of
+  losing slots to collisions.
+- The `list` shortfall warning reports the distinct lines the writer can
+  produce, from the same ranges the writer draws, instead of an estimate that
+  could promise new lines.
+- The capability probe reports a missing temporary directory or a failed fork
+  as "not attempted" instead of as a denial of the capability it names, and
+  `--create-users` resolves `useradd` by absolute path rather than through the
+  caller's `PATH`.
+- A stdout write error other than `EPIPE` exits 1 with the errno instead of
+  reporting a successful run; a closed reader still ends the run quietly.
+- The release workflow fails a final tag when `CARGO_REGISTRY_TOKEN` is unset
+  and verifies with `cargo info` that the registry serves the version before it
+  reports success. The README now says `v0.0.2` is not on crates.io.
+
+### Changed
+
+- An explicit `-p` excludes a family its profile weights at zero; the bare
+  default profile still lists the whole corpus.
+- `--repeat-max` bounds distinct command lines, not templates: a template with
+  a placeholder may supply one line per distinct value, while a fixed command
+  supplies one.
+
 ## 0.0.2
 
 ### Fixed
@@ -56,9 +123,11 @@
   prints `stopped N`. A second `stop` reports `stopped 0 processes`.
 - `stop` signals the deepest PIDs first, so a root's group kill cannot make the
   per-line count depend on scheduling.
-- `stop` refuses a one-field line that names a bind-tier row instead of
-  reporting success without signalling anything; one-field lines stay valid for
-  proc-self rows and for a shadow copy in a staging directory the caller owns.
+- `stop` identifies a one-field line by the run nonce the header records,
+  read from the process environment. That covers proc-self, shadow and
+  bind-tier rows; a header with no nonce refuses one-field lines, and a
+  process without the nonce is skipped. The executable is only named in the
+  skip message, never treated as a match.
 - The pidfile preflight proves the whole write — the body size the writer will
   emit, the mode, the rename and the link count of an existing target — and
   builds exactly the temporary name the writer creates. A basename near

@@ -578,8 +578,10 @@ pub fn run_log(args: &Args) -> i32 {
     // and with --delay 0 the buffer below holds a burst before it is written.
     let hard = args.log_lines.min(MAX_LOG_LINES);
     if args.log_lines > MAX_LOG_LINES {
+        // `--lines` counts events; a weblog burst writes several rows per
+        // event. Calling the cap "log lines" was false by more than 2x.
         let mut out = Buf::new();
-        out.push_str("psgen: log lines capped at ");
+        out.push_str("psgen: log events capped at ");
         out.push_u64(MAX_LOG_LINES as u64);
         out.push(b'\n');
         sys::err(out.as_bytes());
@@ -627,9 +629,11 @@ pub fn run_log(args: &Args) -> i32 {
             emitted.push_bytes(&chunk);
         }
         if args.log_delay_ms > 0 && i + 1 < lines {
-            if !sys::out_checked(emitted.as_bytes()) {
+            match sys::out_checked(emitted.as_bytes()) {
+                sys::OutResult::Ok => {}
                 // The reader is gone. EPIPE is not an error.
-                return 0;
+                sys::OutResult::ReaderGone => return 0,
+                sys::OutResult::Failed(e) => return sys::out_failure(e),
             }
             emitted = Buf::new();
             let ms = args.log_delay_ms / args.speed.max(1);
@@ -638,16 +642,19 @@ pub fn run_log(args: &Args) -> i32 {
             // With no delay the buffer used to grow to the whole output before
             // a single write. Flush on a bound, and stop when the reader has
             // gone even if there is no delay to slow the loop down.
-            if !sys::out_checked(emitted.as_bytes()) {
-                return 0;
+            match sys::out_checked(emitted.as_bytes()) {
+                sys::OutResult::Ok => {}
+                sys::OutResult::ReaderGone => return 0,
+                sys::OutResult::Failed(e) => return sys::out_failure(e),
             }
             emitted = Buf::new();
         }
     }
-    if !sys::out_checked(emitted.as_bytes()) {
-        return 0;
+    match sys::out_checked(emitted.as_bytes()) {
+        sys::OutResult::Ok => 0,
+        sys::OutResult::ReaderGone => 0,
+        sys::OutResult::Failed(e) => sys::out_failure(e),
     }
-    0
 }
 
 /// Burn `pct` percent of one core until `deadline` (monotonic ns), or forever.
@@ -694,11 +701,19 @@ fn touch(ptr: *mut u8, len: usize) {
 }
 
 pub fn run_load(args: &Args) -> i32 {
+    // The clamp and the "was it supplied" question are different: after the
+    // clamp an explicit 0 and an omitted option are the same value, so the
+    // message used to claim an option was missing when all three were given.
+    let supplied = args.load_cpu.is_some() || args.load_mem.is_some() || args.load_disk.is_some();
     let cpu_pct = args.load_cpu.unwrap_or(0).min(100);
     let mem_pct = args.load_mem.unwrap_or(0).min(95);
     let disk_mb = args.load_disk.unwrap_or(0);
-    if cpu_pct == 0 && mem_pct == 0 && disk_mb == 0 {
+    if !supplied {
         sys::err(b"psgen: load needs at least one of --cpu-util, --mem-util, --disk-util\n");
+        return 2;
+    }
+    if cpu_pct == 0 && mem_pct == 0 && disk_mb == 0 {
+        sys::err(b"psgen: all utilization values are zero; set at least one above zero\n");
         return 2;
     }
     let secs = args.duration as u64;
@@ -725,7 +740,32 @@ pub fn run_load(args: &Args) -> i32 {
         // host that is already half full, 95% of total is more than exists
         // free, and the touch loop then invokes the OOM killer against its own
         // caller. Refuse unless the caller says it means it.
-        let avail = util::mem_available_kb();
+        //
+        // MemAvailable is the wrong numerator inside a memory cgroup: the
+        // host can report terabytes free while the cgroup's own limit has a
+        // few MiB left. The limit that will OOM the mapping is the cgroup's,
+        // and the headroom is limit minus what it already charges.
+        let mut avail = util::mem_available_kb();
+        let mut headroom_is_cgroup = false;
+        if cg > 0 {
+            match util::cgroup_mem_current_kb() {
+                Some(cur) => {
+                    let headroom = cg.saturating_sub(cur);
+                    if avail == 0 || headroom < avail {
+                        avail = headroom;
+                    }
+                    headroom_is_cgroup = true;
+                }
+                None => {
+                    let mut out = Buf::new();
+                    out.push_str("psgen: the cgroup limit is ");
+                    out.push_u64(cg / 1024);
+                    out.push_str(" MiB but its current usage cannot be read; --mem-util would be sized against a limit it cannot check\n");
+                    sys::err(out.as_bytes());
+                    return 1;
+                }
+            }
+        }
         if avail > 0 && mem_kb > avail && !args.force {
             let mut out = Buf::new();
             out.push_str("psgen: --mem-util ");
@@ -734,7 +774,11 @@ pub fn run_load(args: &Args) -> i32 {
             out.push_u64(mem_kb / 1024);
             out.push_str(" MiB, above the ");
             out.push_u64(avail / 1024);
-            out.push_str(" MiB MemAvailable; use --force to attempt it anyway\n");
+            out.push_str(if headroom_is_cgroup {
+                " MiB this cgroup can still allocate; use --force to attempt it anyway\n"
+            } else {
+                " MiB MemAvailable; use --force to attempt it anyway\n"
+            });
             sys::err(out.as_bytes());
             return 2;
         }
@@ -779,6 +823,21 @@ pub fn run_load(args: &Args) -> i32 {
     if disk_mb > 0 {
         let dir = std::env::temp_dir();
         let want = disk_mb.saturating_mul(1024 * 1024);
+        let dirb = dir.as_os_str().as_bytes().to_vec();
+        // The directory is measured before anything else: a missing `TMPDIR`
+        // is the cause whether the request is one MiB or nine thousand, and a
+        // limit report would name a second problem while hiding the first.
+        let free = match crate::probe::space(&dirb) {
+            Some((free, _)) => free,
+            None => {
+                let mut out = Buf::new();
+                out.push_str("psgen: --disk-util cannot measure the free space in ");
+                out.push_bytes(&dirb);
+                out.push_str("; create it or set TMPDIR\n");
+                sys::err(out.as_bytes());
+                return 1;
+            }
+        };
         if let Some(limit) = sys::rlimit_fsize() {
             if want > limit {
                 let mut out = Buf::new();
@@ -791,30 +850,18 @@ pub fn run_load(args: &Args) -> i32 {
                 return 1;
             }
         }
-        let dirb = dir.as_os_str().as_bytes().to_vec();
-        // A directory that cannot be measured is refused, not waved through:
-        // the guard exists so `load` cannot fill the filesystem it runs on, and
-        // a missing `TMPDIR` skipped it and then blamed the disk.
-        let free = match crate::probe::space(&dirb) {
-            Some((free, _)) => free,
-            None => {
-                let mut out = Buf::new();
-                out.push_str("psgen: --disk-util cannot measure the free space in ");
-                out.push_bytes(&dirb);
-                out.push_str("; create it or set TMPDIR\n");
-                sys::err(out.as_bytes());
-                return 1;
-            }
-        };
         if want > free.saturating_sub(free / 10) {
+            let usable = free.saturating_sub(free / 10);
             let mut out = Buf::new();
             out.push_str("psgen: --disk-util ");
             out.push_u64(disk_mb);
-            out.push_str(" MiB exceeds the free space in ");
+            out.push_str(" MiB exceeds the usable space in ");
             out.push_bytes(&dirb);
             out.push_str(" (");
+            out.push_u64(usable / 1024 / 1024);
+            out.push_str(" MiB of ");
             out.push_u64(free / 1024 / 1024);
-            out.push_str(" MiB free)\n");
+            out.push_str(" MiB free; 10% is reserved)\n");
             sys::err(out.as_bytes());
             return 1;
         }
@@ -861,9 +908,13 @@ pub fn run_load(args: &Args) -> i32 {
     }
     note.push(b'\n');
     // The summary is information, not a diagnostic: it goes to stdout so
-    // `psgen load ... | tee` shows it, and `-q` suppresses it.
+    // `psgen load ... | tee` shows it, and `-q` suppresses it. A failed write
+    // (a full filesystem) is reported and fails the run; a closed pipe is not.
     if !args.quiet {
-        let _ = sys::out_checked(note.as_bytes());
+        match sys::out_checked(note.as_bytes()) {
+            sys::OutResult::Ok | sys::OutResult::ReaderGone => {}
+            sys::OutResult::Failed(e) => return sys::out_failure(e),
+        }
     }
 
     burn(cpu_pct, deadline);

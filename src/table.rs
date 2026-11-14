@@ -283,13 +283,13 @@ pub fn render(rows: &[Proc], mem_total_kb: u64, clock: &Clock, page_kb: u64) -> 
     out.push_str("USER         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND\n");
     for p in rows {
         let row_start = out.v.len();
-        let vsz = round_up(p.vsz as u64, page_kb);
-        let rss = round_up(p.rss as u64, page_kb);
+        let vsz = round_up(p.vsz, page_kb);
+        let rss = round_up(p.rss, page_kb);
         user_field(&mut out, &p.user);
         out.push(b' ');
         out.push_u64_width(p.pid as u64, 7);
         out.push(b' ');
-        push_pcpu(&mut out, p.cpu as u32);
+        push_pcpu(&mut out, p.cpu);
         out.push(b' ');
         // procps computes `%MEM` as `rss * 1000 / MemTotal` in integer
         // arithmetic, so it truncates rather than rounds: an RSS of 0.377%

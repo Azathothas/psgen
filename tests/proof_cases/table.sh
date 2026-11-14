@@ -921,10 +921,14 @@ case_12_4() {
 	_dirs=$(awk '$1 == "plan:" { for (i = 1; i <= NF; i++) if ($i == "staging") print $(i + 1) }' "$_w/plan")
 	_under=$(awk '$1 == "plan:" { for (i = 1; i <= NF; i++) if ($i == "under") print $(i + 1) }' "$_w/plan")
 	if [ "$_total" != 2 ] || [ "$_dirs" != 2 ] || [ "$_under" != "$_d" ]; then
-		fail_c "the plan says disk '${_total:-none}' MiB over '${_dirs:-none}' staging directories under '${_under:-none}'"
+		fail_c "the plan says disk '${_total:-none}' MiB over '${_dirs:-none}' staging directory patterns under '${_under:-none}'"
 		return
 	fi
-	_stage=$(awk '$1 == "staging" { print $2 }' "$_w/plan" | grep -cF "$_d/.psgen-<pid>-")
+	# The leaf carries the injector's PID and a retry index, neither of which
+	# exists before the spawn, so the plan prints a pattern. The parent is the
+	# real directory the run will use.
+	_stage=$(awk '$1 == "staging" && $2 == "pattern" { print $3 }' "$_w/plan" |
+		grep -cF "$_d/.psgen-<pid>-")
 	if [ "$_stage" -ne 2 ]; then
 		fail_c "the plan named $_stage staging paths under $_d"
 		return
