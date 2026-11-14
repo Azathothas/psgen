@@ -82,6 +82,8 @@ fn parent_of(path: &[u8]) -> &[u8] {
 fn runtime_of(pidfile: &[u8]) -> Result<Runtime, &'static str> {
     const OUTSIDE: &str = "a pidfile must live under /run, in a directory \
 systemd creates for the unit (for example /run/psgen/psgen.pid)";
+    const NESTED: &str = "a pidfile may sit at most one directory below /run: \
+systemd creates one RuntimeDirectory, not a tree";
     if pidfile.iter().any(|b| *b < 0x20 || *b == 0x7f) {
         return Err("the path contains a control byte, which a unit file cannot name");
     }
@@ -92,17 +94,47 @@ systemd creates for the unit (for example /run/psgen/psgen.pid)";
     if rest.is_empty() || rest.ends_with(b"/") {
         return Err(OUTSIDE);
     }
+    let base = match rest.iter().rposition(|b| *b == b'/') {
+        Some(at) => &rest[at + 1..],
+        None => rest,
+    };
+    // The final component is a file name, so it obeys the same rule the
+    // pidfile preflight uses. `/run/.` and `/run/psgen/.` used to pass here
+    // and only fail at boot, when the manager is already running the unit.
+    if let Some(why) = probe::component_problem(base) {
+        return Err(why);
+    }
     match rest.iter().rposition(|b| *b == b'/') {
         None => Ok(Runtime::RunRoot),
         Some(at) => {
             let dir = &rest[..at];
-            if dir.is_empty() || dir.contains(&b'/') {
+            if dir.is_empty() {
+                return Err(OUTSIDE);
+            }
+            if dir.contains(&b'/') {
                 // `/run/user/1000` belongs to a login session: a unit that
                 // named it would have it removed, or re-owned, when it stops.
-                return Err(OUTSIDE);
+                // Anything deeper needs a tree the manager will not create.
+                return Err(NESTED);
             }
             if dir == b"." || dir == b".." || dir.iter().any(|b| *b <= b' ') {
                 return Err("the runtime directory name is not one systemd can create");
+            }
+            if dir.len() > probe::NAME_MAX {
+                return Err("the runtime directory name is longer than NAME_MAX (255 bytes)");
+            }
+            if std::str::from_utf8(dir).is_err() {
+                return Err(
+                    "the runtime directory name is not valid UTF-8, which a unit file cannot carry",
+                );
+            }
+            if dir.iter().any(|b| matches!(b, b'\'' | b'"' | b'\\')) {
+                // `RuntimeDirectory=` is not quoted, so these have no escape
+                // there while `ExecStart=` escapes the same path: one path,
+                // two encoders, disagreeing about what was named.
+                return Err(
+                    "the runtime directory name contains a quote or backslash, which RuntimeDirectory= cannot carry",
+                );
             }
             Ok(Runtime::Named(dir.to_vec()))
         }
@@ -389,5 +421,78 @@ mod tests {
         // A successful stop must remove the pidfile, or the next start is
         // refused as "records live processes" / "not an empty file".
         assert!(stops[1].contains("/run/psgen/psgen.pid"), "{text}");
+    }
+
+    #[test]
+    fn a_dot_component_is_refused_before_the_manager_sees_it() {
+        for path in [
+            &b"/run/."[..],
+            &b"/run/.."[..],
+            &b"/run/psgen/."[..],
+            &b"/run/psgen/.."[..],
+        ] {
+            assert!(
+                runtime_of(path).is_err(),
+                "{} must not name a runtime directory",
+                std::string::String::from_utf8_lossy(path)
+            );
+        }
+    }
+
+    #[test]
+    fn a_component_above_name_max_is_refused() {
+        let long = "a".repeat(256);
+        assert!(runtime_of(format!("/run/{long}/x.pid").as_bytes()).is_err());
+        // A 256-byte basename is refused too, even though its parent is the
+        // runtime directory the unit would create.
+        let name = format!("/run/psgen/{}.pid", "b".repeat(252));
+        assert!(!name.is_empty());
+        assert!(
+            runtime_of(name.as_bytes()).is_err(),
+            "a basename above NAME_MAX must be refused"
+        );
+        // 255 bytes is the limit, not a byte less.
+        let dir = "a".repeat(255);
+        assert!(matches!(
+            runtime_of(format!("/run/{dir}/x.pid").as_bytes()),
+            Ok(Runtime::Named(_))
+        ));
+        let base = format!("{}.pid", "b".repeat(251));
+        assert!(matches!(
+            runtime_of(format!("/run/psgen/{base}").as_bytes()),
+            Ok(Runtime::Named(_))
+        ));
+    }
+
+    #[test]
+    fn a_runtime_name_a_unit_cannot_carry_is_refused() {
+        // 0xFF is not UTF-8; systemd rejects the assignment as not UTF-8 clean.
+        assert!(runtime_of(b"/run/a\xffb/x.pid").is_err());
+        for &byte in b"'\"\\" {
+            let mut path = b"/run/a".to_vec();
+            path.push(byte);
+            path.extend_from_slice(b"b/x.pid");
+            assert!(
+                runtime_of(&path).is_err(),
+                "a {:?} in the runtime name must be refused",
+                byte as char
+            );
+        }
+        // A `%` is a specifier but has a literal form, so it stays accepted.
+        assert!(matches!(
+            runtime_of(b"/run/a%25b/x.pid"),
+            Ok(Runtime::Named(_))
+        ));
+    }
+
+    #[test]
+    fn a_nested_pidfile_names_the_one_directory_rule() {
+        match runtime_of(b"/run/x/y/z.pid") {
+            Err(why) => assert!(
+                why.contains("at most one directory"),
+                "the refusal must name the real rule: {why}"
+            ),
+            Ok(_) => panic!("a two-level pidfile must be refused"),
+        }
     }
 }

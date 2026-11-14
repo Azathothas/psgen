@@ -16,6 +16,9 @@ pub struct Check {
     pub ok: bool,
     pub errno: i32,
     pub detail: Vec<u8>,
+    /// The probe could not fork, so the check never ran. A failure reported
+    /// here is the process limit, not the capability the check names.
+    pub not_attempted: bool,
 }
 
 impl Check {
@@ -25,6 +28,7 @@ impl Check {
             ok,
             errno,
             detail: detail.to_vec(),
+            not_attempted: false,
         }
     }
 }
@@ -37,13 +41,18 @@ fn errno() -> i32 {
 ///
 /// The child never touches the parent's memory, so a probe that calls
 /// `unshare` or `setuid` cannot leave the caller in a modified state.
-fn in_child<F>(f: F) -> (bool, i32)
+///
+/// The third value is true when the probe could not fork at all, which is a
+/// process limit rather than the capability being tested. A closure may return
+/// a negative errno to mean "precondition failed"; the caller can then name the
+/// precondition instead of the syscall the check would have made.
+fn in_child<F>(f: F) -> (bool, i32, bool)
 where
     F: FnOnce() -> Result<(), i32>,
 {
     let mut fds = [0i32; 2];
     if !sys::pipe2(&mut fds, 0) {
-        return (false, errno());
+        return (false, errno(), true);
     }
     let pid = sys::fork();
     if pid == 0 {
@@ -52,14 +61,14 @@ where
             Ok(()) => (true, 0i32),
             Err(e) => (false, e),
         };
-        let raw = (e.max(0) as u32).to_le_bytes();
+        let raw = e.to_le_bytes();
         sys::write_fd(fds[1], &raw);
         sys::exit(if ok { 0 } else { 1 });
     }
     sys::close(fds[1]);
     if pid < 0 {
         sys::close(fds[0]);
-        return (false, errno());
+        return (false, errno(), true);
     }
     let mut raw = [0u8; 4];
     let n = sys::read_fd(fds[0], &mut raw);
@@ -67,18 +76,14 @@ where
     let mut status = 0;
     let r = sys::waitpid(pid, &mut status);
     let ok = r == pid && sys::wait_exit_code(status) == Some(0);
-    let e = if n == 4 {
-        u32::from_le_bytes(raw) as i32
-    } else {
-        0
-    };
-    (ok, e)
+    let e = if n == 4 { i32::from_le_bytes(raw) } else { 0 };
+    (ok, e, false)
 }
 
 fn check_pty() -> Check {
     // A seccomp policy that returns KILL for an unexpected syscall must kill
     // the probe child, not psgen. The parent then reports DENY.
-    let (ok, e) = in_child(|| {
+    let (ok, e, _) = in_child(|| {
         let fd = sys::open(
             b"/dev/ptmx",
             sys::O_RDWR | sys::O_NOCTTY | sys::O_CLOEXEC,
@@ -115,7 +120,7 @@ fn check_pty() -> Check {
 /// the failure to every row. The probe therefore performs the exact sequence
 /// the injector does.
 fn check_memfd() -> Check {
-    let (ok, e) = in_child(|| {
+    let (ok, e, not_attempted) = in_child(|| {
         let fd = sys::memfd_create(b"psgen-probe", libc::MFD_ALLOW_SEALING);
         if fd < 0 {
             return Err(errno());
@@ -130,16 +135,20 @@ fn check_memfd() -> Check {
             Err(e)
         }
     });
-    Check::new(
-        "memfd",
-        ok,
-        e,
-        if ok {
-            b"memfd_create with MFD_ALLOW_SEALING, ftruncate and F_ADD_SEALS"
-        } else {
-            b"memfd_create with MFD_ALLOW_SEALING, ftruncate or F_ADD_SEALS unavailable"
-        },
-    )
+    let detail = memfd_detail(ok, not_attempted);
+    let mut c = Check::new("memfd", ok, e, &detail);
+    c.not_attempted = not_attempted;
+    c
+}
+
+fn memfd_detail(ok: bool, not_attempted: bool) -> Vec<u8> {
+    if ok {
+        b"memfd_create with MFD_ALLOW_SEALING, ftruncate and F_ADD_SEALS".to_vec()
+    } else if not_attempted {
+        b"the probe could not fork, so memfd_create was not tried".to_vec()
+    } else {
+        b"memfd_create with MFD_ALLOW_SEALING, ftruncate or F_ADD_SEALS unavailable".to_vec()
+    }
 }
 
 fn check_proc_exe() -> Check {
@@ -151,7 +160,7 @@ fn check_proc_exe() -> Check {
 }
 
 fn check_mount_ns() -> Check {
-    let (ok, e) = in_child(|| {
+    let (ok, e, _) = in_child(|| {
         // Test the exact function the stub uses, so the verdict cannot drift
         // from the behaviour it predicts.
         if crate::stub::enter_mount_ns() {
@@ -179,14 +188,35 @@ fn check_mount_ns() -> Check {
     )
 }
 
+/// Whether the bind probe has somewhere to create its two files.
+///
+/// A missing, non-directory or unwritable temp dir is a precondition of the
+/// probe, not of a bind mount: the old code reported the `open` errno as
+/// `bind_mount DENY` and the reader went looking for a mount problem that did
+/// not exist. A negative errno is returned so the caller can tell the two
+/// apart.
+fn temp_dir_ready(dir: &Path) -> Result<(), i32> {
+    match std::fs::metadata(dir) {
+        Ok(m) if m.is_dir() => {}
+        Ok(_) => return Err(libc::ENOTDIR),
+        Err(e) => return Err(e.raw_os_error().unwrap_or(1).abs()),
+    }
+    let p = dir.as_os_str().as_bytes();
+    if !sys::access(p, sys::W_OK | sys::X_OK) {
+        return Err(errno());
+    }
+    Ok(())
+}
+
 fn check_bind_mount() -> Check {
-    let (ok, e) = in_child(|| {
+    let dir = std::env::temp_dir();
+    let (ok, e, not_attempted) = in_child(|| {
         // Test the exact function the stub uses, so the verdict cannot drift
         // from the behaviour it predicts.
         if !crate::stub::enter_mount_ns() {
             return Err(errno());
         }
-        let dir = std::env::temp_dir();
+        temp_dir_ready(&dir).map_err(|e| -e)?;
         let a = dir.join(format!(".psgen-probe-a-{}", sys::getpid()));
         let b = dir.join(format!(".psgen-probe-b-{}", sys::getpid()));
         let ab = a.as_os_str().as_bytes().to_vec();
@@ -216,23 +246,35 @@ fn check_bind_mount() -> Check {
         }
         Ok(())
     });
-    Check::new(
-        "bind_mount",
-        ok,
-        e,
-        if ok {
-            b"bind inside a private mount namespace"
-        } else {
-            b"bind inside a namespace failed"
-        },
-    )
+    let errno_abs = e.abs();
+    let detail = bind_detail(ok, not_attempted, e, &dir);
+    let mut c = Check::new("bind_mount", ok, errno_abs, &detail);
+    c.not_attempted = not_attempted;
+    c
+}
+
+fn bind_detail(ok: bool, not_attempted: bool, e: i32, dir: &Path) -> Vec<u8> {
+    if ok {
+        b"bind inside a private mount namespace".to_vec()
+    } else if not_attempted {
+        b"the probe could not fork, so the bind was not attempted".to_vec()
+    } else if e < 0 {
+        format!(
+            "temporary directory {} is missing, not a directory or not writable (errno {}); the bind was not attempted",
+            dir.display(),
+            e.abs()
+        )
+        .into_bytes()
+    } else {
+        b"bind inside a namespace failed".to_vec()
+    }
 }
 
 fn check_user_switch() -> Check {
     if sys::geteuid() != 0 {
         return Check::new("user_switch", false, 1, b"not root");
     }
-    let (ok, e) = in_child(|| {
+    let (ok, e, _) = in_child(|| {
         sys::setgroups(&[]);
         if !sys::setgid(65534) {
             return Err(errno());
@@ -258,7 +300,7 @@ fn check_user_switch() -> Check {
 }
 
 fn check_fork() -> Check {
-    let (ok, e) = in_child(|| Ok(()));
+    let (ok, e, _) = in_child(|| Ok(()));
     Check::new(
         "fork",
         ok,
@@ -272,7 +314,7 @@ fn check_fork() -> Check {
 }
 
 fn check_prctl() -> Check {
-    let (ok, e) = in_child(|| {
+    let (ok, e, _) = in_child(|| {
         if sys::prctl_set_name(b"psgen-probe") {
             Ok(())
         } else {
@@ -382,6 +424,9 @@ pub struct Caps {
     pub root: bool,
     pub pty: bool,
     pub memfd: bool,
+    /// The memfd probe never ran because the probe could not fork. The
+    /// capability is unknown rather than denied, and the warning must say so.
+    pub memfd_untested: bool,
     pub mount_ns: bool,
     pub bind_mount: bool,
     pub user_switch: bool,
@@ -394,6 +439,11 @@ pub fn caps() -> Caps {
         root: sys::geteuid() == 0,
         pty: get("pty").unwrap_or(false),
         memfd: get("memfd").unwrap_or(false),
+        memfd_untested: checks
+            .iter()
+            .find(|c| c.name == "memfd")
+            .map(|c| c.not_attempted)
+            .unwrap_or(false),
         mount_ns: get("mount_ns").unwrap_or(false),
         bind_mount: get("bind_mount").unwrap_or(false),
         user_switch: get("user_switch").unwrap_or(false),
@@ -439,6 +489,14 @@ pub const PIDFILE_RETRIES: u64 = 16;
 /// must fit, so a filesystem that cannot hold it fails before the first fork.
 pub const PIDFILE_PROBE_BYTES: usize = 64 * 1024;
 
+/// The size the pre-spawn preflight writes when the caller has no exact body.
+///
+/// The pending file is a header and nothing else (about 100 bytes), so a
+/// 64 KiB allocation test rejects a file that fits: `RLIMIT_FSIZE` of 32 KiB
+/// failed the probe and left the caller with a `SIGXFSZ` and no pidfile. A
+/// caller that knows its body passes the exact length instead.
+pub const PIDFILE_PENDING_BYTES: usize = 256;
+
 /// The temporary name `write_pidfile` creates for `path` at `level`.
 ///
 /// `pidfile_creatable` and `write_pidfile` both call this, so the preflight
@@ -454,6 +512,29 @@ pub fn pidfile_temp_name(path: &[u8], level: usize, nonce: u64) -> Vec<u8> {
         _ => cand.extend_from_slice(format!("t{}", sys::getpid()).as_bytes()),
     }
     cand
+}
+
+/// The length limit for one path component on the filesystems psgen targets.
+/// ext4, xfs, btrfs and tmpfs all use 255; a filesystem with a smaller limit
+/// reports `ENAMETOOLONG` from the write probe, which `inject` still surfaces.
+pub const NAME_MAX: usize = 255;
+
+/// Why one path component cannot name a file, if it cannot.
+///
+/// `unit` and the pidfile preflight share this rule so a path `inject` refuses
+/// cannot be printed into a unit that would fail at every boot.
+pub fn component_problem(component: &[u8]) -> Option<&'static str> {
+    if component.is_empty() {
+        Some("the path ends in a slash or has an empty component")
+    } else if component == b"." || component == b".." {
+        Some("a path component is `.` or `..`, which names a directory")
+    } else if component.len() > NAME_MAX {
+        Some("a path component is longer than NAME_MAX (255 bytes)")
+    } else if component.iter().any(|b| *b < 0x20 || *b == 0x7f) {
+        Some("the path contains a control byte")
+    } else {
+        None
+    }
 }
 
 /// Why a pidfile path cannot be used, when it cannot.
@@ -522,6 +603,12 @@ pub fn pidfile_target_ok(path: &[u8]) -> bool {
 /// `rename(2)` is the operation that fails in a sticky directory when the
 /// caller owns the temporary file but the target belongs to another user.
 pub fn pidfile_creatable_errno(path: &[u8]) -> i32 {
+    pidfile_creatable_errno_bytes(path, PIDFILE_PENDING_BYTES)
+}
+
+/// `pidfile_creatable_errno`, proving a write of `bytes` rather than of the
+/// default pending size.
+pub fn pidfile_creatable_errno_bytes(path: &[u8], bytes: usize) -> i32 {
     let path = path.strip_suffix(&[0]).unwrap_or(path);
     if path.is_empty() {
         return libc::EINVAL;
@@ -530,7 +617,12 @@ pub fn pidfile_creatable_errno(path: &[u8]) -> i32 {
         Ok(()) => {}
         Err(e) => return e,
     }
-    pidfile_write_errno(path)
+    pidfile_write_errno(path, bytes)
+}
+
+/// Whether a pidfile may be created, proving a write of `bytes`.
+pub fn pidfile_creatable_bytes(path: &[u8], bytes: usize) -> bool {
+    pidfile_creatable_errno_bytes(path, bytes) == 0
 }
 
 /// The reasons a pidfile path is unusable that do not depend on writing: an
@@ -540,6 +632,15 @@ pub fn pidfile_shape_errno(path: &[u8]) -> Result<(), i32> {
     let path = path.strip_suffix(&[0]).unwrap_or(path);
     if path.is_empty() {
         return Err(libc::EINVAL);
+    }
+    let base = match path.iter().rposition(|b| *b == b'/') {
+        Some(at) => &path[at + 1..],
+        None => path,
+    };
+    // Only the length is decided here. A `.` or `..` component still reaches
+    // the real probe, whose `EISDIR` describes what actually failed.
+    if base.len() > NAME_MAX {
+        return Err(libc::ENAMETOOLONG);
     }
     match pidfile_target(path) {
         Ok(()) => {}
@@ -560,7 +661,7 @@ pub fn pidfile_shape_errno(path: &[u8]) -> Result<(), i32> {
 }
 
 /// The reasons the write itself would fail, proved by performing it.
-fn pidfile_write_errno(path: &[u8]) -> i32 {
+fn pidfile_write_errno(path: &[u8], bytes: usize) -> i32 {
     let flags = sys::O_WRONLY | sys::O_CREAT | sys::O_EXCL | sys::O_NOFOLLOW;
     let body = [0u8; 4096];
     for level in 0..pidfile_temp_levels() {
@@ -580,7 +681,7 @@ fn pidfile_write_errno(path: &[u8]) -> i32 {
                     None => return libc::EIO,
                 }
             }
-            let errno = probe_pidfile_body(fd, &body, path, level, nonce);
+            let errno = probe_pidfile_body(fd, &body, path, level, nonce, bytes);
             sys::close(fd);
             let _ = std::fs::remove_file(Path::new(OsStr::from_bytes(&name)));
             return errno;
@@ -593,8 +694,15 @@ fn pidfile_write_errno(path: &[u8]) -> i32 {
 }
 
 /// Fill and rename one probe file, returning 0 or the errno that failed.
-fn probe_pidfile_body(fd: i32, body: &[u8], path: &[u8], level: usize, nonce: u64) -> i32 {
-    let mut left = PIDFILE_PROBE_BYTES;
+fn probe_pidfile_body(
+    fd: i32,
+    body: &[u8],
+    path: &[u8],
+    level: usize,
+    nonce: u64,
+    bytes: usize,
+) -> i32 {
+    let mut left = bytes.clamp(1, PIDFILE_PROBE_BYTES);
     while left > 0 {
         let n = left.min(body.len());
         if !sys::write_fd(fd, &body[..n]) {
@@ -736,5 +844,54 @@ mod tests {
         let _ = std::fs::remove_file(&probe);
         // An absent target is replaceable too.
         assert!(pidfile_replaceable(&bytes));
+    }
+
+    #[test]
+    fn a_missing_temp_directory_is_a_precondition_not_a_bind_failure() {
+        let base = std::env::temp_dir().join(format!(".psgen-test-{}-td", sys::getpid()));
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(temp_dir_ready(&base.join("missing")), Err(libc::ENOENT));
+        std::fs::create_dir_all(&base).unwrap();
+        let file = base.join("file");
+        std::fs::write(&file, b"x").unwrap();
+        assert_eq!(temp_dir_ready(&file), Err(libc::ENOTDIR));
+        assert_eq!(temp_dir_ready(&base), Ok(()));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_precondition_failure_names_the_directory_not_a_bind() {
+        let dir = Path::new("/nonexistent-tmp-for-psgen");
+        let d = bind_detail(false, false, -libc::ENOENT, dir);
+        let text = String::from_utf8_lossy(&d);
+        assert!(text.contains("/nonexistent-tmp-for-psgen"), "{}", text);
+        assert!(text.contains("not attempted"), "{}", text);
+        assert!(!text.contains("bind inside a namespace failed"), "{}", text);
+        // The three other outcomes stay distinct.
+        assert_eq!(
+            bind_detail(false, true, libc::EAGAIN, dir),
+            b"the probe could not fork, so the bind was not attempted".to_vec()
+        );
+        assert_eq!(
+            bind_detail(false, false, libc::EPERM, dir),
+            b"bind inside a namespace failed".to_vec()
+        );
+        assert_eq!(
+            bind_detail(true, false, 0, dir),
+            b"bind inside a private mount namespace".to_vec()
+        );
+    }
+
+    #[test]
+    fn a_fork_failure_is_not_reported_as_a_memfd_denial() {
+        assert_eq!(
+            memfd_detail(false, true),
+            b"the probe could not fork, so memfd_create was not tried".to_vec()
+        );
+        let denied = memfd_detail(false, false);
+        let text = String::from_utf8_lossy(&denied);
+        assert!(text.contains("unavailable"), "{}", text);
+        assert!(!text.contains("fork"), "{}", text);
+        assert!(memfd_detail(true, false).ends_with(b"F_ADD_SEALS"));
     }
 }

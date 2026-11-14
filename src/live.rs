@@ -121,17 +121,46 @@ fn status_number(rest: &[u8]) -> u64 {
     str::parse_u64(&rest[..end]).unwrap_or(0)
 }
 
+/// A `/proc/PID/status` that grows past this is not a status file. The
+/// kernel writes the `Vm*` fields after `Groups:`, one entry per supplementary
+/// group, so a fixed 8 KiB read silently lost VSZ and RSS on a process with
+/// enough groups. 1 MiB is far past any real file.
+const STATUS_MAX: usize = 1 << 20;
+
 fn read_status(pid: i32) -> Option<Status> {
     let path = proc_path(pid, b"/status");
-    let mut buf = [0u8; 8192];
-    let n = sys::read_file(&path, &mut buf)?;
+    let text = match sys::read_file_nofollow(&path, STATUS_MAX) {
+        Some(t) => t,
+        None => {
+            // A process that exits during the scan has no status file, which
+            // is not a defect. Only a file that exists and still cannot be
+            // read whole is reported, because then the row's VSZ and RSS
+            // would be zero without saying so.
+            if std::fs::metadata(Path::new(OsStr::from_bytes(&path))).is_ok() {
+                let mut b = Buf::new();
+                b.push_str("psgen: cannot read /proc/");
+                b.push_u64(pid as u64);
+                b.push_str("/status within ");
+                b.push_u64(STATUS_MAX as u64);
+                b.push_str(" bytes; VSZ, RSS and locked memory are 0 for that row\n");
+                sys::err(&b.v);
+            }
+            return None;
+        }
+    };
+    Some(parse_status(&text))
+}
+
+/// Parse `/proc/PID/status` fields the table needs. Kept separate from the
+/// read so a synthetic file past any fixed buffer can be tested.
+fn parse_status(text: &[u8]) -> Status {
     let mut st = Status {
         vsz: 0,
         rss: 0,
         euid: 0,
         vmlck: 0,
     };
-    for line in buf[..n].split(|b| *b == b'\n') {
+    for line in text.split(|b| *b == b'\n') {
         if str::starts_with(line, b"VmSize:") {
             st.vsz = status_number(&line[7..]);
         } else if str::starts_with(line, b"VmRSS:") {
@@ -151,7 +180,7 @@ fn read_status(pid: i32) -> Option<Status> {
             }
         }
     }
-    Some(st)
+    st
 }
 
 /// `major(3)`: the kernel packs a device number as 12 bits of major above 20
@@ -292,7 +321,10 @@ fn link_name(pid: i32, major: u32, minor: u32, leaf: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// The names a device number has without `/proc/tty/drivers`: procps
-/// `guess_name`, limited to the shapes a Linux host has.
+/// `guess_name`, limited to the shapes a Linux host has. The node is tested
+/// before its name is returned: a freed pty leaves a stale `tty_nr`, and a
+/// name that cannot be opened is not the row's terminal. `ps` prints `?`
+/// there, and so does the table.
 fn guess_tty(major: u32, minor: u32) -> Vec<u8> {
     let mut b = Buf::new();
     if (136..=143).contains(&major) {
@@ -304,6 +336,14 @@ fn guess_tty(major: u32, minor: u32) -> Vec<u8> {
     } else if major == 4 {
         b.push_str("tty");
         b.push_u64(minor as u64);
+    } else {
+        return Vec::new();
+    }
+    let mut path = Vec::with_capacity(b.v.len() + 5);
+    path.extend_from_slice(b"/dev/");
+    path.extend_from_slice(&b.v);
+    if rdev_of(&path) != Some((major, minor)) {
+        return Vec::new();
     }
     b.v
 }
@@ -340,9 +380,9 @@ fn user_name(uid: u32) -> Vec<u8> {
     }
 }
 
-/// `/proc/uptime` in nanoseconds. Its fractional field is CLOCK_BOOTTIME with
-/// more resolution than `/proc/stat`'s whole-second `btime`, and `%CPU`'s
-/// elapsed-time denominator needs that resolution.
+/// `/proc/uptime` in nanoseconds. `%CPU`'s denominator comes from
+/// `CLOCK_BOOTTIME` (`sys::boottime_ns`); this is only the fallback for a
+/// syscall that fails, and the cross-check that reveals a virtualized procfs.
 fn uptime_ns() -> u64 {
     let mut buf = [0u8; 256];
     let n = match sys::read_file(b"/proc/uptime", &mut buf) {
@@ -367,6 +407,34 @@ fn uptime_ns() -> u64 {
         }
     }
     secs.saturating_mul(1_000_000_000).saturating_add(frac)
+}
+
+/// The elapsed-time denominator for `%CPU`, and one warning when the two
+/// clocks disagree.
+///
+/// `CLOCK_BOOTTIME` is the clock `/proc/PID/stat`'s `starttime` is relative
+/// to. A procfs that virtualizes `/proc/uptime` (lxcfs) makes the file
+/// disagree with it, and using the file would inflate every row's `%CPU`.
+/// The file is therefore used only when the syscall fails, and a wide gap is
+/// reported rather than acted on.
+fn elapsed_clock_ns() -> u64 {
+    let proc_ns = uptime_ns();
+    match sys::boottime_ns() {
+        Some(boot_ns) => {
+            if proc_ns != 0 {
+                let gap = proc_ns.abs_diff(boot_ns);
+                if gap > 2_000_000_000 {
+                    let mut b = Buf::new();
+                    b.push_str("psgen: /proc/uptime differs from CLOCK_BOOTTIME by ");
+                    b.push_u64(gap / 1_000_000_000);
+                    b.push_str(" s; %CPU uses CLOCK_BOOTTIME\n");
+                    sys::err(&b.v);
+                }
+            }
+            boot_ns
+        }
+        None => proc_ns,
+    }
 }
 
 /// Whether a code point is printable, for the points that reach the second
@@ -624,7 +692,7 @@ fn read_pid(
         .saturating_mul(1000)
         .checked_div(elapsed_ns)
         .unwrap_or(0)
-        .min(u16::MAX as u64) as u16;
+        .min(u32::MAX as u64) as u32;
     // `pr_stat` order: state, nice, locked, session leader, threads, foreground.
     let mut st = Vec::with_capacity(6);
     st.push(stat.state);
@@ -654,8 +722,8 @@ fn read_pid(
         // (a `stop` check) reads it from `read_status` directly.
         uid: euid,
         gid: 0,
-        vsz: vsz.min(u32::MAX as u64) as u32,
-        rss: rss.min(u32::MAX as u64) as u32,
+        vsz,
+        rss,
         cpu,
         flags: 0,
         age,
@@ -681,7 +749,7 @@ pub fn read_all() -> Vec<Proc> {
     let hz = sys::hz();
     let now = sys::now_secs();
     let btime = boot_time(now);
-    let up_ns = uptime_ns();
+    let up_ns = elapsed_clock_ns();
     let drivers = tty_drivers();
     let mut pids: Vec<i32> = Vec::new();
     if let Ok(rd) = std::fs::read_dir("/proc") {
@@ -707,7 +775,7 @@ pub fn read_pids(pids: &[i32]) -> Vec<Proc> {
     let hz = sys::hz();
     let now = sys::now_secs();
     let btime = boot_time(now);
-    let up_ns = uptime_ns();
+    let up_ns = elapsed_clock_ns();
     let drivers = tty_drivers();
     let mut rows = Vec::with_capacity(pids.len());
     for pid in pids {
@@ -741,4 +809,46 @@ pub fn alive(pid: i32) -> bool {
 /// it has died whenever its parent does not reap it.
 pub fn same_process(pid: i32, start: u64) -> bool {
     read_starttime(pid) == Some(start) && alive(pid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A status file with `Groups:` past the old 8 KiB buffer still yields
+    /// VSZ, RSS and the effective uid.
+    #[test]
+    fn a_status_file_past_8_kib_is_parsed_whole() {
+        let mut text = Vec::new();
+        text.extend_from_slice(b"Name:\tpython3\nGroups:");
+        for i in 0..4000 {
+            text.extend_from_slice(b" ");
+            text.extend_from_slice(i.to_string().as_bytes());
+        }
+        text.extend_from_slice(b"\nVmSize:\t 8589955116 kB\nVmRSS:\t 9612 kB\nVmLck:\t 4 kB\nUid:\t1000\t966\t966\t966\n");
+        assert!(text.len() > 8192);
+        let st = parse_status(&text);
+        assert_eq!(st.vsz, 8589955116);
+        assert_eq!(st.rss, 9612);
+        assert_eq!(st.vmlck, 4);
+        assert_eq!(st.euid, 966);
+    }
+
+    /// A tty device with no node is `?`, not a path nothing can open.
+    #[test]
+    fn a_stale_tty_node_has_no_name() {
+        if std::path::Path::new("/dev/pts/9999").exists() {
+            return;
+        }
+        assert!(guess_tty(136, 9999).is_empty());
+    }
+
+    /// `%CPU`'s denominator is `CLOCK_BOOTTIME`; the file is only a fallback.
+    #[test]
+    fn the_elapsed_clock_is_boottime() {
+        let boot = sys::boottime_ns().expect("CLOCK_BOOTTIME");
+        let used = elapsed_clock_ns();
+        assert!(boot > 0);
+        assert!(used.abs_diff(boot) < 1_000_000_000);
+    }
 }

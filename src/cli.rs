@@ -652,10 +652,9 @@ COMMON
                       request that cannot be met at all prints a warning.
   -s, --seed N        fix the selection and jitter; START and TIME still
                       follow the wall clock
-  -p, --profile NAME  server (default), dev, desktop; weights the rows list,
-                      table and inject draw. Given explicitly, `list` orders
-                      the templates by profile weight; without it, the corpus
-                      order is kept.
+  -p, --profile NAME  server (default), dev, desktop; weights which templates
+                      `list`, `table` and `inject` draw. `list` sorts its lines
+                      by default and `--no-sort` keeps draw order.
   -f, --family NAME   sys, web, db, ctr, dev, mon, sto, mail, desk, net
       --utc-offset M  minutes east of UTC for the START column, -1440..1440
                       (default 0); synthetic table only
@@ -719,7 +718,8 @@ INJECT
       --plan            with --dry-run, print the resolved plan instead: exe
                         tier, per-row user/VSZ/RSS/CPU/tty/threads/exe, parent
                         links, the physical cost estimate, and the staging
-                        directories the run would create. It exits non-zero for
+                        directory patterns the run would create (`<pid>` and
+                        `<i>` are filled at spawn). It exits non-zero for
                         every preflight the real run would refuse.
       --json            with --dry-run, print the plan as one JSON object; an
                         alternative to --plan, not a companion
@@ -735,8 +735,9 @@ CORPUS AND CHECK
       --require-binaries  like --binaries, but exit 1 when any is missing
   --host-mem MiB      generate for a host with this much memory instead of this
                       one (table)
-  --host-pid-max N    generate for a host whose pid_max is N (table); a host
-                      with pid_max below 3 has no PID to show, which is reported
+  --host-pid-max N    generate for a host whose pid_max is N (table); PID 1
+                      is still shown, and the capacity below 3 is zero rows
+                      beside it
   --host-uptime S     generate as if the host had been up S seconds (table)
   --repeat-max N      how often one command may be repeated; 0 means no cap,
                       omitted means the realistic bound. Raising it is what
@@ -748,9 +749,11 @@ CORPUS AND CHECK
 UNIT
   The unit forwards the inject options it was given (-p, -f, -d, --no-mem,
   --mem-cap, --mem-target, --phys-cap, --disk, --no-root, --no-user,
-  --no-tty, --no-threads, --no-exe, --shadow-dir, --cpu, --busy, --verify),
-  caps -n at the inject cap of 500, and uses a RuntimeDirectory the manager
-  removes on stop so the service can be restarted. --count, --seed and
+  --no-tty, --no-threads, --no-exe, --shadow-dir, --cpu, --busy, --verify,
+  --create-users), caps -n at the inject cap of 500, and keeps its
+  RuntimeDirectory across a stop (RuntimeDirectoryPreserve=yes) so another
+  unit in the same directory is unaffected; the stop command removes this
+  unit's pidfile so the service can start again. --count, --seed and
   --pidfile select the injected rows and the pidfile path.
 
 DOCTOR
@@ -968,14 +971,28 @@ pub fn parse(args: &[Vec<u8>]) -> Result<Args, ParseError> {
                     let v =
                         take_value(args, &mut i, inline).ok_or("missing value for --profile")?;
                     if v != b"server" && v != b"dev" && v != b"desktop" {
-                        return Err("unknown profile".into());
+                        // Name the flag and the value: a script that takes
+                        // PROFILE from the environment otherwise cannot tell
+                        // which of its arguments was refused.
+                        return Err(format!(
+                            "unknown --profile {:?}; expected server, dev or desktop",
+                            String::from_utf8_lossy(v)
+                        )
+                        .into());
                     }
                     a.profile = v.to_vec();
                 }
                 b"-f" | b"--family" => {
                     a.seen.push("--family");
                     let v = take_value(args, &mut i, inline).ok_or("missing value for --family")?;
-                    a.family = Some(corpus::family_id(v).ok_or("unknown family")?);
+                    a.family = Some(
+                        corpus::family_id(v).ok_or_else(|| {
+                            format!(
+                                "unknown --family {:?}; see `--help` for the accepted set",
+                                String::from_utf8_lossy(v)
+                            )
+                        })?,
+                    );
                 }
                 b"--utc-offset" => {
                     a.seen.push("--utc-offset");
@@ -1180,6 +1197,12 @@ pub fn parse(args: &[Vec<u8>]) -> Result<Args, ParseError> {
                     let v = take_value(args, &mut i, inline).ok_or("missing value for --lines")?;
                     let n = usize::try_from(str::parse_u64(v).ok_or("invalid --lines")?)
                         .map_err(|_| "invalid --lines")?;
+                    // 0 used to reach `run_log`, write nothing and exit 0,
+                    // which is a silent success rather than a cap. Every
+                    // other count-like option has a lower bound.
+                    if n == 0 {
+                        return Err("--lines must be at least 1".into());
+                    }
                     a.log_lines = n;
                 }
                 b"--delay" => {
@@ -1499,9 +1522,15 @@ fn print_notes(prep: &inject::Prep, args: &Args) {
         sys::err(out.as_bytes());
     }
     if !c.memfd {
-        sys::err(
-            b"psgen: memfd_create denied; using an unlinked temp file for the arena and config\n",
-        );
+        if c.memfd_untested {
+            sys::err(
+                b"psgen: the capability probe could not fork, so memfd_create is untested; the arena may fall back to an unlinked temp file and the run will refuse if a stub config needs a memfd\n",
+            );
+        } else {
+            sys::err(
+                b"psgen: memfd_create denied; the arena falls back to an unlinked temp file, but a stub config cannot, so the run will refuse when it reaches the config\n",
+            );
+        }
     }
     if !prep.created.is_empty() {
         let mut out = Buf::new();
@@ -1661,6 +1690,10 @@ fn pidfile_parent(path: &[u8]) -> &[u8] {
 
 /// Name the object that makes `path` unusable as a pidfile.
 fn pidfile_error(path: &[u8]) -> Buf {
+    pidfile_error_bytes(path, probe::PIDFILE_PENDING_BYTES)
+}
+
+fn pidfile_error_bytes(path: &[u8], bytes: usize) -> Buf {
     let mut out = Buf::new();
     out.push_str("psgen: cannot write the pidfile ");
     out.push_bytes(path);
@@ -1687,6 +1720,10 @@ fn pidfile_error(path: &[u8]) -> Buf {
             out.push_str(" is not a directory");
         } else if !sys::access(parent, sys::W_OK) {
             out.push_str(" is not writable");
+        } else if probe::pidfile_creatable_errno_bytes(path, bytes) == libc::EFBIG {
+            // The one failure a writable parent does not explain. Naming the
+            // limit is the difference between a fixable setting and a mystery.
+            out.push_str(" is writable but RLIMIT_FSIZE is too small for the pidfile");
         } else {
             // The parent is writable, so the failure was the target name
             // itself. NAME_MAX is one cause, not the only one: PATH_MAX, a
@@ -1713,9 +1750,16 @@ fn list_target(args: &Args) -> usize {
         return 0;
     }
     let n = if args.count == 0 {
+        // One line per template in scope. An explicit `-p` makes the zero
+        // weight of a family a statement about the host, and a template in
+        // that family is not in scope; an explicit `-f` stays an override.
+        let weights = corpus::profile_weights(&args.profile);
         corpus::CORPUS
             .iter()
-            .filter(|t| args.family.map(|f| t.fam == f).unwrap_or(true))
+            .filter(|t| match args.family {
+                Some(f) => t.fam == f,
+                None => weights[t.fam as usize] != 0,
+            })
             .count()
     } else {
         args.count.min(2000)
@@ -1729,17 +1773,6 @@ fn lists_count(args: &Args) -> bool {
     list_target(args) != 0
 }
 
-/// Whether any in-scope template can produce more than one distinct line.
-///
-/// This is the only honest test for "`--no-uniq` can pad a short list": a
-/// fixed command line re-expands to itself, so repeating it is not padding.
-fn can_vary(family: Option<u8>) -> bool {
-    corpus::CORPUS
-        .iter()
-        .filter(|t| family.map(|f| t.fam == f).unwrap_or(true))
-        .any(gen::has_variants)
-}
-
 /// Say so when a request cannot be met at all.
 ///
 /// A table that repeats a row a real host runs several times is not a
@@ -1747,7 +1780,14 @@ fn can_vary(family: Option<u8>) -> bool {
 /// contribute more than one row. What a caller does need to hear is the case
 /// where even that cannot reach the number, which happens for a family whose
 /// templates all run once and cannot vary (`list -f mail -n 50`).
-fn shortfall(family: Option<u8>, got: usize, want: usize, list: bool, reason: Option<&str>) {
+fn shortfall(
+    family: Option<u8>,
+    got: usize,
+    want: usize,
+    list: bool,
+    reason: Option<&str>,
+    distinct: u64,
+) {
     if want == 0 || got >= want {
         return;
     }
@@ -1770,18 +1810,19 @@ fn shortfall(family: Option<u8>, got: usize, want: usize, list: bool, reason: Op
         out.push_str(r);
     }
     // `list` rejects `--repeat-max`, so recommending it there names an option
-    // the same run refuses (issue #9b). `--no-uniq` is a remedy only when an
-    // in-scope template has a placeholder that can produce a second distinct
-    // line; a fixed command line re-expands to itself, so repeating it is not
-    // padding.
+    // the same run refuses (issue #9b). `--no-uniq` does not invent new
+    // command lines: it repeats the lines the templates already produced, so
+    // the warning quotes the distinct supply instead of promising padding
+    // that does not exist.
     if list {
-        out.push_str("; a list never repeats a command");
-        if can_vary(family) {
-            out.push_str(" (use --no-uniq to pad with new command lines)");
+        out.push_str("; a list never repeats a command (");
+        out.push_u64(distinct);
+        out.push_str(if distinct == 1 {
+            " distinct line"
         } else {
-            out.push_str(", and none of these templates has a variable placeholder");
-        }
-        out.push_str(". Ask for fewer lines.");
+            " distinct lines"
+        });
+        out.push_str(" can be produced; --no-uniq pads by repeating them). Ask for fewer lines.");
     } else {
         out.push_str(". Use --repeat-max N to allow more repeats, or ask for fewer rows.");
     }
@@ -1852,14 +1893,19 @@ fn would_create(rows: &mut [gen::Proc], args: &Args) -> Vec<Vec<u8>> {
 /// yet. It is never a real id; the plan says the account does not exist.
 pub const UNKNOWN_ID: u32 = u32::MAX;
 
-/// The staging directories a run would create, in the order `spawn()` makes
-/// them: one per row that needs its own directory, plus one for the shadow
-/// copy when the tier is shadow.
+/// The staging directory patterns a run would create, in the order `spawn()`
+/// makes them: one per row that needs its own directory, plus one for the
+/// shadow copy when the tier is shadow.
 ///
-/// `spawn()` builds each leaf from the injector's own PID, which does not
-/// exist yet, so the plan names the parent and the count rather than inventing
-/// a path the run will not use.
-fn staging_dirs(rows: &[gen::Proc], prep: &inject::Prep, args: &Args) -> Vec<Vec<u8>> {
+/// `spawn()` builds each leaf from the injector's own PID and a retry index,
+/// neither of which exists yet, so the plan prints a pattern with every
+/// placeholder named. The parent is real; the leaf is not, and a caller that
+/// read the leaf as a path would look for a directory the run never makes.
+///
+/// The predicate mirrors `spawn()` exactly: a bind-tier row whose template
+/// executable is missing needs a directory even without `--disk`, because the
+/// stub's exe is written there.
+fn staging_patterns(rows: &[gen::Proc], prep: &inject::Prep, args: &Args) -> Vec<Vec<u8>> {
     let mut out: Vec<Vec<u8>> = Vec::new();
     if prep.tier == inject::ExeTier::Shadow {
         if let Some(root) = &prep.shadow_root {
@@ -1867,24 +1913,30 @@ fn staging_dirs(rows: &[gen::Proc], prep: &inject::Prep, args: &Args) -> Vec<Vec
             if !p.ends_with(b"/") {
                 p.push(b'/');
             }
-            p.extend_from_slice(b".psgen-<pid>-9000");
+            p.extend_from_slice(b".psgen-<pid>-9000-<i>");
             out.push(p);
         }
     }
-    if args.disk_mb.unwrap_or(0) == 0 {
-        return out;
-    }
+    let disk = args.disk_mb.unwrap_or(0) > 0;
     let dir = std::env::temp_dir();
     let mut base = dir.as_os_str().as_bytes().to_vec();
     if base.ends_with(b"/") {
         base.pop();
     }
-    for i in 0..rows.len() {
+    for (i, row) in rows.iter().enumerate() {
+        let exe = gen::template_exe(&corpus::CORPUS[row.tmpl]);
+        let need_exe_dir = prep.tier == inject::ExeTier::Bind
+            && !exe.is_empty()
+            && !std::path::Path::new(std::ffi::OsStr::from_bytes(&exe)).exists();
+        if !disk && !need_exe_dir {
+            continue;
+        }
         let mut p = base.clone();
         p.extend_from_slice(b"/.psgen-<pid>-");
         let mut b = Buf::new();
         b.push_u64(i as u64);
         p.extend_from_slice(b.as_bytes());
+        p.extend_from_slice(b"-<i>");
         out.push(p);
     }
     out
@@ -1922,7 +1974,16 @@ fn print_plan(rows: &[gen::Proc], prep: &inject::Prep, create: &[Vec<u8>], args:
     out.push_str("   mem ");
     out.push_str(if args.mem { "on" } else { "off" });
     out.push_str(", tty ");
-    out.push_str(if args.tty { "on" } else { "off" });
+    // The plan describes the run that would start, so a host without a pty
+    // master says the rows will be detached rather than promising a terminal
+    // the run cannot give them.
+    out.push_str(if !args.tty {
+        "off"
+    } else if prep.caps.pty {
+        "on"
+    } else {
+        "unavailable on this host"
+    });
     out.push_str(", threads ");
     out.push_str(if args.threads { "on" } else { "off" });
     out.push_str(", busy ");
@@ -1933,7 +1994,7 @@ fn print_plan(rows: &[gen::Proc], prep: &inject::Prep, create: &[Vec<u8>], args:
     });
     out.push(b'\n');
     let roots = rows.iter().filter(|p| p.parent.is_none()).count();
-    let rss: u64 = rows.iter().map(|p| p.rss as u64).sum();
+    let rss: u64 = rows.iter().map(|p| p.rss).sum();
     out.push_str("plan: ");
     out.push_u64(rows.len() as u64);
     out.push_str(if rows.len() == 1 {
@@ -1970,13 +2031,13 @@ fn print_plan(rows: &[gen::Proc], prep: &inject::Prep, create: &[Vec<u8>], args:
         out.push_u64(rows.len() as u64);
         out.push_str(" stubs");
     }
-    let dirs = staging_dirs(rows, prep, args);
+    let dirs = staging_patterns(rows, prep, args);
     out.push_str("; staging ");
     out.push_u64(dirs.len() as u64);
     out.push_str(if dirs.len() == 1 {
-        " directory"
+        " directory pattern"
     } else {
-        " directories"
+        " directory patterns"
     });
     let parents = staging_parents(&dirs);
     if !parents.is_empty() {
@@ -2005,17 +2066,19 @@ fn print_plan(rows: &[gen::Proc], prep: &inject::Prep, create: &[Vec<u8>], args:
             out.push_str(" (would create)");
         }
         out.push_str(" vsz=");
-        out.push_u64(p.vsz as u64);
+        out.push_u64(p.vsz);
         out.push_str(" rss=");
-        out.push_u64(p.rss as u64);
+        out.push_u64(p.rss);
         out.push_str(" cpu=");
-        out.push_tenths_plain(p.cpu as u32);
+        out.push_tenths_plain(p.cpu);
         out.push_str(" tty=");
-        out.push_str(if p.flags & corpus::F_TTY != 0 {
-            "yes"
-        } else {
-            "no"
-        });
+        out.push_str(
+            if p.flags & corpus::F_TTY != 0 && args.tty && prep.caps.pty {
+                "yes"
+            } else {
+                "no"
+            },
+        );
         out.push_str(" threads=");
         out.push_str(if p.flags & corpus::F_THREADS != 0 {
             "yes"
@@ -2032,7 +2095,7 @@ fn print_plan(rows: &[gen::Proc], prep: &inject::Prep, create: &[Vec<u8>], args:
         out.push(b'\n');
     }
     for d in &dirs {
-        out.push_str("staging ");
+        out.push_str("staging pattern ");
         out.push_bytes(d);
         out.push(b'\n');
     }
@@ -2064,7 +2127,7 @@ fn print_json_plan(rows: &[gen::Proc], prep: &inject::Prep, create: &[Vec<u8>], 
     out.push_str(",\"busy\":");
     out.push_str(bool_str(args.busy || args.cpu_pct.unwrap_or(0) > 0));
     out.push_str(",\"rss_kb\":");
-    out.push_u64(rows.iter().map(|p| p.rss as u64).sum());
+    out.push_u64(rows.iter().map(|p| p.rss).sum());
     out.push_str(",\"phys_kb\":");
     out.push_u64(prep.phys_estimate_kb);
     out.push_str(",\"budget_kb\":");
@@ -2077,7 +2140,7 @@ fn print_json_plan(rows: &[gen::Proc], prep: &inject::Prep, create: &[Vec<u8>], 
     out.push_u64(args.disk_mb.unwrap_or(0));
     out.push_str(",\"disk_mb_total\":");
     out.push_u64(args.disk_mb.unwrap_or(0).saturating_mul(rows.len() as u64));
-    let dirs = staging_dirs(rows, prep, args);
+    let dirs = staging_patterns(rows, prep, args);
     out.push_str(",\"staging_dirs\":[");
     for (i, d) in dirs.iter().enumerate() {
         if i > 0 {
@@ -2122,13 +2185,15 @@ fn print_json_plan(rows: &[gen::Proc], prep: &inject::Prep, create: &[Vec<u8>], 
             out.push_u64(p.gid as u64);
         }
         out.push_str(",\"vsz_kb\":");
-        out.push_u64(p.vsz as u64);
+        out.push_u64(p.vsz);
         out.push_str(",\"rss_kb\":");
-        out.push_u64(p.rss as u64);
+        out.push_u64(p.rss);
         out.push_str(",\"cpu_tenths\":");
         out.push_u64(p.cpu as u64);
         out.push_str(",\"tty\":");
-        out.push_str(bool_str(p.flags & corpus::F_TTY != 0));
+        out.push_str(bool_str(
+            p.flags & corpus::F_TTY != 0 && args.tty && prep.caps.pty,
+        ));
         out.push_str(",\"threads\":");
         out.push_str(bool_str(p.flags & corpus::F_THREADS != 0));
         out.push_str(",\"busy\":");
@@ -2216,6 +2281,7 @@ pub fn run() -> i32 {
                 count: 0,
                 seed: args.seed.unwrap_or(1),
                 profile: args.profile.clone(),
+                profile_set: args.seen.contains(&"--profile"),
                 family: args.family,
                 self_user: b"deploy".to_vec(),
                 uniq: args.uniq,
@@ -2268,6 +2334,7 @@ pub fn run() -> i32 {
                 count: list_target(&args),
                 seed: args.seed.unwrap_or(0),
                 profile: args.profile.clone(),
+                profile_set: args.seen.contains(&"--profile"),
                 family: args.family,
                 self_user: util::current_user().name,
                 uniq: args.uniq,
@@ -2281,7 +2348,18 @@ pub fn run() -> i32 {
                 } else {
                     args.count.min(2000)
                 };
-                shortfall(args.family, cmds.len(), want, true, None);
+                shortfall(
+                    args.family,
+                    cmds.len(),
+                    want,
+                    true,
+                    None,
+                    gen::distinct_supply(
+                        args.family,
+                        &corpus::profile_weights(&args.profile),
+                        args.seen.contains(&"--profile"),
+                    ),
+                );
             }
             if args.sort {
                 cmds.sort_unstable();
@@ -2328,6 +2406,7 @@ pub fn run() -> i32 {
                 },
                 seed: args.seed.unwrap_or(0),
                 profile: args.profile.clone(),
+                profile_set: args.seen.contains(&"--profile"),
                 family: args.family,
                 self_user: util::current_user().name,
                 uniq: args.uniq,
@@ -2347,6 +2426,11 @@ pub fn run() -> i32 {
                 want,
                 false,
                 fit.shortfall_reason(want).as_deref(),
+                gen::distinct_supply(
+                    args.family,
+                    &corpus::profile_weights(&args.profile),
+                    args.seen.contains(&"--profile"),
+                ),
             );
             // `%MEM` divides by the memory of the host the table describes.
             // `table::mem_budget_kb()` is this host's budget; an explicit
@@ -2376,8 +2460,11 @@ pub fn run() -> i32 {
             // fails for a command line the real run would refuse.
             let mut blockers = 0usize;
             if let Some(p) = &args.pidfile {
-                if !probe::pidfile_creatable(p) {
-                    let mut out = pidfile_error(p);
+                // Prove the pending write, not a 64 KiB allocation: a small
+                // RLIMIT_FSIZE fits this run and used to refuse it.
+                let pending_bytes = inject::pending_pidfile_len();
+                if !probe::pidfile_creatable_bytes(p, pending_bytes) {
+                    let mut out = pidfile_error_bytes(p, pending_bytes);
                     // Suggest a writable path without writing to the
                     // candidate path.
                     for cand in [
@@ -2386,7 +2473,7 @@ pub fn run() -> i32 {
                     ] {
                         use std::os::unix::ffi::OsStrExt;
                         let b = cand.as_os_str().as_bytes();
-                        if probe::pidfile_creatable(b) {
+                        if probe::pidfile_creatable_bytes(b, pending_bytes) {
                             out.push_str("; use ");
                             out.push_bytes(b);
                             out.push_str(" instead");
@@ -2411,6 +2498,7 @@ pub fn run() -> i32 {
                 },
                 seed: args.seed.unwrap_or(0),
                 profile: args.profile.clone(),
+                profile_set: args.seen.contains(&"--profile"),
                 family: args.family,
                 self_user: me.name,
                 uniq: args.uniq,
@@ -2431,6 +2519,11 @@ pub fn run() -> i32 {
                 want,
                 false,
                 gen::Fit::none().shortfall_reason(want).as_deref(),
+                gen::distinct_supply(
+                    args.family,
+                    &corpus::profile_weights(&args.profile),
+                    args.seen.contains(&"--profile"),
+                ),
             );
 
             // A disk target that would fill the filesystem is refused here,
@@ -2478,6 +2571,37 @@ pub fn run() -> i32 {
                 return 2;
             }
 
+            // A pidfile that still records live stubs cannot be reused: the
+            // pending rewrite would erase the only record of the old run, and
+            // the old stubs would outlive `stop`. A preview runs the same
+            // check, because it describes what a real run would do, and a run
+            // against this pidfile would be refused.
+            if let Some(p) = &args.pidfile {
+                match inject::live_pidfile_rows(p) {
+                    Some(0) => {}
+                    Some(_) => {
+                        let mut out = Buf::new();
+                        out.push_str("psgen: the pidfile ");
+                        out.push_bytes(p);
+                        out.push_str(
+                            " records live processes; stop them first or choose another --pidfile",
+                        );
+                        out.push(b'\n');
+                        sys::err(out.as_bytes());
+                        return 2;
+                    }
+                    None => {
+                        let mut out = Buf::new();
+                        out.push_str("psgen: cannot read the existing pidfile ");
+                        out.push_bytes(p);
+                        out.push_str("; remove it or choose another --pidfile");
+                        out.push(b'\n');
+                        sys::err(out.as_bytes());
+                        return 2;
+                    }
+                }
+            }
+
             let prep = inject::prepare(&mut rows, &args, args.create_users && !args.dry_run);
 
             if args.dry_run {
@@ -2510,34 +2634,33 @@ pub fn run() -> i32 {
                 return 0;
             }
 
-            // A pidfile that still records live stubs cannot be reused: the
-            // pending rewrite would erase the only record of the old run, and
-            // the old stubs would outlive `stop`.
-            if let Some(p) = &args.pidfile {
-                match inject::live_pidfile_rows(p) {
-                    Some(0) => {}
-                    Some(_) => {
+            // Serialize the pending write and the final rewrite. The live
+            // check above is a read, and two runs that pass it together both
+            // rename a file into place; the second erases the first's rows.
+            let _pidfile_lock = match &args.pidfile {
+                Some(p) => match inject::lock_pidfile(p) {
+                    Ok(lock) => Some(lock),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         let mut out = Buf::new();
-                        out.push_str("psgen: the pidfile ");
+                        out.push_str("psgen: another psgen run holds the pidfile ");
                         out.push_bytes(p);
-                        out.push_str(
-                            " records live processes; stop them first or choose another --pidfile",
-                        );
+                        out.push_str("; wait for it to finish or choose another --pidfile\n");
+                        sys::err(out.as_bytes());
+                        return 2;
+                    }
+                    Err(e) => {
+                        let mut out = Buf::new();
+                        out.push_str("psgen: cannot lock the pidfile ");
+                        out.push_bytes(p);
+                        out.push_str(": ");
+                        out.push_str(&e.to_string());
                         out.push(b'\n');
                         sys::err(out.as_bytes());
                         return 2;
                     }
-                    None => {
-                        let mut out = Buf::new();
-                        out.push_str("psgen: cannot read the existing pidfile ");
-                        out.push_bytes(p);
-                        out.push_str("; remove it or choose another --pidfile");
-                        out.push(b'\n');
-                        sys::err(out.as_bytes());
-                        return 2;
-                    }
-                }
-            }
+                },
+                None => None,
+            };
 
             // Forget the staging directories of runs whose injector is gone.
             // A `--duration` run that nobody stops leaves its shadow copy and
@@ -2618,10 +2741,29 @@ pub fn run() -> i32 {
                     out.push_bytes(t.as_os_str().as_bytes());
                     out.push(b'\n');
                 }
+                // The file still on disk is the pending header, not a record
+                // of this run. Removing it makes `stop` report a missing
+                // pidfile; when the directory refuses the unlink, the rows go
+                // to a sidecar `stop --pidfile` can use.
+                if let Some(p) = &args.pidfile {
+                    let removed =
+                        std::fs::remove_file(Path::new(std::ffi::OsStr::from_bytes(p))).is_ok();
+                    if !removed && inject::write_pid_sidecar(p, &result.pids) {
+                        out.push_str("psgen: the spawned rows are in ");
+                        out.push_bytes(p);
+                        out.push_str(".spawned\n");
+                    }
+                }
                 sys::err(out.as_bytes());
             }
             let mut code = 0;
-            if result.failed > 0 || result.missing > 0 || !result.mismatches.is_empty() {
+            if result.failed > 0
+                || result.missing > 0
+                || !result.mismatches.is_empty()
+                || pidfile_failed
+            {
+                // A run whose pidfile was not written is not a success even
+                // when every stub started: the caller cannot stop them.
                 code = 1;
             }
 

@@ -341,7 +341,8 @@ jobs:
         # tag was refused", and only a successful "yes" publishes. The tag is
         # re-checked here as well, because this is the step that cannot be
         # undone: a version published from the wrong tag stays on crates.io. A
-        # fork without the secret skips instead of failing the release.
+        # fork without the secret fails the publish step on a final tag rather
+        # than announcing a release the registry cannot serve.
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
@@ -359,8 +360,28 @@ jobs:
           fi
           sh scripts/release-notes.sh tag-matches "$TAG" >/dev/null
           if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
-            echo "CARGO_REGISTRY_TOKEN is not set; skipping cargo publish"
-            exit 0
+            # A final tag with no token used to skip and stay green, so the
+            # release existed while the registry kept serving 0.0.0. A release
+            # nobody can install from is a failure, not a skip.
+            echo "CARGO_REGISTRY_TOKEN is not set, so $TAG cannot be published to the registry" >&2
+            exit 1
           fi
           cargo publish --locked --dry-run
           cargo publish --locked
+          # The registry can answer with the previous version for a short time
+          # after the upload. Prove it serves this tag's version before the job
+          # succeeds, so a skipped or half-done publish is a red release.
+          version=${TAG#v}
+          published=no
+          for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            if cargo info "psgen@$version" >/dev/null 2>&1; then
+              published=yes
+              break
+            fi
+            sleep 10
+          done
+          if [ "$published" != yes ]; then
+            echo "the registry does not serve psgen@$version after publishing $TAG" >&2
+            exit 1
+          fi
+          echo "the registry serves psgen@$version"

@@ -12,14 +12,16 @@ use std::vec::Vec;
 
 /// Write one JSON string literal.
 ///
-/// JSON strings are UTF-8, so a valid sequence is copied through and every byte
-/// that is not part of one is escaped as `\u00XX`. The previous version replaced
-/// every byte outside printable ASCII with `?`, which made `/tmp/aéb.pid` and
-/// `/tmp/aèb.pid` the same JSON value: two paths a consumer could not tell
-/// apart, and the one the tool had just probed was unrecoverable.
-fn json_string(out: &mut Buf, s: &[u8]) {
+/// Printable ASCII is copied as-is and only what JSON requires is escaped.
+/// Valid UTF-8 sequences are copied whole. A byte that is not part of one is
+/// escaped as `\u00XX` so the buffer stays well-formed, but U+00XX is not the
+/// original byte and the function returns `false` to say so. The caller must
+/// refuse the report rather than emit a path a consumer cannot recover: `0xFF`
+/// and `0xC3 0xBF` would otherwise be the same JSON string.
+fn json_string(out: &mut Buf, s: &[u8]) -> bool {
     out.push(b'"');
     let mut i = 0;
+    let mut valid = true;
     while i < s.len() {
         match s[i] {
             b'"' => {
@@ -42,8 +44,12 @@ fn json_string(out: &mut Buf, s: &[u8]) {
                 out.push_str("\\t");
                 i += 1;
             }
-            b if b < 0x20 => {
+            b if b < 0x20 || b == 0x7f => {
                 push_u_escape(out, b);
+                i += 1;
+            }
+            b if b < 0x7f => {
+                out.push(b);
                 i += 1;
             }
             _ => {
@@ -56,12 +62,54 @@ fn json_string(out: &mut Buf, s: &[u8]) {
                     i += n;
                 } else {
                     push_u_escape(out, s[i]);
+                    valid = false;
                     i += 1;
                 }
             }
         }
     }
     out.push(b'"');
+    valid
+}
+
+/// Whether `s` is a single valid UTF-8 string.
+fn valid_utf8(s: &[u8]) -> bool {
+    core::str::from_utf8(s).is_ok()
+}
+
+/// Write one text-report field so it cannot split the row it belongs to.
+///
+/// A path or an environment value can contain a newline, and the text report
+/// uses `\n` as the row separator. Control bytes and bytes that are not valid
+/// UTF-8 become `\xNN`; printable text is copied unchanged.
+fn text_field(out: &mut Buf, s: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut i = 0;
+    while i < s.len() {
+        let b = s[i];
+        if b < 0x20 || b == 0x7f {
+            out.push_str("\\x");
+            out.push(HEX[(b >> 4) as usize]);
+            out.push(HEX[(b & 0xf) as usize]);
+            i += 1;
+            continue;
+        }
+        if b < 0x7f {
+            out.push(b);
+            i += 1;
+            continue;
+        }
+        let n = utf8_len(b);
+        if n > 1 && i + n <= s.len() && core::str::from_utf8(&s[i..i + n]).is_ok() {
+            out.push_bytes(&s[i..i + n]);
+            i += n;
+        } else {
+            out.push_str("\\x");
+            out.push(HEX[(b >> 4) as usize]);
+            out.push(HEX[(b & 0xf) as usize]);
+            i += 1;
+        }
+    }
 }
 
 /// `\u00XX` for one byte, so no byte the input carries is lost.
@@ -251,7 +299,11 @@ pub fn pidfile_verdict(pidfile: &[u8]) -> PidfileVerdict {
                 let mut d = Buf::new();
                 d.push_str("records ");
                 d.push_u64(n as u64);
-                d.push_str(" live processes");
+                d.push_str(if n == 1 {
+                    " live process"
+                } else {
+                    " live processes"
+                });
                 d.v
             }
             None => b"the existing file cannot be read".to_vec(),
@@ -288,6 +340,7 @@ pub fn run(as_json: bool, pidfile: Option<&[u8]>) -> i32 {
 
     if as_json {
         let mut out = Buf::new();
+        let mut json_ok = true;
         out.push(b'{');
         out.push_str("\"version\":\"");
         out.push_str(crate::version::VERSION);
@@ -300,20 +353,20 @@ pub fn run(as_json: bool, pidfile: Option<&[u8]>) -> i32 {
             if i > 0 {
                 out.push(b',');
             }
-            json_string(&mut out, name.as_bytes());
+            json_ok &= json_string(&mut out, name.as_bytes());
         }
         out.push_str("],\"env\":{");
         for (i, (k, v)) in env.iter().enumerate() {
             if i > 0 {
                 out.push(b',');
             }
-            json_string(&mut out, k.as_bytes());
+            json_ok &= json_string(&mut out, k.as_bytes());
             out.push(b':');
             let numeric = env_is_number(k) && !v.is_empty() && v.iter().all(|b| b.is_ascii_digit());
             if numeric {
                 out.push_bytes(v);
             } else {
-                json_string(&mut out, v);
+                json_ok &= json_string(&mut out, v);
             }
         }
         out.push_str("},\"checks\":[");
@@ -323,11 +376,11 @@ pub fn run(as_json: bool, pidfile: Option<&[u8]>) -> i32 {
             }
             out.push(b'{');
             out.push_str("\"name\":");
-            json_string(&mut out, c.name.as_bytes());
+            json_ok &= json_string(&mut out, c.name.as_bytes());
             out.push_str(",\"ok\":");
             out.push_str(if c.ok { "true" } else { "false" });
             out.push_str(",\"detail\":");
-            json_string(&mut out, &c.detail);
+            json_ok &= json_string(&mut out, &c.detail);
             if !c.ok {
                 out.push_str(",\"errno\":");
                 json_number(&mut out, c.errno.max(0) as u64);
@@ -340,16 +393,17 @@ pub fn run(as_json: bool, pidfile: Option<&[u8]>) -> i32 {
             if i > 0 {
                 out.push(b',');
             }
-            json_string(&mut out, k.as_bytes());
+            json_ok &= json_string(&mut out, k.as_bytes());
             out.push(b':');
-            json_string(&mut out, v);
+            json_ok &= json_string(&mut out, v);
         }
         out.push(b'}');
         if let Some(v) = &verdict {
             // A path is not a JSON key: it may not be valid UTF-8, and a
             // consumer cannot read it back as a field. The path is a value.
             out.push_str(",\"pidfile\":{\"path\":");
-            json_string(&mut out, pidfile.unwrap_or(b""));
+            let path_ok = valid_utf8(pidfile.unwrap_or(b""));
+            json_ok &= json_string(&mut out, pidfile.unwrap_or(b""));
             out.push_str(",\"allowed\":");
             out.push_str(bool_txt(v.allowed));
             out.push_str(",\"writable\":");
@@ -360,10 +414,20 @@ pub fn run(as_json: bool, pidfile: Option<&[u8]>) -> i32 {
                 None => out.push_str("null"),
             }
             out.push_str(",\"detail\":");
-            json_string(&mut out, &v.detail);
+            json_ok &= json_string(&mut out, &v.detail);
             out.push(b'}');
+            if !path_ok {
+                sys::err(b"psgen: doctor --json cannot represent the pidfile path: it is not valid UTF-8, so the byte that was probed cannot be recovered from the report; use the text report\n");
+                return 1;
+            }
         }
         out.push_str("}\n");
+        // The report is only emitted if every value could be represented.
+        // Refusing beats emitting two different paths as the same string.
+        if !json_ok {
+            sys::err(b"psgen: doctor --json cannot represent this environment: a value it would report is not valid UTF-8; use the text report\n");
+            return 1;
+        }
         sys::out(out.as_bytes());
     } else {
         let mut out = Buf::new();
@@ -372,18 +436,18 @@ pub fn run(as_json: bool, pidfile: Option<&[u8]>) -> i32 {
         out.push_str("env\n");
         for (k, v) in &env {
             out.push_str("  ");
-            out.push_str(k);
+            text_field(&mut out, k.as_bytes());
             out.push_str("\t");
-            out.push_bytes(v);
+            text_field(&mut out, v);
             out.push(b'\n');
         }
         out.push_str("capability\tverdict\tdetail\n");
         for c in &checks {
-            out.push_bytes(c.name.as_bytes());
+            text_field(&mut out, c.name.as_bytes());
             out.push(b'\t');
             out.push_str(if c.ok { "ALLOW" } else { "DENY" });
             out.push(b'\t');
-            out.push_bytes(&c.detail);
+            text_field(&mut out, &c.detail);
             if !c.ok {
                 out.push_str(" (errno ");
                 out.push_u64(c.errno.max(0) as u64);
@@ -394,19 +458,19 @@ pub fn run(as_json: bool, pidfile: Option<&[u8]>) -> i32 {
         out.push_str("probe\n");
         for (k, v) in &posture {
             out.push_str("  ");
-            out.push_str(k);
+            text_field(&mut out, k.as_bytes());
             out.push_str("\t");
-            out.push_bytes(v);
+            text_field(&mut out, v);
             out.push(b'\n');
         }
         if let (Some(p), Some(v)) = (pidfile, &verdict) {
             out.push_str("pidfile\t");
             out.push_str(if v.allowed { "ALLOW" } else { "DENY" });
             out.push(b'\t');
-            out.push_bytes(p);
+            text_field(&mut out, p);
             if !v.allowed {
                 out.push_str(" (");
-                out.push_bytes(&v.detail);
+                text_field(&mut out, &v.detail);
                 out.push(b')');
             }
             out.push(b'\n');

@@ -168,7 +168,8 @@ These are known and accepted, not unreported defects.
 
 ## Reporting
 
-Open a private security advisory on the repository, or mail the maintainer
-address in `Cargo.toml`. Do not open a public issue for an exploitable report.
+Open a private security advisory on the repository, or mail
+Azathothas <AjamX101@gmail.com>. Do not open a public issue for an exploitable
+report.
 Please include the exact command line, the psgen version, the kernel, and the
 capabilities of the environment (`psgen doctor` is a good summary).

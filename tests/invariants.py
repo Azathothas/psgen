@@ -2771,11 +2771,12 @@ def check_residuals(tmp):
         fail("#15: --plan -q printed would-signal lines")
     stop_pidfile(pf)
 
-    # #24: --lines 0 is "print nothing and succeed", which is what the base
-    # did; the review kept that rather than turning it into an error.
+    # #24: `--lines 0` is a usage error, like `--speed 0`: a silent success is
+    # not a parse error, and the help says the value is "events to write".
     p = run(["log", "--lines", "0"], check=False)
-    if p.returncode != 0 or p.stdout.strip():
-        fail(f"#24: log --lines 0 printed {p.stdout[:40]!r} and exited {p.returncode}")
+    if p.returncode != 2 or "--lines must be at least 1" not in p.stderr:
+        fail(f"#24: log --lines 0 printed {p.stdout[:40]!r}, stderr "
+             f"{p.stderr.strip()[:60]!r} and exited {p.returncode}")
 
     # #5: an unmarked foreign .psgen-* directory is never removed.
     foreign = Path(tmp) / ".psgen-1-2-3"
@@ -3441,6 +3442,16 @@ def check_option_matrix():
         return elapsed
 
     observed = {("inject", "-d"): inject_lifetime}
+    # `--repeat-max` bounds *repeated command lines*. The default table request
+    # is 30 rows from 181 templates, so no command repeats and the flag cannot
+    # bind; this cell asks for 200 rows from the 8-template stop family, where
+    # `--repeat-max 1` must stop short (and say so) and `5` must not. Until
+    # this override the cell passed on the PIDs the old accounting happened to
+    # reshuffle, which measured nothing about repeats.
+    cell_base = {
+        ("table", "--repeat-max"): ["-f", "sto", "-n", "200"],
+        ("inject", "--repeat-max"): ["-f", "sto", "-n", "60"],
+    }
     # `stop` without a pidfile is a usage error for every cell, which says
     # nothing about the option; give it a file so the rejection is about the
     # flag under test. The file must be one `stop` accepts, which now means a
@@ -3474,8 +3485,9 @@ def check_option_matrix():
                     compared += 1
                     continue
                 try:
-                    ra = matrix_run([sub] + base[sub] + a)
-                    rb = matrix_run([sub] + base[sub] + b)
+                    extra = cell_base.get((sub, opt), [])
+                    ra = matrix_run([sub] + base[sub] + extra + a)
+                    rb = matrix_run([sub] + base[sub] + extra + b)
                 except subprocess.TimeoutExpired:
                     fail(f"#9: {sub} {opt} timed out")
                 # Only exit 2 means "this option does not apply here". Anything
@@ -3857,7 +3869,9 @@ def _check_option_surface(tmp):
 
     # `-p` must be a real weight for `list` at the default count, which is the
     # invocation the README shows. The corpus order is a documented contract,
-    # so the bare form stays byte-identical; only an explicit `-p` re-orders.
+    # so the bare form stays byte-identical; an explicit `-p` re-orders *and*
+    # drops the families the profile gives weight zero (#44): a server has no
+    # desktop session, so the bare list and `-p server` cannot agree in size.
     bare = run(["list", "-s", "1"]).stdout
     if len(bare.splitlines()) < 180:
         fail(f"#9: a bare list printed {len(bare.splitlines())} lines")
@@ -3865,8 +3879,14 @@ def _check_option_surface(tmp):
     desktop = run(["list", "-s", "1", "-p", "desktop"]).stdout
     if server == desktop:
         fail("#9: list -p has no effect at the default count")
-    if len(server.splitlines()) != len(bare.splitlines()):
-        fail("#9: list -p changed the number of lines, not their order")
+    if len(server.splitlines()) >= len(bare.splitlines()):
+        fail(f"#9: list -p server kept {len(server.splitlines())} of "
+             f"{len(bare.splitlines())} templates; a zero-weight family must "
+             f"not be listed")
+    if "/usr/lib/firefox/firefox" in server:
+        fail("#9: list -p server listed a desktop program")
+    if "/usr/lib/firefox/firefox" not in desktop:
+        fail("#9: list -p desktop dropped its own family")
 
     # `list` rejects --repeat-max, so its shortfall must not recommend it.
     p = run(["list", "-f", "mail", "-n", "50"], check=False)
@@ -4882,6 +4902,14 @@ def check_generator_sweep():
                 if k < m:
                     fail(f"#18: {kid['cmd'][:40]!r} starts {k}, before its "
                          f"master at {m}")
+
+    # The `s` and `+` flags describe a terminal session, so the comparison
+    # needs a host that can give an injected row a pty. Without one the table
+    # describes the run it would start on a capable host while the injected
+    # row is detached; that is a capability gap, not a rendering disagreement.
+    if not can_pty():
+        skip("#18 STAT parity needs a pty master to give injected rows a terminal")
+        return
 
     # The same corpus row must render the same STAT in `table` and after
     # injection: the `s` and `+` flags were derived twice and diverged. The
@@ -6571,6 +6599,44 @@ def check_stub_binaries(tmp):
                      f"it does not measure the product")
 
 
+def check_doc_header(tmp: Path) -> None:
+    """The README's pidfile sample must name the fields `inject` writes.
+
+    #35: the header gained `nonce` and the sample did not, so a reader who
+    followed the sample could not recognise a current pidfile. The sample is
+    parsed for its labels and compared with the first line of a real run.
+    """
+    readme = (ROOT / "README.md").read_text()
+    m = re.search(r"^# psgen <version>[^\n]*$", readme, re.M)
+    if m is None:
+        fail("#35: README has no `# psgen <version>` pidfile sample")
+        return
+    sample = m.group(0).split()
+    sample_labels = sample[3::2]
+    sample_values = [sample[2]] + sample[4::2]
+    for v in sample_values:
+        if not (v.startswith("<") and v.endswith(">")):
+            fail(f"#35: README sample field {v!r} is not a placeholder")
+            return
+    p = Path(tmp) / "doc.pid"
+    try:
+        run(["inject", "-n", "1", "--no-exe", "--no-user", "--no-mem",
+             "--no-tty", "--no-threads", "-q", "--pidfile", str(p)])
+        line = p.read_bytes().split(b"\n", 1)[0].decode("utf-8", "replace")
+        parts = line.split()
+        if parts[:2] != ["#", "psgen"] or len(parts) < 3:
+            fail(f"#35: inject wrote an unexpected header {line!r}")
+            return
+        actual_labels = parts[3::2]
+        if sample_labels != actual_labels:
+            fail(f"#35: README sample labels {sample_labels} but inject "
+                 f"writes {actual_labels}")
+        if "nonce" not in sample_labels:
+            fail("#35: the README sample does not carry the run nonce")
+    finally:
+        stop_pidfile(p)
+
+
 def check_meta_tests(tmp: Path) -> None:
     """The gates that hold the other gates to their contract.
 
@@ -6664,6 +6730,7 @@ def _main_checks() -> None:
         check_new_gates(Path(tmp))
     with tempfile.TemporaryDirectory(prefix="psgen-meta-") as tmp:
         check_meta_tests(Path(tmp))
+        check_doc_header(Path(tmp))
     with tempfile.TemporaryDirectory(prefix="psgen-wt4-") as tmp:
         check_session_detach(Path(tmp))
         check_prune_from_another_cwd(Path(tmp))

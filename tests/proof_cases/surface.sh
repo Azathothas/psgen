@@ -865,8 +865,19 @@ case_11_6() {
 		fail_c "the crate publish is not ordered after the release assets and its dry run"
 		return
 	fi
-	grep -Fq 'CARGO_REGISTRY_TOKEN is not set; skipping' "$REL" || {
-		fail_c "a missing registry token fails the release instead of skipping the crate"
+	# #49: a final tag that cannot reach the registry is a failed release,
+	# not a successful one with a skipped crate, and the step proves the
+	# registry serves the version it published.
+	grep -Fq 'CARGO_REGISTRY_TOKEN is not set, so $TAG cannot be published to the registry' "$REL" || {
+		fail_c "a final tag without a registry token does not fail the release"
+		return
+	}
+	grep -Fq 'cargo info "psgen@$version"' "$REL" || {
+		fail_c "the publish step does not verify the registry serves the version"
+		return
+	}
+	grep -Fq 'the registry does not serve psgen@$version' "$REL" || {
+		fail_c "the registry check has no failure message"
 		return
 	}
 	pass_c

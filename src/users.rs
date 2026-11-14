@@ -102,6 +102,21 @@ pub fn valid_name(name: &[u8]) -> bool {
         .all(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
 }
 
+/// Absolute paths `useradd` may live at, in order. Never a bare name: this
+/// runs as root, and a bare name resolves through the caller's `PATH`, which
+/// is CWE-426 whichever caller it is.
+const USERADD_CANDIDATES: &[&str] = &["/usr/sbin/useradd", "/usr/bin/useradd", "/sbin/useradd"];
+
+/// The `useradd` this host has, by absolute path, or `None`.
+fn useradd() -> Option<&'static str> {
+    use std::os::unix::fs::PermissionsExt;
+    USERADD_CANDIDATES.iter().copied().find(|p| {
+        std::fs::metadata(p)
+            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    })
+}
+
 /// Look up a user, optionally creating it with `useradd` when it is missing.
 /// Returns the uid and gid, whether this call created the account, and the
 /// error text when creation failed or the create succeeded without NSS
@@ -119,6 +134,17 @@ pub fn ensure(name: &[u8], create: bool) -> (Option<(u32, u32)>, bool, Option<St
     let name_str = match std::str::from_utf8(name) {
         Ok(s) => s,
         Err(_) => return (None, false, Some("invalid user name".to_string())),
+    };
+    // Resolve the tool once. A bare name would run whatever the inherited
+    // PATH puts first, as root; refusing is better than trusting it.
+    let useradd_bin = match useradd() {
+        Some(p) => p,
+        None => {
+            let mut msg = String::from("no useradd at ");
+            msg.push_str(&USERADD_CANDIDATES.join(", "));
+            msg.push_str("; --create-users needs one of them");
+            return (None, false, Some(msg));
+        }
     };
     // Ordered from most to least specific. The first attempt creates the
     // group with the user; the third uses a group that already exists, which
@@ -175,7 +201,7 @@ pub fn ensure(name: &[u8], create: bool) -> (Option<(u32, u32)>, bool, Option<St
     ];
     let mut first_error = String::new();
     for opts in attempts.iter() {
-        let mut cmd = std::process::Command::new("useradd");
+        let mut cmd = std::process::Command::new(useradd_bin);
         for o in opts.iter() {
             cmd.arg(o);
         }

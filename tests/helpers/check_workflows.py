@@ -618,6 +618,10 @@ def check_publish_guard(root: Path, work: Workdir) -> None:
              f"and a publish")
     elif not published[0].endswith("--dry-run"):
         fail(f"publish-crate published before its dry run: {published}")
+    if not any(c.startswith("cargo info psgen@") for c in calls):
+        fail("publish-crate never verifies that the registry serves the "
+             "version, so a release can pass while `cargo install` still "
+             "installs the name reservation")
 
     ctx = {"ref_name": f"v{ver}-beta.1", "ref": f"refs/tags/v{ver}-beta.1",
            "tag_input": "", "token": "secret-token"}
@@ -629,14 +633,19 @@ def check_publish_guard(root: Path, work: Workdir) -> None:
     if published:
         fail(f"publish-crate published a prerelease: {published}")
 
-    # A fork without the secret skips instead of failing the release.
+    # A fork without the secret fails on a final tag rather than announcing a
+    # release the registry cannot serve (#49). Nothing may be published.
     ctx = {"ref_name": f"v{ver}", "ref": f"refs/tags/v{ver}", "tag_input": "",
            "token": ""}
     env = step_env(step, ctx)
     p, calls = work.run(substitute(body, ctx), ctx, env)
     published = [line for line in calls if line.startswith("cargo publish")]
-    if p.returncode != 0:
-        fail(f"publish-crate failed without a token: {p.stderr.strip()[:160]}")
+    if p.returncode == 0:
+        fail("publish-crate passed without a token; a final tag the registry "
+             "cannot serve has to fail the job")
+    if "CARGO_REGISTRY_TOKEN is not set" not in p.stderr:
+        fail(f"publish-crate failed without naming the token: "
+             f"{p.stderr.strip()[:160]}")
     if published:
         fail(f"publish-crate published without a token: {published}")
 
@@ -1248,6 +1257,41 @@ def check_require_all(root: Path) -> None:
     note("the suite gate job in each workflow sets PSGEN_REQUIRE_ALL=1")
 
 
+def check_readme_ci_gates(root: Path) -> None:
+    """The README's CI-gate list must describe the assertions the workflow makes.
+
+    #35: the list said the unit check greps for `ExecStop=-`, which the
+    workflow deliberately does not (the `/bin/rm` cleanup line satisfies it).
+    Every literal the unit step greps for has to appear in the README
+    paragraph, so deleting an assertion or adding one cannot leave the
+    documentation describing a weaker check.
+    """
+    readme = (root / "README.md").read_text()
+    start = readme.find("### CI gates")
+    if start < 0:
+        fail("#35: README has no `### CI gates` section")
+        return
+    end = readme.find("\n### ", start + 1)
+    section = readme[start:end if end > 0 else len(readme)]
+    norm = " ".join(section.split())
+    ci = (root / ".github" / "workflows" / "ci.yml").read_text()
+    lits = re.findall(r"grep -q '([^']+)' /tmp/psgen\.service", ci)
+    lits += re.findall(r"grep -v -E '([^']+)'", ci)
+    if not lits:
+        fail("#35: the unit check has no greps to compare the README with")
+        return
+    for lit in lits:
+        for frag in re.split(r"[\^\$\.\*\(\)\|\+\[\]\{\}\\]", lit):
+            frag = frag.strip()
+            if len(frag) < 4:
+                continue
+            if frag not in norm:
+                fail(f"#35: the README CI list does not name {frag!r} from "
+                     f"the workflow's {lit!r}")
+    if "`ExecStop=-`" in norm and "does not grep for `ExecStop=-`" not in norm:
+        fail("#35: the README still lists `ExecStop=-` as an assertion")
+
+
 def main(argv: list[str]) -> int:
     root = Path(".").resolve()
     bin_path = None
@@ -1283,6 +1327,7 @@ def main(argv: list[str]) -> int:
         ("smoke", lambda: check_smoke_parity(root)),
         ("smoke-unit", lambda: check_smoke_unit_asserts(root)),
         ("require-all", lambda: check_require_all(root)),
+        ("readme-gates", lambda: check_readme_ci_gates(root)),
         ("sabotage", lambda: check_sabotage_is_staged(root)),
     ]
     work = Workdir(root, bin_path)
