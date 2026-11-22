@@ -4,6 +4,7 @@ version = "0.0.2"
 edition = "2021"
 description = "Generate realistic Linux process lists and inject them into the real process table"
 license = "0BSD"
+authors = ["Azathothas <AjamX101@gmail.com>"]
 repository = "https://github.com/Azathothas/psgen"
 homepage = "https://github.com/Azathothas/psgen"
 readme = "README.md"

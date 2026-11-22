@@ -578,8 +578,10 @@ pub fn run_log(args: &Args) -> i32 {
     // and with --delay 0 the buffer below holds a burst before it is written.
     let hard = args.log_lines.min(MAX_LOG_LINES);
     if args.log_lines > MAX_LOG_LINES {
+        // `--lines` counts events; a weblog burst writes several rows per
+        // event. Calling the cap "log lines" was false by more than 2x.
         let mut out = Buf::new();
-        out.push_str("psgen: log lines capped at ");
+        out.push_str("psgen: log events capped at ");
         out.push_u64(MAX_LOG_LINES as u64);
         out.push(b'\n');
         sys::err(out.as_bytes());
@@ -627,9 +629,11 @@ pub fn run_log(args: &Args) -> i32 {
             emitted.push_bytes(&chunk);
         }
         if args.log_delay_ms > 0 && i + 1 < lines {
-            if !sys::out_checked(emitted.as_bytes()) {
+            match sys::out_checked(emitted.as_bytes()) {
+                sys::OutResult::Ok => {}
                 // The reader is gone. EPIPE is not an error.
-                return 0;
+                sys::OutResult::ReaderGone => return 0,
+                sys::OutResult::Failed(e) => return sys::out_failure(e),
             }
             emitted = Buf::new();
             let ms = args.log_delay_ms / args.speed.max(1);
@@ -638,16 +642,19 @@ pub fn run_log(args: &Args) -> i32 {
             // With no delay the buffer used to grow to the whole output before
             // a single write. Flush on a bound, and stop when the reader has
             // gone even if there is no delay to slow the loop down.
-            if !sys::out_checked(emitted.as_bytes()) {
-                return 0;
+            match sys::out_checked(emitted.as_bytes()) {
+                sys::OutResult::Ok => {}
+                sys::OutResult::ReaderGone => return 0,
+                sys::OutResult::Failed(e) => return sys::out_failure(e),
             }
             emitted = Buf::new();
         }
     }
-    if !sys::out_checked(emitted.as_bytes()) {
-        return 0;
+    match sys::out_checked(emitted.as_bytes()) {
+        sys::OutResult::Ok => 0,
+        sys::OutResult::ReaderGone => 0,
+        sys::OutResult::Failed(e) => sys::out_failure(e),
     }
-    0
 }
 
 /// Burn `pct` percent of one core until `deadline` (monotonic ns), or forever.
@@ -693,12 +700,113 @@ fn touch(ptr: *mut u8, len: usize) {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum MemGuardOutcome {
+    /// Proceed and map `mem_kb` KiB.
+    Allow(u64),
+    /// Refuse with exit status and diagnostic message.
+    Refuse { code: i32, msg: Vec<u8> },
+}
+
+/// Decide how many KiB `--mem-util` may map, or why the request is refused.
+///
+/// The denominator is the tighter of host `MemTotal` and any finite cgroup
+/// memory limit. The ceiling is the tighter of host `MemAvailable` and the
+/// cgroup's remaining headroom; a cgroup with zero headroom (`Some(0)`) is a
+/// known zero budget, never treated as "unknown".
+fn eval_mem_guard(
+    mem_pct: u32,
+    mem_total_kb: u64,
+    host_avail_kb: u64,
+    cg: Option<util::CgroupMem>,
+    force: bool,
+) -> MemGuardOutcome {
+    let cg_limit = cg.map(|c| c.limit_kb).unwrap_or(0);
+    let denom_is_cgroup = cg_limit > 0 && (mem_total_kb == 0 || cg_limit < mem_total_kb);
+    let total = if denom_is_cgroup {
+        cg_limit
+    } else {
+        mem_total_kb
+    };
+    if total == 0 {
+        return MemGuardOutcome::Refuse {
+            code: 1,
+            msg: b"psgen: cannot read MemTotal; --mem-util needs /proc/meminfo\n".to_vec(),
+        };
+    }
+    let mem_kb = total.saturating_mul(mem_pct as u64) / 100;
+    // MemTotal is the wrong denominator for "make the host look busy": on a
+    // host that is already half full, 95% of total is more than exists free,
+    // and the touch loop then invokes the OOM killer against its own caller.
+    // Refuse unless the caller says it means it.
+    //
+    // MemAvailable is the wrong numerator inside a memory cgroup: the host can
+    // report terabytes free while the cgroup's own limit has a few MiB left.
+    // The limit that will OOM the mapping is the cgroup's, and the headroom is
+    // limit minus what it already charges.
+    let mut avail = host_avail_kb;
+    let mut avail_known = host_avail_kb > 0;
+    let mut headroom_is_cgroup = false;
+    if let Some(c) = cg.filter(|c| c.limit_kb > 0) {
+        match c.headroom_kb {
+            Some(h) => {
+                if !avail_known || h <= avail {
+                    avail = h;
+                    headroom_is_cgroup = true;
+                }
+                avail_known = true;
+            }
+            None => {
+                let mut out = Buf::new();
+                out.push_str("psgen: the cgroup limit is ");
+                out.push_u64(c.limit_kb / 1024);
+                out.push_str(" MiB but its current usage cannot be read; --mem-util would be sized against a limit it cannot check\n");
+                return MemGuardOutcome::Refuse {
+                    code: 1,
+                    msg: out.v,
+                };
+            }
+        }
+    }
+    if avail_known && mem_kb > avail && !force {
+        let mut out = Buf::new();
+        out.push_str("psgen: --mem-util ");
+        out.push_u64(mem_pct as u64);
+        out.push_str(if denom_is_cgroup {
+            "% of cgroup memory limit is "
+        } else {
+            "% of MemTotal is "
+        });
+        out.push_u64(mem_kb / 1024);
+        out.push_str(" MiB, above the ");
+        out.push_u64(avail / 1024);
+        out.push_str(if headroom_is_cgroup {
+            " MiB this cgroup can still allocate; use --force to attempt it anyway\n"
+        } else {
+            " MiB MemAvailable; use --force to attempt it anyway\n"
+        });
+        return MemGuardOutcome::Refuse {
+            code: 2,
+            msg: out.v,
+        };
+    }
+    MemGuardOutcome::Allow(mem_kb)
+}
+
 pub fn run_load(args: &Args) -> i32 {
+    // The clamp and the "was it supplied" question are different: after the
+    // clamp an explicit 0 and an omitted option are the same value, so the
+    // message used to claim an option was missing when all three were given.
+    let supplied = args.load_cpu.is_some() || args.load_mem.is_some() || args.load_disk.is_some();
     let cpu_pct = args.load_cpu.unwrap_or(0).min(100);
     let mem_pct = args.load_mem.unwrap_or(0).min(95);
     let disk_mb = args.load_disk.unwrap_or(0);
-    if cpu_pct == 0 && mem_pct == 0 && disk_mb == 0 {
+    if !supplied {
         sys::err(b"psgen: load needs at least one of --cpu-util, --mem-util, --disk-util\n");
+        return 2;
+    }
+    if cpu_pct == 0 && mem_pct == 0 && disk_mb == 0 {
+        sys::err(b"psgen: all utilization values are zero; set at least one above zero\n");
         return 2;
     }
     let secs = args.duration as u64;
@@ -713,31 +821,19 @@ pub fn run_load(args: &Args) -> i32 {
 
     // Memory: hold a touched mapping for the whole run.
     if mem_pct > 0 {
-        let total = util::mem_total_kb();
-        let cg = util::cgroup_mem_limit_kb();
-        let total = if cg > 0 { total.min(cg) } else { total };
-        if total == 0 {
-            sys::err(b"psgen: cannot read MemTotal; --mem-util needs /proc/meminfo\n");
-            return 1;
-        }
-        let mem_kb = total * mem_pct as u64 / 100;
-        // MemTotal is the wrong denominator for "make the host look busy": on a
-        // host that is already half full, 95% of total is more than exists
-        // free, and the touch loop then invokes the OOM killer against its own
-        // caller. Refuse unless the caller says it means it.
-        let avail = util::mem_available_kb();
-        if avail > 0 && mem_kb > avail && !args.force {
-            let mut out = Buf::new();
-            out.push_str("psgen: --mem-util ");
-            out.push_u64(mem_pct as u64);
-            out.push_str("% of MemTotal is ");
-            out.push_u64(mem_kb / 1024);
-            out.push_str(" MiB, above the ");
-            out.push_u64(avail / 1024);
-            out.push_str(" MiB MemAvailable; use --force to attempt it anyway\n");
-            sys::err(out.as_bytes());
-            return 2;
-        }
+        let mem_kb = match eval_mem_guard(
+            mem_pct,
+            util::mem_total_kb(),
+            util::mem_available_kb(),
+            util::cgroup_mem_limits(),
+            args.force,
+        ) {
+            MemGuardOutcome::Allow(kb) => kb,
+            MemGuardOutcome::Refuse { code, msg } => {
+                sys::err(&msg);
+                return code;
+            }
+        };
         let want = mem_kb.saturating_mul(1024);
         let len = want.min(usize::MAX as u64) as usize;
         if want > len as u64 {
@@ -779,6 +875,21 @@ pub fn run_load(args: &Args) -> i32 {
     if disk_mb > 0 {
         let dir = std::env::temp_dir();
         let want = disk_mb.saturating_mul(1024 * 1024);
+        let dirb = dir.as_os_str().as_bytes().to_vec();
+        // The directory is measured before anything else: a missing `TMPDIR`
+        // is the cause whether the request is one MiB or nine thousand, and a
+        // limit report would name a second problem while hiding the first.
+        let free = match crate::probe::space(&dirb) {
+            Some((free, _)) => free,
+            None => {
+                let mut out = Buf::new();
+                out.push_str("psgen: --disk-util cannot measure the free space in ");
+                out.push_bytes(&dirb);
+                out.push_str("; create it or set TMPDIR\n");
+                sys::err(out.as_bytes());
+                return 1;
+            }
+        };
         if let Some(limit) = sys::rlimit_fsize() {
             if want > limit {
                 let mut out = Buf::new();
@@ -791,30 +902,18 @@ pub fn run_load(args: &Args) -> i32 {
                 return 1;
             }
         }
-        let dirb = dir.as_os_str().as_bytes().to_vec();
-        // A directory that cannot be measured is refused, not waved through:
-        // the guard exists so `load` cannot fill the filesystem it runs on, and
-        // a missing `TMPDIR` skipped it and then blamed the disk.
-        let free = match crate::probe::space(&dirb) {
-            Some((free, _)) => free,
-            None => {
-                let mut out = Buf::new();
-                out.push_str("psgen: --disk-util cannot measure the free space in ");
-                out.push_bytes(&dirb);
-                out.push_str("; create it or set TMPDIR\n");
-                sys::err(out.as_bytes());
-                return 1;
-            }
-        };
         if want > free.saturating_sub(free / 10) {
+            let usable = free.saturating_sub(free / 10);
             let mut out = Buf::new();
             out.push_str("psgen: --disk-util ");
             out.push_u64(disk_mb);
-            out.push_str(" MiB exceeds the free space in ");
+            out.push_str(" MiB exceeds the usable space in ");
             out.push_bytes(&dirb);
             out.push_str(" (");
+            out.push_u64(usable / 1024 / 1024);
+            out.push_str(" MiB of ");
             out.push_u64(free / 1024 / 1024);
-            out.push_str(" MiB free)\n");
+            out.push_str(" MiB free; 10% is reserved)\n");
             sys::err(out.as_bytes());
             return 1;
         }
@@ -861,9 +960,13 @@ pub fn run_load(args: &Args) -> i32 {
     }
     note.push(b'\n');
     // The summary is information, not a diagnostic: it goes to stdout so
-    // `psgen load ... | tee` shows it, and `-q` suppresses it.
+    // `psgen load ... | tee` shows it, and `-q` suppresses it. A failed write
+    // (a full filesystem) is reported and fails the run; a closed pipe is not.
     if !args.quiet {
-        let _ = sys::out_checked(note.as_bytes());
+        match sys::out_checked(note.as_bytes()) {
+            sys::OutResult::Ok | sys::OutResult::ReaderGone => {}
+            sys::OutResult::Failed(e) => return sys::out_failure(e),
+        }
     }
 
     burn(cpu_pct, deadline);
@@ -899,4 +1002,143 @@ fn make_load_file(dir: &std::path::Path) -> Option<std::fs::File> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::util::CgroupMem;
+
+    const MIB: u64 = 1024;
+
+    #[test]
+    fn cgroup_denominator_is_named_instead_of_memtotal() {
+        let cg = Some(CgroupMem {
+            limit_kb: 512 * MIB,
+            headroom_kb: Some(64 * MIB),
+        });
+        let res = eval_mem_guard(20, 64 * 1024 * MIB, 32 * 1024 * MIB, cg, false);
+        match res {
+            MemGuardOutcome::Refuse { code, msg } => {
+                let text = String::from_utf8_lossy(&msg);
+                assert_eq!(code, 2, "{}", text);
+                assert!(
+                    text.contains("20% of cgroup memory limit is 102 MiB"),
+                    "{}",
+                    text
+                );
+                assert!(!text.contains("MemTotal"), "{}", text);
+                assert!(
+                    text.contains("64 MiB this cgroup can still allocate"),
+                    "{}",
+                    text
+                );
+            }
+            MemGuardOutcome::Allow(kb) => panic!("expected refusal, got Allow({})", kb),
+        }
+
+        // When MemTotal is smaller than the cgroup limit, MemTotal is the denominator.
+        let cg_big = Some(CgroupMem {
+            limit_kb: 128 * 1024 * MIB,
+            headroom_kb: Some(64 * MIB),
+        });
+        let res = eval_mem_guard(10, 16 * 1024 * MIB, 8 * 1024 * MIB, cg_big, false);
+        match res {
+            MemGuardOutcome::Refuse { code, msg } => {
+                let text = String::from_utf8_lossy(&msg);
+                assert_eq!(code, 2, "{}", text);
+                assert!(text.contains("10% of MemTotal is "), "{}", text);
+                assert!(
+                    text.contains("64 MiB this cgroup can still allocate"),
+                    "{}",
+                    text
+                );
+            }
+            MemGuardOutcome::Allow(kb) => panic!("expected refusal, got Allow({})", kb),
+        }
+    }
+
+    #[test]
+    fn zero_cgroup_headroom_is_refused_not_fail_open() {
+        let cg = Some(CgroupMem {
+            limit_kb: 512 * MIB,
+            headroom_kb: Some(0),
+        });
+        // Host has plenty of MemAvailable, but cgroup headroom is 0.
+        let res = eval_mem_guard(10, 64 * 1024 * MIB, 32 * 1024 * MIB, cg, false);
+        match res {
+            MemGuardOutcome::Refuse { code, msg } => {
+                let text = String::from_utf8_lossy(&msg);
+                assert_eq!(code, 2, "{}", text);
+                assert!(
+                    text.contains("0 MiB this cgroup can still allocate"),
+                    "{}",
+                    text
+                );
+            }
+            MemGuardOutcome::Allow(kb) => panic!("zero headroom must not fail open: {}", kb),
+        }
+
+        // Even when host MemAvailable is unavailable (0), cgroup headroom 0 still refuses.
+        let res_no_host_avail = eval_mem_guard(10, 64 * 1024 * MIB, 0, cg, false);
+        assert!(
+            matches!(res_no_host_avail, MemGuardOutcome::Refuse { code: 2, .. }),
+            "zero headroom with host_avail=0 must still refuse: {:?}",
+            res_no_host_avail
+        );
+    }
+
+    #[test]
+    fn unreadable_cgroup_current_is_refused() {
+        let cg = Some(CgroupMem {
+            limit_kb: 512 * MIB,
+            headroom_kb: None,
+        });
+        let res = eval_mem_guard(10, 64 * 1024 * MIB, 32 * 1024 * MIB, cg, false);
+        match res {
+            MemGuardOutcome::Refuse { code, msg } => {
+                let text = String::from_utf8_lossy(&msg);
+                assert_eq!(code, 1, "{}", text);
+                assert!(text.contains("512 MiB"), "{}", text);
+                assert!(text.contains("current usage cannot be read"), "{}", text);
+            }
+            MemGuardOutcome::Allow(kb) => panic!("unreadable cgroup current must refuse: {}", kb),
+        }
+    }
+
+    #[test]
+    fn host_memavailable_tighter_than_cgroup_headroom_blames_memavailable() {
+        let cg = Some(CgroupMem {
+            limit_kb: 512 * MIB,
+            headroom_kb: Some(400 * MIB),
+        });
+        let res = eval_mem_guard(20, 64 * 1024 * MIB, 16 * MIB, cg, false);
+        match res {
+            MemGuardOutcome::Refuse { code, msg } => {
+                let text = String::from_utf8_lossy(&msg);
+                assert_eq!(code, 2, "{}", text);
+                assert!(
+                    text.contains("20% of cgroup memory limit is 102 MiB"),
+                    "{}",
+                    text
+                );
+                assert!(text.contains("16 MiB MemAvailable"), "{}", text);
+                assert!(!text.contains("this cgroup can still allocate"), "{}", text);
+            }
+            MemGuardOutcome::Allow(kb) => panic!("expected refusal, got Allow({})", kb),
+        }
+    }
+
+    #[test]
+    fn force_overrides_over_budget_refusal() {
+        let cg = Some(CgroupMem {
+            limit_kb: 512 * MIB,
+            headroom_kb: Some(0),
+        });
+        let res = eval_mem_guard(20, 64 * 1024 * MIB, 16 * MIB, cg, true);
+        assert_eq!(res, MemGuardOutcome::Allow(512 * MIB * 20 / 100));
+
+        let host_only = eval_mem_guard(95, 1024 * MIB, 16 * MIB, None, true);
+        assert_eq!(host_only, MemGuardOutcome::Allow(1024 * MIB * 95 / 100));
+    }
 }

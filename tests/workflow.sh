@@ -440,7 +440,22 @@ sabotage "checksums-includes-itself" notes \
     's/sha256sum psgen-\*/sha256sum -b * > SHA256SUMS/' \
     .github/workflows/release.yml
 
-# 20. A negative control: the unchanged copy must pass every check the
+# 20. Revert tokenless final-tag publish back to a green skip (#49): a final
+#     tag without CARGO_REGISTRY_TOKEN must fail rather than announce a
+#     release the registry cannot serve.
+sabotage "publish-tokenless-skip" publish-guard \
+    "publish-crate passed without a token" \
+    '/CARGO_REGISTRY_TOKEN:-/,/^          fi$/{s/echo "CARGO_REGISTRY_TOKEN is not set.*" >&2/echo "skipping cargo publish"/;s/exit 1/exit 0/}' \
+    .github/workflows/release.yml
+
+# 21. Drop the `cargo info` registry verification loop (#49): a publish that
+#     exits 0 without proving the registry serves the new version must fail.
+sabotage "publish-registry-verify-dropped" publish-guard \
+    "publish-crate never verifies that the registry serves the version" \
+    '/^          version=..TAG#v}/,/^          echo "the registry serves/d' \
+    .github/workflows/release.yml
+
+# 22. A negative control: the unchanged copy must pass every check the
 #     sabotages target, so a gate that fails everything cannot pass for a good
 #     one. Each sabotage above names the message it produced, and this proves
 #     the same check accepts the tree when the defect is absent — without both

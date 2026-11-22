@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import ctypes
+import fcntl
 import json
 import math
 import os
@@ -20,6 +21,7 @@ import re
 import resource
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -550,10 +552,34 @@ def check_cli():
         rows = [l for l in run(args).stdout.splitlines() if not l.startswith("USER ")]
         if len(rows) != want:
             fail(f"{args} returned {len(rows)} rows")
-    if run(["table", "-p", "bogus"], check=False).returncode != 2:
+    p = run(["table", "-p", "bogus"], check=False)
+    if p.returncode != 2:
         fail("bad profile did not exit 2")
-    if run(["table", "-f", "bogus"], check=False).returncode != 2:
+    p = run(["table", "--profile", "foo"], check=False)
+    if p.returncode != 2 or "foo" not in p.stderr or "server, dev or desktop" not in p.stderr:
+        fail(f"#45: unknown --profile error mismatch: rc={p.returncode} {p.stderr.strip()[:160]!r}")
+    p = run(["table", "-f", "bogus"], check=False)
+    if p.returncode != 2:
         fail("bad family did not exit 2")
+    p = run(["table", "--family", "foo"], check=False)
+    if p.returncode != 2 or "foo" not in p.stderr or "--help" not in p.stderr:
+        fail(f"#45: unknown --family error mismatch: rc={p.returncode} {p.stderr.strip()[:160]!r}")
+    p = run(["log", "--log-fmt", "foo"], check=False)
+    if p.returncode != 2 or "foo" not in p.stderr or "apache, json or syslog" not in p.stderr:
+        fail(f"#45: unknown --log-fmt error mismatch: rc={p.returncode} {p.stderr.strip()[:160]!r}")
+    p = run(["inject", "-n", "1", "--mem-cap", "1", "--dry-run"], check=False)
+    if p.returncode != 0 or "1 stub" not in p.stderr or "1 stubs" in p.stderr:
+        fail(f"#45: inject -n 1 --mem-cap 1 warning grammar mismatch: "
+             f"rc={p.returncode} {p.stderr.strip()[:160]!r}")
+    p = run(["inject", "-n", "40", "--phys-cap", "30", "--dry-run"], check=False)
+    m_kib = re.search(r"about (\d+) KiB, above the (\d+) KiB budget", p.stderr)
+    if p.returncode != 0 or not m_kib or int(m_kib.group(1)) <= int(m_kib.group(2)):
+        fail(f"#45: --phys-cap over-budget warning did not report distinct KiB values: "
+             f"rc={p.returncode} {p.stderr.strip()[:160]!r}")
+    for sub in ("table", "load"):
+        h = " ".join(run([sub, "--help"]).stdout.split())
+        if "--host-pid-max" not in h or "PID 1 is still shown" not in h:
+            fail(f"#37: {sub} --help --host-pid-max does not state that PID 1 is still shown")
     a = run(["list", "-n", "10", "-s", "7", "--sort"]).stdout.splitlines()
     if a != sorted(a):
         fail("--sort did not sort")
@@ -1070,6 +1096,63 @@ def check_stop():
         if run(["stop"], check=False).returncode != 2:
             fail("stop without --pidfile did not exit 2")
 
+        # #38: distinct OS error messages naming the path for ENOENT, EACCES,
+        # and EISDIR.
+        missing = Path(tmp) / "no-such.pid"
+        p_missing = run(["stop", "--pidfile", str(missing)], check=False)
+        if p_missing.returncode != 1 or str(missing) not in p_missing.stderr:
+            fail(f"#38: stop on missing pidfile failed unexpectedly: "
+                 f"rc={p_missing.returncode} {p_missing.stderr.strip()[:160]!r}")
+        as_dir = Path(tmp) / "dir.pid"
+        as_dir.mkdir()
+        p_dir = run(["stop", "--pidfile", str(as_dir)], check=False)
+        if p_dir.returncode != 1 or str(as_dir) not in p_dir.stderr:
+            fail(f"#38: stop on directory pidfile failed unexpectedly: "
+                 f"rc={p_dir.returncode} {p_dir.stderr.strip()[:160]!r}")
+        err_missing = p_missing.stderr.replace(str(missing), "<path>").strip()
+        err_dir = p_dir.stderr.replace(str(as_dir), "<path>").strip()
+        if err_missing == err_dir:
+            fail(f"#38: ENOENT and EISDIR produced identical stop errors: {err_missing!r}")
+        if not is_root():
+            unreadable = Path(tmp) / "mode000.pid"
+            unreadable.write_text("x\n")
+            unreadable.chmod(0)
+            try:
+                p_perm = run(["stop", "--pidfile", str(unreadable)], check=False)
+            finally:
+                unreadable.chmod(0o600)
+            if p_perm.returncode != 1 or str(unreadable) not in p_perm.stderr:
+                fail(f"#38: stop on mode-000 pidfile failed unexpectedly: "
+                     f"rc={p_perm.returncode} {p_perm.stderr.strip()[:160]!r}")
+            err_perm = p_perm.stderr.replace(str(unreadable), "<path>").strip()
+            if len({err_missing, err_dir, err_perm}) != 3:
+                fail(f"#38: ENOENT/EISDIR/EACCES stop errors were not distinct: "
+                     f"{(err_missing, err_dir, err_perm)!r}")
+
+        # #38: leading comments/blanks (including `# psgen-wrapper` and
+        # `# psgen: note`) are accepted before the real header; a header after
+        # content is rejected.
+        hdr = f"# psgen {VERSION} boot {boot_id()} nonce 0000000000000000\n"
+        body = "999999\t0\ttest\n"
+        for label, prefix in (
+            ("plain comment", "# note\n"),
+            ("psgen-wrapper comment", "# psgen-wrapper\n"),
+            ("psgen-colon comment", "# psgen: note\n"),
+            ("blank line", "\n"),
+        ):
+            pf_hdr = Path(tmp) / "lead.pid"
+            pf_hdr.write_text(prefix + hdr + body)
+            r = run(["stop", "--plan", "--pidfile", str(pf_hdr)], check=False)
+            if r.returncode != 0:
+                fail(f"#38: stop --plan rejected valid header after {label}: "
+                     f"rc={r.returncode} {r.stderr.strip()[:160]!r}")
+        pf_late = Path(tmp) / "late.pid"
+        pf_late.write_text(body + hdr)
+        r = run(["stop", "--plan", "--pidfile", str(pf_late)], check=False)
+        if r.returncode != 1 or "not a psgen pidfile" not in r.stderr:
+            fail(f"#38: stop --plan accepted header after content line: "
+                 f"rc={r.returncode} {r.stderr.strip()[:160]!r}")
+
 
 def check_root():
     with tempfile.TemporaryDirectory(prefix="psgen-root-") as tmp:
@@ -1450,6 +1533,26 @@ def check_log():
     if time.monotonic() - t0 > 1.5:
         fail("--speed did not shorten the delay")
 
+    # #36: --lines 0 is a usage error, and >200000 warns about events (not lines).
+    p0 = run(["log", "--lines", "0"], check=False)
+    if p0.returncode != 2 or "--lines" not in p0.stderr:
+        fail(f"#36: log --lines 0 was not refused with exit 2: "
+             f"rc={p0.returncode} {p0.stderr.strip()[:120]!r}")
+    proc = subprocess.Popen(
+        [str(BIN), "log", "-m", "weblog", "--lines", "200001", "--delay", "0"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        proc.stdout.readline()
+        proc.stdout.close()
+        err = proc.stderr.read()
+        proc.wait(timeout=30)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    if "log events capped at 200000" not in err or "log lines capped" in err:
+        fail(f"#36: log --lines 200001 cap warning mismatch: {err.strip()[:160]!r}")
+
 
 def poll_until(predicate, timeout=6.0, interval=0.05):
     """Poll `predicate` until it returns a true value, or the timeout passes."""
@@ -1481,8 +1584,18 @@ def held_fds(pid, size):
 
 
 def check_load():
-    if run(["load"], check=False).returncode != 2:
-        fail("load without a util flag did not exit 2")
+    p = run(["load"], check=False)
+    if p.returncode != 2 or "at least one" not in p.stderr:
+        fail(f"#39: load without a util flag did not exit 2 naming 'at least one': "
+             f"rc={p.returncode} {p.stderr.strip()[:120]!r}")
+    for zero_args in (
+        ["load", "--cpu-util", "0"],
+        ["load", "--cpu-util", "0", "--mem-util", "0", "--disk-util", "0"],
+    ):
+        pz = run(zero_args, check=False)
+        if pz.returncode != 2 or "all utilization values are zero" not in pz.stderr:
+            fail(f"#39: {' '.join(zero_args)} did not exit 2 with zero-util refusal: "
+                 f"rc={pz.returncode} {pz.stderr.strip()[:120]!r}")
 
     total = mem_total()
     cg = cgroup_limit_kb()
@@ -1588,9 +1701,11 @@ def check_load_disk_guards():
             over = (free // (1024 * 1024)) + 8
             env = dict(os.environ, TMPDIR=str(small_fs))
             p = limited(["load", "--disk-util", over], None, env=env)
-            if p.returncode != 1 or "exceeds the free space" not in p.stderr:
-                fail(f"load --disk-util {over} ignored the free-space guard: "
-                     f"rc={p.returncode} {p.stderr.strip()[:120]!r}")
+            if (p.returncode != 1
+                    or "exceeds the usable space" not in p.stderr
+                    or "10% is reserved" not in p.stderr):
+                fail(f"#39: load --disk-util {over} ignored the usable-space guard: "
+                     f"rc={p.returncode} {p.stderr.strip()[:160]!r}")
         finally:
             subprocess.run(as_root(["umount", small_fs]), stdout=subprocess.DEVNULL,
                            stderr=subprocess.DEVNULL)
@@ -1610,8 +1725,11 @@ def check_load_disk_guards():
              f"is {resource.getrlimit(resource.RLIMIT_FSIZE)[1] // (1024 * 1024)} MiB")
         return
     p = limited(["load", "--disk-util", over], None)
-    if p.returncode != 1 or "exceeds the free space" not in p.stderr:
-        fail(f"load --disk-util {over} ignored the free-space guard")
+    if (p.returncode != 1
+            or "exceeds the usable space" not in p.stderr
+            or "10% is reserved" not in p.stderr):
+        fail(f"#39: load --disk-util {over} ignored the usable-space guard: "
+             f"rc={p.returncode} {p.stderr.strip()[:160]!r}")
 
 
 TIOCGPTN = 0x80045430
@@ -2771,11 +2889,12 @@ def check_residuals(tmp):
         fail("#15: --plan -q printed would-signal lines")
     stop_pidfile(pf)
 
-    # #24: --lines 0 is "print nothing and succeed", which is what the base
-    # did; the review kept that rather than turning it into an error.
+    # #24: `--lines 0` is a usage error, like `--speed 0`: a silent success is
+    # not a parse error, and the help says the value is "events to write".
     p = run(["log", "--lines", "0"], check=False)
-    if p.returncode != 0 or p.stdout.strip():
-        fail(f"#24: log --lines 0 printed {p.stdout[:40]!r} and exited {p.returncode}")
+    if p.returncode != 2 or "--lines must be at least 1" not in p.stderr:
+        fail(f"#24: log --lines 0 printed {p.stdout[:40]!r}, stderr "
+             f"{p.stderr.strip()[:60]!r} and exited {p.returncode}")
 
     # #5: an unmarked foreign .psgen-* directory is never removed.
     foreign = Path(tmp) / ".psgen-1-2-3"
@@ -3441,6 +3560,16 @@ def check_option_matrix():
         return elapsed
 
     observed = {("inject", "-d"): inject_lifetime}
+    # `--repeat-max` bounds *repeated command lines*. The default table request
+    # is 30 rows from 181 templates, so no command repeats and the flag cannot
+    # bind; this cell asks for 200 rows from the 8-template stop family, where
+    # `--repeat-max 1` must stop short (and say so) and `5` must not. Until
+    # this override the cell passed on the PIDs the old accounting happened to
+    # reshuffle, which measured nothing about repeats.
+    cell_base = {
+        ("table", "--repeat-max"): ["-f", "sto", "-n", "200"],
+        ("inject", "--repeat-max"): ["-f", "sto", "-n", "60"],
+    }
     # `stop` without a pidfile is a usage error for every cell, which says
     # nothing about the option; give it a file so the rejection is about the
     # flag under test. The file must be one `stop` accepts, which now means a
@@ -3474,8 +3603,9 @@ def check_option_matrix():
                     compared += 1
                     continue
                 try:
-                    ra = matrix_run([sub] + base[sub] + a)
-                    rb = matrix_run([sub] + base[sub] + b)
+                    extra = cell_base.get((sub, opt), [])
+                    ra = matrix_run([sub] + base[sub] + extra + a)
+                    rb = matrix_run([sub] + base[sub] + extra + b)
                 except subprocess.TimeoutExpired:
                     fail(f"#9: {sub} {opt} timed out")
                 # Only exit 2 means "this option does not apply here". Anything
@@ -3566,6 +3696,53 @@ def check_unit_and_report_truth(tmp: Path) -> None:
         if p.returncode != 2 or "psgen:" not in p.stderr:
             fail(f"unit accepted {path} (rc {p.returncode})")
 
+    # #32: unit CLI path boundary checks (dot components, nesting, empty
+    # components, >246-byte basename, non-UTF-8 basename, quotes/backslash in
+    # runtime dir, valid 246-byte basename, and % escaping).
+    for bad_path, want_err in (
+        ("/run/.", None),
+        ("/run/..", None),
+        ("/run/psgen/.", None),
+        ("/run/psgen/..", None),
+        ("/run/a/b/c.pid", "at most one directory below /run"),
+        ("/run//psgen/x.pid", "empty component"),
+        ("/run/psgen/" + "a" * 247, "246"),
+        ("/run/ps'gen/x.pid", None),
+        ('/run/ps"gen/x.pid', None),
+        (r"/run/ps\gen/x.pid", None),
+    ):
+        p = run(["unit", "--pidfile", bad_path], check=False)
+        if p.returncode != 2:
+            fail(f"#32: unit accepted invalid pidfile {bad_path!r} (rc={p.returncode})")
+        if want_err is not None and want_err not in p.stderr:
+            fail(f"#32: unit refusal for {bad_path!r} missed {want_err!r}: "
+                 f"{p.stderr.strip()[:160]!r}")
+    p_raw = subprocess.run(
+        [os.fsencode(BIN), b"unit", b"--pidfile", b"/run/psgen/a\xffb.pid"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+    err_raw = p_raw.stderr.decode("utf-8", "replace")
+    if p_raw.returncode != 2 or "UTF-8" not in err_raw:
+        fail(f"#32: unit did not refuse non-UTF-8 basename: rc={p_raw.returncode} "
+             f"{err_raw.strip()[:160]!r}")
+    ok_246 = "/run/psgen/" + "a" * 246
+    p_ok246 = run(["unit", "--pidfile", ok_246], check=False)
+    if p_ok246.returncode != 0 or "RuntimeDirectory=psgen" not in p_ok246.stdout:
+        fail(f"#32: unit rejected valid 246-byte basename: rc={p_ok246.returncode} "
+             f"{p_ok246.stderr.strip()[:160]!r}")
+    pct_unit = run(["unit", "--pidfile", "/run/psgen/a%nb.pid"]).stdout
+    pct_start = next(l for l in pct_unit.splitlines() if l.startswith("ExecStart="))
+    if "a%%nb.pid" not in pct_start:
+        fail(f"#32: unit did not escape % in ExecStart: {pct_start!r}")
+    if shutil.which("systemd-analyze"):
+        ufile = Path(tmp) / "psgen-pct.service"
+        ufile.write_text(pct_unit)
+        va = subprocess.run(["systemd-analyze", "verify", str(ufile)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, timeout=60)
+        if va.returncode != 0:
+            fail(f"#32: systemd-analyze verify rejected unit with % in path: "
+                 f"{va.stderr.strip()[:200]!r}")
+
     # `$` is a variable reference in an Exec line; `unit` must double it, and
     # the pre-fix output named a path nobody asked for.
     dollars = run(["unit", "--pidfile", "/run/psgen-u1/a$b.pid"]).stdout
@@ -3611,24 +3788,85 @@ def check_unit_and_report_truth(tmp: Path) -> None:
     if len(set(paths.values())) != 2:
         fail(f"two distinct paths became one JSON value: {paths!r}")
 
+    # #34: doctor --json keeps literal printable ASCII, refuses non-UTF-8
+    # pidfile paths with exit 1 + text-report hint, accepts valid UTF-8,
+    # escapes newline onto one line in text mode, and uses singular "process"
+    # for 1 live row.
+    j_std = run(["doctor", "--json"]).stdout
+    if '"version":' not in j_std or '"proc_exe"' not in j_std:
+        fail(f"#34: doctor --json escaped standard ASCII fields: {j_std[:160]!r}")
+    if all(0x20 <= ord(ch) < 0x7f for ch in os.getcwd()) and r"\u00" in j_std:
+        fail(f"#34: doctor --json emitted unexpected \\u00 escape in ASCII environment: "
+             f"{j_std[:200]!r}")
+    bad_pf = os.fsencode(tmp) + b"/x\xff.pid"
+    p_bad = subprocess.run(
+        [os.fsencode(BIN), b"doctor", b"--json", b"--pidfile", bad_pf],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+    err_bad = p_bad.stderr.decode("utf-8", "replace")
+    if p_bad.returncode != 1 or "use the text report" not in err_bad or p_bad.stdout:
+        fail(f"#34: doctor --json did not refuse non-UTF-8 pidfile cleanly: "
+             f"rc={p_bad.returncode} out={p_bad.stdout[:80]!r} err={err_bad.strip()[:160]!r}")
+    good_pf = Path(tmp) / "x\u00ff.pid"
+    doc_utf8 = json.loads(run(["doctor", "--json", "--pidfile", str(good_pf)]).stdout)
+    if doc_utf8.get("pidfile", {}).get("path") != str(good_pf):
+        fail(f"#34: doctor --json mangled valid UTF-8 pidfile: {doc_utf8.get('pidfile')!r}")
+    nl_pf = f"{tmp}/a\nb.pid"
+    nl_out = run(["doctor", "--pidfile", nl_pf]).stdout
+    pf_lines = [l for l in nl_out.splitlines() if l.startswith("pidfile\t")]
+    if len(pf_lines) != 1 or r"a\x0ab.pid" not in pf_lines[0]:
+        fail(f"#34: doctor text mode did not keep newline pidfile on one line: {pf_lines!r}")
+    if any(l.startswith("b.pid") for l in nl_out.splitlines()):
+        fail("#34: doctor text mode split newline pidfile across lines")
+    one_live = Path(tmp) / "one-live-doctor.pid"
+    run(["inject", "-n", "1", "-s", "7", "--no-exe", "--no-user", "--no-mem",
+         "--no-tty", "--no-threads", "--pidfile", str(one_live)])
+    try:
+        one_text = run(["doctor", "--pidfile", str(one_live)]).stdout
+        one_line = next(l for l in one_text.splitlines() if l.startswith("pidfile\t"))
+        if "records 1 live process" not in one_line or "records 1 live processes" in one_line:
+            fail(f"#34: doctor text mode did not use singular for 1 live row: {one_line!r}")
+        one_doc = json.loads(run(["doctor", "--json", "--pidfile", str(one_live)]).stdout)
+        if one_doc["pidfile"].get("detail") != "records 1 live process":
+            fail(f"#34: doctor --json did not use singular for 1 live row: {one_doc['pidfile']!r}")
+    finally:
+        stop_pidfile(one_live)
+
     # A write error other than EPIPE is not success. /dev/full exists on
-    # Linux and returns ENOSPC from write(2).
+    # Linux and returns ENOSPC from write(2). (#48: cover log and load too.)
     if Path("/dev/full").exists():
         for args in (["table", "-n", "3", "-s", "1"], ["list", "-n", "3", "-s", "1"],
-                     ["doctor"], ["version"], ["corpus"]):
+                     ["doctor"], ["version"], ["corpus"],
+                     ["log", "--lines", "2"], ["load", "--cpu-util", "1", "-d", "1"]):
             with open("/dev/full", "wb") as full:
                 p = subprocess.run([str(BIN)] + args, stdout=full,
                                    stderr=subprocess.PIPE, timeout=120)
-            if p.returncode == 0:
-                fail(f"{' '.join(args)} reported success on a failed write")
+            err = p.stderr.decode("utf-8", "replace")
+            if p.returncode != 1 or "cannot write to stdout" not in err:
+                fail(f"#48: {' '.join(args)} on /dev/full exited {p.returncode}: "
+                     f"{err.strip()[:160]!r}")
     else:
         skip("no /dev/full to provoke a write error")
 
-    # ...but a closed reader is not an error: `| head` is a normal pipeline.
-    p = subprocess.run(f"{BIN} table -n 4000 | head -1 >/dev/null", shell=True,
-                       stderr=subprocess.PIPE, timeout=120)
-    if p.returncode != 0:
-        fail(f"a closed reader made psgen exit {p.returncode}: {p.stderr!r}")
+    # ...but a closed reader is not an error: `| head -1` is a normal pipeline
+    # and must stay silent on stderr (#48).
+    for cmd in (
+        f"{BIN} table -n 4000 | head -1 >/dev/null",
+        f"{BIN} log --lines 2000 --delay 0 | head -1 >/dev/null",
+        f"{BIN} load --cpu-util 1 -d 1 | head -1 >/dev/null",
+    ):
+        p = subprocess.run(cmd, shell=True, stderr=subprocess.PIPE, timeout=120)
+        if p.returncode != 0 or p.stderr != b"":
+            fail(f"#48: closed reader pipeline `{cmd}` exited {p.returncode}: {p.stderr!r}")
+    # Also force EPIPE directly on `load` (whose summary is one line).
+    r_fd, w_fd = os.pipe()
+    os.close(r_fd)
+    try:
+        p = subprocess.run([str(BIN), "load", "--cpu-util", "1", "-d", "1"],
+                           stdout=w_fd, stderr=subprocess.PIPE, timeout=120)
+    finally:
+        os.close(w_fd)
+    if p.returncode != 0 or p.stderr != b"":
+        fail(f"#48: load with closed pipe exited {p.returncode}: {p.stderr!r}")
 
     # `bpf` is a capability the caller either has or does not. The probe must
     # agree with `/proc/sys/kernel/unprivileged_bpf_disabled` and CAP_BPF.
@@ -3857,7 +4095,9 @@ def _check_option_surface(tmp):
 
     # `-p` must be a real weight for `list` at the default count, which is the
     # invocation the README shows. The corpus order is a documented contract,
-    # so the bare form stays byte-identical; only an explicit `-p` re-orders.
+    # so the bare form stays byte-identical; an explicit `-p` re-orders *and*
+    # drops the families the profile gives weight zero (#44): a server has no
+    # desktop session, so the bare list and `-p server` cannot agree in size.
     bare = run(["list", "-s", "1"]).stdout
     if len(bare.splitlines()) < 180:
         fail(f"#9: a bare list printed {len(bare.splitlines())} lines")
@@ -3865,8 +4105,14 @@ def _check_option_surface(tmp):
     desktop = run(["list", "-s", "1", "-p", "desktop"]).stdout
     if server == desktop:
         fail("#9: list -p has no effect at the default count")
-    if len(server.splitlines()) != len(bare.splitlines()):
-        fail("#9: list -p changed the number of lines, not their order")
+    if len(server.splitlines()) >= len(bare.splitlines()):
+        fail(f"#9: list -p server kept {len(server.splitlines())} of "
+             f"{len(bare.splitlines())} templates; a zero-weight family must "
+             f"not be listed")
+    if "/usr/lib/firefox/firefox" in server:
+        fail("#9: list -p server listed a desktop program")
+    if "/usr/lib/firefox/firefox" not in desktop:
+        fail("#9: list -p desktop dropped its own family")
 
     # `list` rejects --repeat-max, so its shortfall must not recommend it.
     p = run(["list", "-f", "mail", "-n", "50"], check=False)
@@ -4808,6 +5054,26 @@ def check_generator_sweep():
             fail(f"#28: {flag} 0 exited 2 without naming the flag: "
                  f"{p.stderr.strip()[:120]!r}")
 
+    # #37: --host-pid-max boundary row counts and exact parentheticals, both
+    # with PID 1 (default) and without PID 1 (-f web).
+    for extra, want_rows, want_paren in (
+        (["-n", "200", "-s", "1", "--host-pid-max", "1"], 1, "PID 1 alone"),
+        (["-n", "200", "-s", "1", "--host-pid-max", "2"], 1, "PID 1 alone"),
+        (["-n", "200", "-s", "1", "--host-pid-max", "3"], 2, "PID 1 and 2..2"),
+        (["-n", "200", "-s", "1", "--host-pid-max", "100"], 99, "PID 1 and 2..99"),
+        (["-n", "5", "-s", "1", "-f", "web", "--host-pid-max", "2"], 0, "no PID beside PID 1"),
+        (["-n", "5", "-s", "1", "-f", "web", "--host-pid-max", "3"], 1, "PID 2..2"),
+    ):
+        p = run(["table"] + extra, check=False)
+        if p.returncode != 0:
+            fail(f"#37: table {' '.join(extra)} exited {p.returncode}: {p.stderr.strip()[:160]!r}")
+        got_rows = [l for l in p.stdout.splitlines()[1:] if l.strip()]
+        if len(got_rows) != want_rows:
+            fail(f"#37: table {' '.join(extra)} produced {len(got_rows)} rows, wanted {want_rows}")
+        if f"({want_paren})" not in p.stderr:
+            fail(f"#37: table {' '.join(extra)} missed ({want_paren}) in stderr: "
+                 f"{p.stderr.strip()[:200]!r}")
+
     # The same seed must give the same *rows* seconds apart, START included:
     # START is the process's start time, and a per-row clock read made the
     # column move a minute per minute of wall clock.
@@ -4882,6 +5148,14 @@ def check_generator_sweep():
                 if k < m:
                     fail(f"#18: {kid['cmd'][:40]!r} starts {k}, before its "
                          f"master at {m}")
+
+    # The `s` and `+` flags describe a terminal session, so the comparison
+    # needs a host that can give an injected row a pty. Without one the table
+    # describes the run it would start on a capable host while the injected
+    # row is detached; that is a capability gap, not a rendering disagreement.
+    if not can_pty():
+        skip("#18 STAT parity needs a pty master to give injected rows a terminal")
+        return
 
     # The same corpus row must render the same STAT in `table` and after
     # injection: the `s` and `+` flags were derived twice and diverged. The
@@ -5262,17 +5536,18 @@ def check_security_markers(tmp):
         # the wrong shape instead of passing this check unexercised.
         skip("#26 sticky-dir EPERM needs an unprivileged caller and root")
 
-    # #26: the preflight must prove the body, not a zero-byte create. A size
-    # limit lets the header through and fails on the rows, which used to leave
-    # a header-only pidfile that `stop` called a clean stop of nothing.
+    # #26/#43: the preflight must prove the estimated body, not a zero-byte
+    # create. Under RLIMIT_FSIZE=1500 with -n 60, preflight refuses with exit 2
+    # before spawning any stub and leaves no leaked stubs or orphaned sidecars.
     small = tmp / "small.pid"
-    import resource
 
     def cap_fsize():
-        resource.setrlimit(resource.RLIMIT_FSIZE, (1500, 1500))
-        import signal
+        _, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+        lim = 1500 if hard == resource.RLIM_INFINITY else min(1500, hard)
+        resource.setrlimit(resource.RLIMIT_FSIZE, (lim, hard))
         signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
 
+    before_desc = set(descendants(os.getpid()))
     p = subprocess.run([str(BIN), "inject", "-n", "60", "--no-user",
                         "--no-mem", "--no-tty", "--no-threads",
                         "--pidfile", str(small)],
@@ -5280,20 +5555,107 @@ def check_security_markers(tmp):
                        text=True,
                        env=dict(os.environ, TMPDIR=str(tmp)),
                        preexec_fn=cap_fsize, timeout=180)
+    after_desc = set(descendants(os.getpid())) - before_desc
+    sidecars = [c for c in ([small.with_name(small.name + ".spawned")]
+                            + list(tmp.glob("psgen-spawned-*")))
+                if c.exists()]
     if small.exists():
         rows = [l for l in small.read_text().splitlines()
                 if l and not l.startswith("#")]
         spawned = len(re.findall(r"\bspawned \d+ processes", p.stdout))
         if p.returncode == 0 and spawned and len(rows) < 60:
             stop_pidfile(small)
-            fail(f"#26: a pidfile with {len(rows)} of 60 rows was accepted")
+            fail(f"#26/#43: a pidfile with {len(rows)} of 60 rows was accepted")
         if p.returncode != 0 and rows:
             stop_pidfile(small)
-            fail(f"#26: a failed run left a {len(rows)}-row pidfile behind")
+            fail(f"#26/#43: a failed run left a {len(rows)}-row pidfile behind")
         if rows:
             stop_pidfile(small)
         else:
             small.unlink()
+    for sc in sidecars:
+        stop_pidfile(sc)
+        sc.unlink(missing_ok=True)
+    leaked_alive = [pid for pid in after_desc if alive(pid)]
+    if leaked_alive:
+        reap_descendants(os.getpid())
+        fail(f"#43: RLIMIT_FSIZE=1500 inject leaked live stubs: {leaked_alive}")
+    if p.returncode != 2 or "RLIMIT_FSIZE" not in p.stderr:
+        fail(f"#43: inject -n 60 under RLIMIT_FSIZE=1500 exited {p.returncode}, "
+             f"wanted 2 with RLIMIT_FSIZE: {p.stderr.strip()[:160]!r}")
+
+    # #43: RLIMIT_FSIZE with DEFAULT SIGXFSZ (psgen itself must ignore SIGXFSZ
+    # rather than dying with signal 25 / exit 153). 4096 bytes fits a small
+    # pidfile (even though < 64 KiB); 32 bytes is below the body and exits 2.
+    def fsize_default_sig(nbytes: int):
+        def _preexec():
+            _, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+            lim = nbytes if hard == resource.RLIM_INFINITY else min(nbytes, hard)
+            resource.setrlimit(resource.RLIMIT_FSIZE, (lim, hard))
+            signal.signal(signal.SIGXFSZ, signal.SIG_DFL)
+        return _preexec
+
+    if fsize_allows(4096):
+        pf_4k = tmp / "fsize-4k.pid"
+        p4k = subprocess.run(
+            [str(BIN), "inject", "-n", "1", "-s", "7", "--no-exe", "--no-user",
+             "--no-mem", "--no-tty", "--no-threads", "--pidfile", str(pf_4k)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=dict(os.environ, TMPDIR=str(tmp)),
+            preexec_fn=fsize_default_sig(4096), timeout=120)
+        try:
+            if p4k.returncode != 0:
+                fail(f"#43: inject -n 1 under RLIMIT_FSIZE=4096 (default SIGXFSZ) "
+                     f"failed: rc={p4k.returncode} {p4k.stderr.strip()[:160]!r}")
+        finally:
+            stop_pidfile(pf_4k)
+
+    pf_32 = tmp / "fsize-32.pid"
+    p32 = subprocess.run(
+        [str(BIN), "inject", "-n", "1", "-s", "7", "--no-exe", "--no-user",
+         "--no-mem", "--no-tty", "--no-threads", "--pidfile", str(pf_32)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        env=dict(os.environ, TMPDIR=str(tmp)),
+        preexec_fn=fsize_default_sig(32), timeout=120)
+    stop_pidfile(pf_32)
+    if p32.returncode != 2 or "RLIMIT_FSIZE" not in p32.stderr:
+        fail(f"#43: inject under RLIMIT_FSIZE=32 (default SIGXFSZ) exited "
+             f"{p32.returncode}, wanted 2 with RLIMIT_FSIZE: {p32.stderr.strip()[:160]!r}")
+
+    # #43: external flock on <pidfile>.lock refuses inject with exit 2, and two
+    # concurrent injects racing on the same pidfile never leave unrecorded stubs.
+    lock_pf = tmp / "flock.pid"
+    lock_fd = os.open(str(lock_pf) + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        p_lk = run(["inject", "-n", "1", "-s", "7", "--no-exe", "--no-user",
+                    "--no-mem", "--no-tty", "--no-threads",
+                    "--pidfile", str(lock_pf)], check=False)
+        if p_lk.returncode != 2 or "holds the pidfile" not in p_lk.stderr:
+            fail(f"#43: inject did not refuse held .lock: rc={p_lk.returncode} "
+                 f"{p_lk.stderr.strip()[:160]!r}")
+    finally:
+        os.close(lock_fd)
+
+    race_pf = tmp / "race.pid"
+    before_race = set(descendants(os.getpid()))
+    race_cmd = [str(BIN), "inject", "-n", "2", "-s", "7", "--no-exe", "--no-user",
+                "--no-mem", "--no-tty", "--no-threads", "--pidfile", str(race_pf)]
+    r1 = subprocess.Popen(race_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    r2 = subprocess.Popen(race_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        _, e1 = r1.communicate(timeout=120)
+        _, e2 = r2.communicate(timeout=120)
+        rcs = sorted([r1.returncode, r2.returncode])
+        if rcs != [0, 2]:
+            fail(f"#43: two concurrent injects exited {rcs}, wanted [0, 2]: "
+                 f"e1={e1.strip()[:120]!r} e2={e2.strip()[:120]!r}")
+    finally:
+        stop_pidfile(race_pf)
+    leaked_race = [pid for pid in (set(descendants(os.getpid())) - before_race) if alive(pid)]
+    if leaked_race:
+        reap_descendants(os.getpid())
+        fail(f"#43: concurrent inject left unrecorded live stubs after stop: {leaked_race}")
 
     # #5: a marker written in another PID namespace must not be judged here.
     # The first run is real, in a private PID namespace; a second inject on the
@@ -5410,7 +5772,6 @@ def check_security_markers(tmp):
                     out.add(int(line.split()[0]))
         return out
 
-    import signal
     lp = subprocess.Popen([str(BIN), "inject", "-n", "3", "-s", "7", "-d", "60",
                            "--disk", "96", "--no-user", "--no-mem",
                            "--no-tty", "--no-threads", "--pidfile", str(pf)],
@@ -5788,7 +6149,7 @@ def check_security_markers(tmp):
         env=dict(os.environ, TMPDIR=str(tmp / "no-such-dir")))
     if p.returncode != 1:
         fail(f"#23: load with an unmeasurable TMPDIR exited {p.returncode}")
-    if "cannot measure" not in p.stderr and "exceeds the free space" not in p.stderr:
+    if "cannot measure" not in p.stderr and "exceeds the usable space" not in p.stderr:
         fail(f"#23: load with an unmeasurable TMPDIR blamed something else: "
              f"{p.stderr.strip()[:160]!r}")
 
@@ -5827,68 +6188,117 @@ def check_security_markers(tmp):
     if logged.exists() and logged.read_text().strip():
         fail("#20: --create-users --dry-run ran useradd")
 
-    # #20: the repair must offer an attempt that works when the group already
-    # exists, every attempt must be tried when all of them fail, and a create
-    # that succeeds without NSS seeing the account must not be retried. These
-    # are invariants of the repair rather than deltas against `ddc6f0c`, which
-    # already had all three; the checks keep them from regressing.
-    logged.write_text("")
-    (shim / "useradd").write_text(
-        "#!/bin/sh\n"
-        f"echo \"$@\" >> {logged}\n"
-        "exit 1\n")
-    (shim / "useradd").chmod(0o755)
-    # `sudo` resets PATH and TMPDIR, so the shim and the private scratch
-    # directory have to be placed after it rather than in `env=`.
-    p = subprocess.run(
-        as_root(["env", f"PATH={shim}:/usr/bin:/bin", f"TMPDIR={cfg_tmp}",
-                 BIN, "inject", "-f", "mail", "-n", "30", "-s", "8",
-                 "--create-users", "--user", "--no-exe", "--no-mem",
-                 "--no-tty", "--no-threads", "--pidfile", str(tmp / "u.pid")]),
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        timeout=180)
-    stop_pidfile(tmp / "u.pid")
+    # #20/#46: `--create-users` ignores PATH and invokes a fixed absolute
+    # `useradd` path. Bind-mount the shim over that real path inside a private
+    # mount namespace (`unshare -m`) so host `/etc/passwd` is never touched.
     if can_root():
-        runs = [l for l in logged.read_text().splitlines() if l.strip()]
-        if not runs:
-            fail("#20: --create-users as root never invoked useradd")
-        # Every attempt is tried when all of them fail.
-        if len(runs) < 2:
-            fail(f"#20: only {len(runs)} useradd attempt was tried, so the "
-                 f"group-only host cannot be repaired")
-        if not any("--gid" in r for r in runs):
-            fail("#20: no attempt used an existing group, so a host with the "
-                 "group but not the user cannot be repaired")
+        useradd_candidates = (
+            "/usr/sbin/useradd",
+            "/usr/bin/useradd",
+            "/sbin/useradd",
+            "/run/current-system/sw/bin/useradd",
+        )
+        real_useradd = None
+        for cand in useradd_candidates:
+            try:
+                st = os.stat(cand)
+            except OSError:
+                continue
+            if stat.S_ISREG(st.st_mode) and (st.st_mode & 0o111):
+                real_useradd = cand
+                break
+        if real_useradd is None:
+            skip("#20/#46: no useradd found at fixed system paths")
+        else:
+            ns_probe = subprocess.run(
+                as_root(["unshare", "-m", "--", "true"]),
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+            if ns_probe.returncode != 0:
+                skip("#20/#46: unshare -m is unavailable for useradd bind-mount")
+            else:
+                def run_useradd_shim(shim_exe: Path, extra_env: list[str], pf: Path):
+                    return subprocess.run(
+                        as_root([
+                            "unshare", "-m", "--", "sh", "-c",
+                            'mount --bind "$1" "$2" && shift 2 && exec "$@"', "_",
+                            str(shim_exe), real_useradd,
+                            "env", *extra_env,
+                            str(BIN), "inject", "-f", "mail", "-n", "30", "-s", "8",
+                            "--create-users", "--user", "--no-exe", "--no-mem",
+                            "--no-tty", "--no-threads", "--pidfile", str(pf),
+                        ]),
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        text=True, timeout=180)
 
-    # #20: a useradd that succeeds but is invisible to NSS must not be retried.
-    logged.write_text("")
-    (shim / "useradd").write_text(
-        "#!/bin/sh\n"
-        f"echo \"$@\" >> {logged}\n"
-        "exit 0\n")
-    (shim / "useradd").chmod(0o755)
-    if can_root():
-        subprocess.run(
-            as_root(["env", f"PATH={shim}:/usr/bin:/bin", f"TMPDIR={cfg_tmp}",
-                     BIN, "inject", "-f", "mail", "-n", "30", "-s", "8",
-                     "--create-users", "--user", "--no-exe", "--no-mem",
-                     "--no-tty", "--no-threads",
-                     "--pidfile", str(tmp / "v.pid")]),
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            timeout=180)
-        stop_pidfile(tmp / "v.pid")
-        # One call per distinct missing name: a family names several users,
-        # but the same name must never be retried after its create succeeded,
-        # because the second attempt can only answer "already exists" and hide
-        # the first error.
-        runs = [l for l in logged.read_text().splitlines() if l.strip()]
-        by_name: dict[str, int] = {}
-        for r in runs:
-            name = r.split("--", 1)[-1].strip() if "--" in r else r.split()[-1]
-            by_name[name] = by_name.get(name, 0) + 1
-        retried = {n: c for n, c in by_name.items() if c > 1}
-        if retried:
-            fail(f"#20: a useradd that succeeded was retried: {retried}")
+                # #20: every attempt is tried when all of them fail, including
+                # one using an existing group (`--gid`).
+                logged.write_text("")
+                (shim / "useradd").write_text(
+                    "#!/bin/sh\n"
+                    f"echo \"$@\" >> {logged}\n"
+                    "exit 1\n")
+                (shim / "useradd").chmod(0o755)
+                run_useradd_shim(shim / "useradd", [f"TMPDIR={cfg_tmp}"], tmp / "u.pid")
+                stop_pidfile(tmp / "u.pid", root=True)
+                runs = [l for l in logged.read_text().splitlines() if l.strip()]
+                if not runs:
+                    fail("#20: --create-users as root never invoked useradd")
+                if len(runs) < 2:
+                    fail(f"#20: only {len(runs)} useradd attempt was tried, so the "
+                         f"group-only host cannot be repaired")
+                if not any("--gid" in r for r in runs):
+                    fail("#20: no attempt used an existing group, so a host with the "
+                         "group but not the user cannot be repaired")
+
+                # #20: a useradd that succeeds but is invisible to NSS must not
+                # be retried.
+                logged.write_text("")
+                (shim / "useradd").write_text(
+                    "#!/bin/sh\n"
+                    f"echo \"$@\" >> {logged}\n"
+                    "exit 0\n")
+                (shim / "useradd").chmod(0o755)
+                run_useradd_shim(shim / "useradd", [f"TMPDIR={cfg_tmp}"], tmp / "v.pid")
+                stop_pidfile(tmp / "v.pid", root=True)
+                runs = [l for l in logged.read_text().splitlines() if l.strip()]
+                by_name: dict[str, int] = {}
+                for r in runs:
+                    name = r.split("--", 1)[-1].strip() if "--" in r else r.split()[-1]
+                    by_name[name] = by_name.get(name, 0) + 1
+                retried = {n: c for n, c in by_name.items() if c > 1}
+                if retried:
+                    fail(f"#20: a useradd that succeeded was retried: {retried}")
+
+                # #46: a poison `useradd` first in PATH must NEVER run; only the
+                # fixed absolute `real_useradd` path may be invoked.
+                poison = tmp / "poison-path"
+                poison.mkdir(exist_ok=True)
+                poison_log = tmp / "poison-useradd.log"
+                poison_log.write_text("")
+                (poison / "useradd").write_text(
+                    "#!/bin/sh\n"
+                    f"echo \"POISON $@\" >> {poison_log}\n"
+                    "exit 0\n")
+                (poison / "useradd").chmod(0o755)
+                logged.write_text("")
+                (shim / "useradd").write_text(
+                    "#!/bin/sh\n"
+                    f"echo \"$@\" >> {logged}\n"
+                    "exit 1\n")
+                (shim / "useradd").chmod(0o755)
+                p46 = run_useradd_shim(
+                    shim / "useradd",
+                    [f"PATH={poison}:/usr/bin:/bin", f"TMPDIR={cfg_tmp}"],
+                    tmp / "p46.pid")
+                stop_pidfile(tmp / "p46.pid", root=True)
+                if poison_log.read_text().strip():
+                    fail(f"#46: --create-users ran poison useradd from PATH: "
+                         f"{poison_log.read_text().strip()[:160]!r}")
+                runs46 = [l for l in logged.read_text().splitlines() if l.strip()]
+                if not runs46:
+                    fail(f"#46: --create-users did not invoke fixed useradd "
+                         f"{real_useradd} (rc={p46.returncode}, "
+                         f"err={p46.stderr.strip()[:160]!r})")
     else:
         skip("#20: the --create-users checks need root or passwordless sudo")
 
@@ -6232,6 +6642,80 @@ def check_dry_run_shape():
         if any(field not in row for row in rows):
             fail(f"#12: the plan rows omit {field}, so the matrix cannot read it")
 
+    # #33: preview parity (--dry-run, --dry-run --plan, --dry-run --json) on
+    # live pidfiles, held .lock files, staging pattern fidelity, and JSON tty.
+    with tempfile.TemporaryDirectory(prefix="psgen-dry-") as dry_tmp:
+        dt = Path(dry_tmp)
+        live_pf = dt / "live.pid"
+        run(["inject", "-n", "1", "-s", "7", "--no-exe", "--no-user",
+             "--no-mem", "--no-tty", "--no-threads", "--pidfile", str(live_pf)])
+        try:
+            for extra in ([], ["--plan"], ["--json"]):
+                p_live = run(
+                    ["inject", "-n", "1", "-s", "7", "--no-exe", "--no-user",
+                     "--no-mem", "--no-tty", "--no-threads", "--dry-run"]
+                    + extra + ["--pidfile", str(live_pf)], check=False)
+                if p_live.returncode != 2 or "live processes" not in p_live.stderr:
+                    fail(f"#33: --dry-run {' '.join(extra)} did not refuse live "
+                         f"pidfile: rc={p_live.returncode} {p_live.stderr.strip()[:160]!r}")
+        finally:
+            stop_pidfile(live_pf)
+
+        lock_pf = dt / "locked.pid"
+        lock_fd = os.open(str(lock_pf) + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            for extra in ([], ["--plan"], ["--json"]):
+                p_lk = run(
+                    ["inject", "-n", "1", "-s", "7", "--no-exe", "--no-user",
+                     "--no-mem", "--no-tty", "--no-threads", "--dry-run"]
+                    + extra + ["--pidfile", str(lock_pf)], check=False)
+                if p_lk.returncode != 2 or "holds the pidfile" not in p_lk.stderr:
+                    fail(f"#33: --dry-run {' '.join(extra)} did not refuse held "
+                         f".lock: rc={p_lk.returncode} {p_lk.stderr.strip()[:160]!r}")
+        finally:
+            os.close(lock_fd)
+
+        # `--plan` staging pattern lines match real `# temp` lines.
+        if fsize_allows(1024 * 1024):
+            stage_dir = dt / "stage"
+            stage_dir.mkdir()
+            stage_env = dict(os.environ, TMPDIR=str(stage_dir))
+            stage_args = ["inject", "-n", "2", "-s", "7", "--no-exe", "--no-user",
+                          "--no-mem", "--no-tty", "--no-threads", "--disk", "1"]
+            plan_out = run(stage_args + ["--dry-run", "--plan"], env=stage_env).stdout
+            pats = [l[len("staging pattern "):] for l in plan_out.splitlines()
+                    if l.startswith("staging pattern ")]
+            if len(pats) != 2:
+                fail(f"#33: --plan printed {len(pats)} staging pattern lines, wanted 2")
+            stage_pf = dt / "stage.pid"
+            run(stage_args + ["--pidfile", str(stage_pf)], env=stage_env)
+            try:
+                temps = [l[len("# temp "):] for l in stage_pf.read_text().splitlines()
+                         if l.startswith("# temp ")]
+            finally:
+                stop_pidfile(stage_pf)
+            if len(temps) != len(pats):
+                fail(f"#33: real run wrote {len(temps)} # temp lines vs "
+                     f"{len(pats)} staging patterns")
+            for pat, real_t in zip(pats, temps):
+                rx = "^" + re.escape(pat).replace("<pid>", r"\d+").replace("<i>", r"\d+") + "$"
+                if not re.match(rx, real_t):
+                    fail(f"#33: # temp {real_t!r} did not match staging pattern {pat!r}")
+
+        # `--dry-run --json` top-level `"tty"` matches capability & per-row tty.
+        j_tty = json.loads(run(["inject", "-n", "30", "-s", "1", "--dry-run", "--json"]).stdout)
+        want_tty = can_pty()
+        if j_tty.get("tty") is not want_tty:
+            fail(f"#33: --dry-run --json top-level tty={j_tty.get('tty')!r}, "
+                 f"wanted {want_tty!r}")
+        if not j_tty["tty"] and any(r.get("tty") for r in j_tty["rows"]):
+            fail("#33: --dry-run --json had top-level tty=false with a tty=true row")
+        j_notty = json.loads(
+            run(["inject", "-n", "12", "-s", "1", "--no-tty", "--dry-run", "--json"]).stdout)
+        if j_notty.get("tty") is not False or any(r.get("tty") for r in j_notty["rows"]):
+            fail("#33: --no-tty --dry-run --json reported tty=true")
+
 
 def check_matrix_reaps():
     """`check_option_matrix` leaves no process behind.
@@ -6410,6 +6894,7 @@ SKIP_NEEDS = [
     ("check_option_surface", "can_root", "False", False,
      "passwordless sudo"),
     ("check_injection", "can_pty", "False", False, ("pty", "qemu")),
+    ("check_generator_sweep", "can_pty", "False", False, "pty"),
     ("check_live_matches_ps", "non_utc_zone", "None", False, "non-UTC"),
     ("check_live_reference_columns", "non_utc_zone", "None", False, "UTC"),
     ("check_security_markers", "can_root", "False", True,
@@ -6571,6 +7056,74 @@ def check_stub_binaries(tmp):
                      f"it does not measure the product")
 
 
+def check_doc_header(tmp: Path) -> None:
+    """The README's pidfile sample must name the fields `inject` writes.
+
+    #35: the header gained `nonce` and the sample did not, so a reader who
+    followed the sample could not recognise a current pidfile. The sample is
+    parsed for its labels and compared with the first line of a real run.
+    """
+    readme = (ROOT / "README.md").read_text()
+    m = re.search(r"^# psgen <version>[^\n]*$", readme, re.M)
+    if m is None:
+        fail("#35: README has no `# psgen <version>` pidfile sample")
+        return
+    sample = m.group(0).split()
+    sample_labels = sample[3::2]
+    sample_values = [sample[2]] + sample[4::2]
+    for v in sample_values:
+        if not (v.startswith("<") and v.endswith(">")):
+            fail(f"#35: README sample field {v!r} is not a placeholder")
+            return
+    p = Path(tmp) / "doc.pid"
+    try:
+        run(["inject", "-n", "1", "--no-exe", "--no-user", "--no-mem",
+             "--no-tty", "--no-threads", "-q", "--pidfile", str(p)])
+        line = p.read_bytes().split(b"\n", 1)[0].decode("utf-8", "replace")
+        parts = line.split()
+        if parts[:2] != ["#", "psgen"] or len(parts) < 3:
+            fail(f"#35: inject wrote an unexpected header {line!r}")
+            return
+        actual_labels = parts[3::2]
+        if sample_labels != actual_labels:
+            fail(f"#35: README sample labels {sample_labels} but inject "
+                 f"writes {actual_labels}")
+        if "nonce" not in sample_labels:
+            fail("#35: the README sample does not carry the run nonce")
+    finally:
+        stop_pidfile(p)
+
+
+def check_doc_sync() -> None:
+    """README.md and SECURITY.md must stay aligned with current behaviour (#35)."""
+    readme = (ROOT / "README.md").read_text()
+    readme_flat = " ".join(readme.split())
+    if "staging 0 directories" in readme_flat:
+        fail("#35: README.md --dry-run --plan sample still shows stale 'staging 0 directories'")
+    m = re.search(r"^plan:.*$", readme, re.M)
+    if m is None or "staging" not in m.group(0) or "directory pattern" not in m.group(0):
+        fail(f"#35: README.md --dry-run --plan sample lacks 'staging ... directory patterns': "
+             f"{m.group(0) if m else None!r}")
+    if "status record through the same mapping" in readme_flat:
+        fail("#35: README.md still claims F_SEAL_WRITE is omitted for the status record")
+
+    sec = (ROOT / "SECURITY.md").read_text()
+    sec_flat = " ".join(sec.split())
+    for stale in (
+        "or an unlinked temporary file",
+        "skips the seal check",
+        "re-measure this section",
+        "status record through the same mapping",
+        "recurses through the mount and deletes what is under it",
+    ):
+        if stale in sec_flat:
+            fail(f"#35: SECURITY.md still contains obsolete claim {stale!r}")
+    if "fd_sealed" not in sec or "F_SEAL_SHRINK" not in sec:
+        fail("#35: SECURITY.md does not document the sealed-memfd-only fd-3 gate")
+    if "is_mount_point" not in sec:
+        fail("#35: SECURITY.md does not document is_mount_point staging protection")
+
+
 def check_meta_tests(tmp: Path) -> None:
     """The gates that hold the other gates to their contract.
 
@@ -6664,6 +7217,8 @@ def _main_checks() -> None:
         check_new_gates(Path(tmp))
     with tempfile.TemporaryDirectory(prefix="psgen-meta-") as tmp:
         check_meta_tests(Path(tmp))
+        check_doc_header(Path(tmp))
+        check_doc_sync()
     with tempfile.TemporaryDirectory(prefix="psgen-wt4-") as tmp:
         check_session_detach(Path(tmp))
         check_prune_from_another_cwd(Path(tmp))

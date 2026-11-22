@@ -241,7 +241,7 @@ pub fn round_up(v: u64, page_kb: u64) -> u64 {
     if page_kb <= 1 {
         return v;
     }
-    v.div_ceil(page_kb) * page_kb
+    v.div_ceil(page_kb).saturating_mul(page_kb)
 }
 
 /// The memory a *synthetic* table's `%MEM` is a percentage of: MemTotal,
@@ -283,13 +283,13 @@ pub fn render(rows: &[Proc], mem_total_kb: u64, clock: &Clock, page_kb: u64) -> 
     out.push_str("USER         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND\n");
     for p in rows {
         let row_start = out.v.len();
-        let vsz = round_up(p.vsz as u64, page_kb);
-        let rss = round_up(p.rss as u64, page_kb);
+        let vsz = round_up(p.vsz, page_kb);
+        let rss = round_up(p.rss, page_kb);
         user_field(&mut out, &p.user);
         out.push(b' ');
         out.push_u64_width(p.pid as u64, 7);
         out.push(b' ');
-        push_pcpu(&mut out, p.cpu as u32);
+        push_pcpu(&mut out, p.cpu);
         out.push(b' ');
         // procps computes `%MEM` as `rss * 1000 / MemTotal` in integer
         // arithmetic, so it truncates rather than rounds: an RSS of 0.377%
@@ -454,5 +454,15 @@ mod tests {
         let rows = [proc_with(b"short".to_vec())];
         let out = render(&rows, 1024, &Clock::synthetic(NOON, 0, false), 1);
         assert!(out.v.ends_with(b" short\n"));
+    }
+
+    #[test]
+    fn round_up_saturates_near_u64_max() {
+        assert_eq!(round_up(0, 4), 0);
+        assert_eq!(round_up(1, 4), 4);
+        assert_eq!(round_up(4, 4), 4);
+        assert_eq!(round_up(5, 4), 8);
+        assert_eq!(round_up(u64::MAX, 4), u64::MAX);
+        assert_eq!(round_up(u64::MAX - 1, 4), u64::MAX);
     }
 }

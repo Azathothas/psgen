@@ -17,9 +17,9 @@ pub struct Proc {
     pub user: Vec<u8>,
     pub uid: u32,
     pub gid: u32,
-    pub vsz: u32,
-    pub rss: u32,
-    pub cpu: u16,
+    pub vsz: u64,
+    pub rss: u64,
+    pub cpu: u32,
     pub flags: u8,
     pub age: u64,
     /// The absolute start time, in seconds since the epoch. `age` is derived
@@ -54,6 +54,10 @@ pub struct Opts {
     /// `--repeat-max`: raise the per-command repeat bound so a count the corpus
     /// cannot supply realistically is still met. `None` keeps the bound.
     pub repeat_max: Option<usize>,
+    /// Whether `-p` was given. A zero weight in the default profile is not a
+    /// statement about the host; an explicit profile is, and a zero-weight
+    /// family under it must not be filled either.
+    pub profile_set: bool,
 }
 
 /// Virtual size the stub needs before the template's own mappings. The std
@@ -86,18 +90,24 @@ impl Fit {
         Some(self.pid_max.saturating_sub(2) as usize)
     }
 
-    /// Why a table cannot hold `want` rows, if the host limits it.
-    pub fn shortfall_reason(&self, want: usize) -> Option<String> {
+    /// Why a table produced `have` of `want` rows, if `pid_max` limited it.
+    ///
+    /// When `has_init` is true, PID 1 is `/sbin/init`, so capacity is
+    /// `pid_capacity() + 1`. When `has_init` is false (e.g. `-f web`), PID 1
+    /// is absent, so capacity is `pid_capacity()` (`2..pid_max - 1`) alone.
+    pub fn shortfall_reason_for(&self, have: usize, want: usize, has_init: bool) -> Option<String> {
         let cap = self.pid_capacity()?;
-        // PID 1 is init, so the table can show `cap` more rows.
-        let room = cap.saturating_add(1);
-        if want <= room {
+        let room = if has_init { cap.saturating_add(1) } else { cap };
+        if want <= room || have >= want || have < room {
             return None;
         }
-        let pids = if self.pid_max > 3 {
-            format!("PID 1 and 2..{}", self.pid_max - 1)
-        } else {
-            "PID 1 alone".to_string()
+        // `pid_capacity` is `pid_max - 2`, so `pid_max == 3` still leaves one
+        // row beside PID 1 (PID 2) and the parenthetical must say so.
+        let pids = match (has_init, self.pid_max > 2) {
+            (true, true) => format!("PID 1 and 2..{}", self.pid_max - 1),
+            (true, false) => "PID 1 alone".to_string(),
+            (false, true) => format!("PID 2..{}", self.pid_max - 1),
+            (false, false) => "no PID beside PID 1".to_string(),
         };
         Some(format!(
             "pid_max is {}, so a snapshot can hold {} {} ({})",
@@ -181,10 +191,16 @@ impl Snap {
             Some(u) => u,
             None => {
                 // The boot epoch is a fixed point on this machine, so the host
-                // has been up exactly `now - boot` seconds.
+                // has been up exactly `now - boot` seconds. When `/proc/stat`
+                // cannot supply it, prefer `CLOCK_BOOTTIME` over `/proc/uptime`
+                // so a virtualized container `/proc/uptime` is not mixed with
+                // host-domain start times.
                 let boot = util::boot_time_secs();
                 if boot == 0 || boot > now {
-                    util::uptime_secs()
+                    sys::boottime_ns()
+                        .map(|ns| ns / 1_000_000_000)
+                        .filter(|&s| s > 0)
+                        .unwrap_or_else(util::uptime_secs)
                 } else {
                     now - boot
                 }
@@ -207,22 +223,40 @@ impl Snap {
 ///
 /// `--repeat-max N` replaces the bound: the caller asked for a cap on the
 /// command line, and `0` means no cap.
-fn budget(t: &Tmpl, opts: &Opts, want: usize) -> usize {
+fn budget(t: &Tmpl, weights: &[u16; 10], opts: &Opts, want: usize) -> usize {
     match opts.repeat_max {
         Some(0) => usize::MAX,
+        // A template that re-expands to one command line is capped by the
+        // caller's number; one with a variable placeholder is not, because
+        // each expansion can be a new line and `command_allows` bounds each
+        // of those instead.
         Some(n) => n,
         None => {
             let inst = if t.inst == 0 { 1 } else { t.inst as usize };
-            inst.max(pigeonhole(opts, want))
+            inst.max(pigeonhole(weights, opts, want))
         }
     }
 }
 
+/// The distinct pass covers templates, so it spends one draw per template.
+///
+/// `--repeat-max` bounds one expanded command line; repeats are the fill
+/// pass's business, and letting this pass repeat a variable template would
+/// spend its whole count before it reached a template that yields only one
+/// row.
+fn distinct_cap(t: &Tmpl, weights: &[u16; 10], opts: &Opts, want: usize) -> usize {
+    if opts.repeat_max.is_some() {
+        1
+    } else {
+        budget(t, weights, opts, want)
+    }
+}
+
 /// `ceil(want / k)` over the in-scope templates that can repeat.
-fn pigeonhole(opts: &Opts, want: usize) -> usize {
+fn pigeonhole(weights: &[u16; 10], opts: &Opts, want: usize) -> usize {
     let k = corpus::CORPUS
         .iter()
-        .filter(|t| opts.family.map(|f| f == t.fam).unwrap_or(true))
+        .filter(|t| in_scope(t, weights, opts))
         .filter(|t| t.cmd != "/sbin/init" && repeatable(t))
         .count()
         .max(1);
@@ -270,9 +304,122 @@ pub fn has_variants(t: &Tmpl) -> bool {
     VARIABLE_PLACEHOLDERS.iter().any(|p| t.cmd.contains(p))
 }
 
+/// `has_variants` for a list, where `{uid}` is not fixed for the run: `list`
+/// expands it to one of six IDs. `table` and `inject` fix the UID, so a
+/// `{uid}` template produces one command line there and many in a list.
+fn list_variants(t: &Tmpl) -> bool {
+    has_variants(t) || t.cmd.contains("{uid}")
+}
+
+/// How many distinct values one placeholder can take.
+///
+/// Only `{uid}` and the small ranges matter for the supply estimate; a hex
+/// placeholder is capped at `SUPPLY_MAX`, which is far past any count a list
+/// accepts.
+const SUPPLY_MAX: u64 = 1_000_000;
+
+/// Draws one fill slot may spend before giving up on a command line the
+/// repeat bound has already used. A template with `{n}` (9 values) or `{port}`
+/// (14 values) needs enough retries to reliably find its last unused variant.
+const FILL_DRAWS: usize = 128;
+
+fn placeholder_values(key: &[u8]) -> u64 {
+    // `Rng::range` is inclusive at both ends, so each count is the span of the
+    // same constant `expand` draws from. Every `hex*` placeholder supported by
+    // `expand` is listed explicitly; unknown keys stay literal and produce 1.
+    match key {
+        b"hex6" | b"hex8" | b"hex12" | b"hex64" => SUPPLY_MAX,
+        b"n" => span(R_N),
+        b"n2" => span(R_N2),
+        b"pid" => span(R_PID),
+        b"port" => COMMON_PORTS.len() as u64,
+        b"cport" => span(R_CPORT),
+        b"ip" => span(R_IP_A) * span(R_IP_B),
+        b"uid" => span(R_UID),
+        b"user" => 1,
+        _ => 1,
+    }
+}
+
+fn template_supply_with(cmd: &str, fixed_uid: bool) -> u64 {
+    let bytes = cmd.as_bytes();
+    let mut total = 1u64;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            if let Some(rel) = str::find(&bytes[i..], b"}") {
+                let key = &bytes[i + 1..i + rel];
+                let count = if fixed_uid && key == b"uid" {
+                    1
+                } else {
+                    placeholder_values(key)
+                };
+                total = total.saturating_mul(count).min(SUPPLY_MAX);
+                i += rel + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    total
+}
+
+/// The number of distinct command lines one template can produce in a list.
+fn template_supply(cmd: &str) -> u64 {
+    template_supply_with(cmd, false)
+}
+
+/// The number of distinct command lines one template can produce in a table
+/// or inject run, where `{uid}` and `{user}` are fixed for the whole run.
+fn table_template_supply(t: &Tmpl) -> usize {
+    template_supply_with(t.cmd, true).min(usize::MAX as u64) as usize
+}
+
+/// The distinct lines a `list` can emit for the in-scope templates.
+///
+/// This is the estimate the shortfall warning quotes. It is derived from the
+/// same placeholder table the writer uses, including `{uid}`'s six values when
+/// the run has no fixed UID, so the warning cannot promise new lines the
+/// writer cannot produce.
+pub fn distinct_supply(family: Option<u8>, weights: &[u16; 10], profile_set: bool) -> u64 {
+    let opts = Opts {
+        count: 0,
+        seed: 0,
+        uptime: None,
+        profile: Vec::new(),
+        family,
+        self_user: Vec::new(),
+        uniq: true,
+        repeat_max: None,
+        profile_set,
+    };
+    let mut total = 0u64;
+    for t in corpus::CORPUS.iter() {
+        if in_scope(t, weights, &opts) {
+            total = total.saturating_add(template_supply(t.cmd)).min(SUPPLY_MAX);
+        }
+    }
+    total
+}
+
 const COMMON_PORTS: [u16; 14] = [
     80, 443, 3000, 5000, 5432, 6379, 8000, 8080, 8443, 9000, 9090, 11211, 27017, 9200,
 ];
+
+// The inclusive bounds `expand` draws from, shared with `placeholder_values`
+// so the supply estimate cannot drift from the values the writer emits.
+const R_N: (u64, u64) = (1, 9);
+const R_N2: (u64, u64) = (10, 999);
+const R_PID: (u64, u64) = (100, 40_000);
+const R_UID: (u64, u64) = (1_000, 1_005);
+const R_CPORT: (u64, u64) = (30_000, 65_000);
+const R_IP_A: (u64, u64) = (0, 3);
+const R_IP_B: (u64, u64) = (2, 250);
+
+/// How many distinct values an inclusive range holds.
+fn span(r: (u64, u64)) -> u64 {
+    r.1 - r.0 + 1
+}
 
 fn expand(cmd: &str, rng: &mut Rng, self_user: &[u8], uid: Option<u32>) -> Vec<u8> {
     let bytes = cmd.as_bytes();
@@ -303,23 +450,23 @@ fn expand(cmd: &str, rng: &mut Rng, self_user: &[u8], uid: Option<u32>) -> Vec<u
                         rng.hex(64, &mut h);
                         out.push_bytes(&h);
                     }
-                    b"n" => out.push_u64(rng.range(1, 9)),
-                    b"n2" => out.push_u64(rng.range(10, 999)),
-                    b"pid" => out.push_u64(rng.range(100, 40000)),
+                    b"n" => out.push_u64(rng.range(R_N.0, R_N.1)),
+                    b"n2" => out.push_u64(rng.range(R_N2.0, R_N2.1)),
+                    b"pid" => out.push_u64(rng.range(R_PID.0, R_PID.1)),
                     b"uid" => match uid {
                         Some(u) => out.push_u64(u as u64),
-                        None => out.push_u64(rng.range(1000, 1005)),
+                        None => out.push_u64(rng.range(R_UID.0, R_UID.1)),
                     },
                     b"port" => {
                         let p = COMMON_PORTS[rng.below(COMMON_PORTS.len() as u64) as usize];
                         out.push_u64(p as u64);
                     }
-                    b"cport" => out.push_u64(rng.range(30000, 65000)),
+                    b"cport" => out.push_u64(rng.range(R_CPORT.0, R_CPORT.1)),
                     b"ip" => {
                         out.push_str("10.0.");
-                        out.push_u64(rng.range(0, 3));
+                        out.push_u64(rng.range(R_IP_A.0, R_IP_A.1));
                         out.push(b'.');
-                        out.push_u64(rng.range(2, 250));
+                        out.push_u64(rng.range(R_IP_B.0, R_IP_B.1));
                     }
                     b"user" => out.push_bytes(self_user),
                     _ => {
@@ -339,6 +486,20 @@ fn expand(cmd: &str, rng: &mut Rng, self_user: &[u8], uid: Option<u32>) -> Vec<u
     out.v
 }
 
+/// Whether a template is in scope for a run.
+///
+/// An explicit `-f FAMILY` is an override: every template of that family is
+/// in scope whatever the profile says. With an explicit `-p`, a zero weight
+/// means the family does not belong on this host, and neither a table nor a
+/// list may draw it. Without `-p`, the default profile is not a statement
+/// about the host, so the corpus stays whole.
+fn in_scope(t: &Tmpl, weights: &[u16; 10], opts: &Opts) -> bool {
+    match opts.family {
+        Some(f) => t.fam == f,
+        None => !opts.profile_set || weights[t.fam as usize] != 0,
+    }
+}
+
 fn cand_weight(t: &Tmpl, weights: &[u16; 10], family: Option<u8>) -> u64 {
     match family {
         Some(_) => t.weight as u64,
@@ -348,32 +509,27 @@ fn cand_weight(t: &Tmpl, weights: &[u16; 10], family: Option<u8>) -> u64 {
 
 /// Draw one index from `pool` with probability proportional to its template's
 /// weight, and return its position in `pool`.
-fn weighted_total(weights: &[u16; 10], family: Option<u8>) -> u64 {
+fn weighted_total(weights: &[u16; 10], opts: &Opts) -> u64 {
     let mut total = 0u64;
     for t in corpus::CORPUS.iter() {
-        if let Some(f) = family {
-            if t.fam != f {
-                continue;
-            }
+        if in_scope(t, weights, opts) {
+            total += cand_weight(t, weights, opts.family);
         }
-        total += cand_weight(t, weights, family);
     }
     total
 }
 
-fn weighted_index(rng: &mut Rng, weights: &[u16; 10], family: Option<u8>) -> usize {
-    let total = weighted_total(weights, family);
+fn weighted_index(rng: &mut Rng, weights: &[u16; 10], opts: &Opts) -> usize {
+    let total = weighted_total(weights, opts);
     if total == 0 {
         return 0;
     }
     let mut n = rng.below(total);
     for (idx, t) in corpus::CORPUS.iter().enumerate() {
-        if let Some(f) = family {
-            if t.fam != f {
-                continue;
-            }
+        if !in_scope(t, weights, opts) {
+            continue;
         }
-        let w = cand_weight(t, weights, family);
+        let w = cand_weight(t, weights, opts.family);
         if n < w {
             return idx;
         }
@@ -410,10 +566,10 @@ fn weighted_pick(pool: &[usize], rng: &mut Rng, weights: &[u16; 10]) -> usize {
 /// Single-instance daemons are picked at most once, so a generated table does
 /// not show two sshd listeners or two PID-1 processes. Build tools and desktop
 /// applications are allowed to repeat.
-fn pick_index(rng: &mut Rng, weights: &[u16; 10], family: Option<u8>, used: &[usize]) -> usize {
+fn pick_index(rng: &mut Rng, weights: &[u16; 10], opts: &Opts, used: &[usize]) -> usize {
     let mut fallback = 0;
     for _ in 0..80 {
-        let idx = weighted_index(rng, weights, family);
+        let idx = weighted_index(rng, weights, opts);
         let t = &corpus::CORPUS[idx];
         if !repeatable(t) && used.contains(&idx) {
             fallback = idx;
@@ -591,9 +747,9 @@ fn make_proc(
         user,
         uid,
         gid,
-        vsz,
-        rss,
-        cpu: cpu as u16,
+        vsz: vsz as u64,
+        rss: rss as u64,
+        cpu: cpu as u32,
         // The rendered STAT and the injection-time session decision read one
         // set of flags: `effective_flags` is the only place that decides what
         // "has a terminal" means for a row.
@@ -662,7 +818,7 @@ pub fn gen_list(rng: &mut Rng, opts: &Opts) -> Vec<Vec<u8>> {
     let mut fixed_used = vec![false; corpus::CORPUS.len()];
     let mut drawn = vec![false; corpus::CORPUS.len()];
     for (idx, t) in corpus::CORPUS.iter().enumerate() {
-        if opts.family.map(|f| f == t.fam).unwrap_or(true) {
+        if in_scope(t, &weights, opts) {
             drawn[idx] = true;
             push(
                 expand(t.cmd, rng, &opts.self_user, None),
@@ -675,10 +831,8 @@ pub fn gen_list(rng: &mut Rng, opts: &Opts) -> Vec<Vec<u8>> {
     }
     let mut pool: Vec<usize> = Vec::new();
     for (idx, t) in corpus::CORPUS.iter().enumerate() {
-        if let Some(f) = opts.family {
-            if t.fam != f {
-                continue;
-            }
+        if !in_scope(t, &weights, opts) {
+            continue;
         }
         if !drawn[idx] {
             pool.push(idx);
@@ -693,7 +847,7 @@ pub fn gen_list(rng: &mut Rng, opts: &Opts) -> Vec<Vec<u8>> {
             &mut out,
             &mut seen,
         );
-        if !has_variants(t) {
+        if !list_variants(t) {
             fixed_used[idx] = true;
         }
     }
@@ -706,12 +860,10 @@ pub fn gen_list(rng: &mut Rng, opts: &Opts) -> Vec<Vec<u8>> {
     // reach the count at all.
     let mut var_pool: Vec<usize> = Vec::new();
     for (idx, t) in corpus::CORPUS.iter().enumerate() {
-        if let Some(f) = opts.family {
-            if t.fam != f {
-                continue;
-            }
+        if !in_scope(t, &weights, opts) {
+            continue;
         }
-        if !uniq || has_variants(t) || !fixed_used[idx] {
+        if !uniq || list_variants(t) || !fixed_used[idx] {
             var_pool.push(idx);
         }
     }
@@ -722,7 +874,7 @@ pub fn gen_list(rng: &mut Rng, opts: &Opts) -> Vec<Vec<u8>> {
         let idx = var_pool[pos];
         let t = &corpus::CORPUS[idx];
         guard += 1;
-        if !has_variants(t) {
+        if !list_variants(t) {
             fixed_used[idx] = true;
             // Only a unique list has to drop the template: the pool is its
             // record of what has been emitted, and a padded list may draw it
@@ -903,7 +1055,11 @@ fn population_counting(
     // PID 1 is init whenever the system family is in scope. `inject` never
     // draws it: PID 1 is the kernel's.
     let init_idx = corpus::CORPUS.iter().position(|t| t.cmd == "/sbin/init");
-    if !inject && opts.family.map(|f| f == corpus::FAM_SYS).unwrap_or(true) {
+    if !inject
+        && init_idx
+            .map(|idx| in_scope(&corpus::CORPUS[idx], &weights, opts))
+            .unwrap_or(false)
+    {
         if let Some(idx) = init_idx {
             let p = make_proc(&corpus::CORPUS[idx], idx, rng, opts, &snap, &mut cache);
             *emitted.entry(p.cmd.clone()).or_insert(0) += 1;
@@ -927,10 +1083,10 @@ fn population_counting(
     let mut idle = 0usize;
     while rows.len() < want && idle < corpus::CORPUS.len() {
         let before = rows.len();
-        let idx = pick_index(rng, &weights, opts.family, &used);
+        let idx = pick_index(rng, &weights, opts, &used);
         let t = &corpus::CORPUS[idx];
         if Some(idx) == init_idx
-            || counts[idx] >= budget(t, opts, want)
+            || counts[idx] >= distinct_cap(t, &weights, opts, want)
             || (counts[idx] > 0 && !repeatable(t))
         {
             idle += 1;
@@ -959,7 +1115,7 @@ fn population_counting(
         let instances = if t.inst == 0 { 1 } else { t.inst as usize };
         let take = instances.min(want.saturating_sub(rows.len()));
         for _ in 0..take {
-            if counts[idx] >= budget(t, opts, want) {
+            if counts[idx] >= distinct_cap(t, &weights, opts, want) {
                 break;
             }
             let mut p = make_proc(t, idx, rng, opts, &snap, &mut cache);
@@ -1063,6 +1219,74 @@ fn order_by_parent(rows: &mut [Proc]) {
 /// an existing master when the population has one, and adds one only when it
 /// must.
 #[allow(clippy::too_many_arguments)]
+fn emit_fill_row(
+    idx: usize,
+    rng: &mut Rng,
+    opts: &Opts,
+    out: &mut Vec<Proc>,
+    want: usize,
+    counts: &mut [usize],
+    emitted: &mut BTreeMap<Vec<u8>, usize>,
+    snap: &Snap,
+    user_cache: &mut BTreeMap<Vec<u8>, (u32, u32)>,
+    built: &mut usize,
+) -> bool {
+    if out.len() >= want {
+        return false;
+    }
+    let t = &corpus::CORPUS[idx];
+    let command_bound = opts.repeat_max;
+    let mut parent_row = parent_index(idx).and_then(|pidx| {
+        if pidx == idx {
+            None
+        } else {
+            out.iter().position(|r| r.tmpl == pidx)
+        }
+    });
+    if parent_row.is_none() {
+        if let Some(pidx) = parent_index(idx) {
+            if pidx != idx && out.len() + 1 < want {
+                let mut pp = make_proc(&corpus::CORPUS[pidx], pidx, rng, opts, snap, user_cache);
+                *built += 1;
+                pp.parent = None;
+                if command_allows(emitted, &pp.cmd, command_bound) {
+                    *emitted.entry(pp.cmd.clone()).or_insert(0) += 1;
+                    counts[pidx] += 1;
+                    out.push(pp);
+                    parent_row = Some(out.len() - 1);
+                }
+            }
+        }
+    }
+    // A draw can land on a command line the bound already spent, and
+    // that is a reason to draw again rather than to lose the row: a
+    // template with nine values collides with its own first row one
+    // time in nine. `FILL_DRAWS` bounds the retry so a template that
+    // can no longer produce anything cannot spin.
+    for _ in 0..FILL_DRAWS {
+        let mut p = make_proc(t, idx, rng, opts, snap, user_cache);
+        *built += 1;
+        if !command_allows(emitted, &p.cmd, command_bound) {
+            continue;
+        }
+        *emitted.entry(p.cmd.clone()).or_insert(0) += 1;
+        counts[idx] += 1;
+        p.parent = parent_row;
+        if let Some(pi) = parent_row {
+            if let Some(parent) = out.get(pi) {
+                if p.age > parent.age {
+                    p.age = parent.age;
+                    p.start_epoch = parent.start_epoch;
+                }
+            }
+        }
+        out.push(p);
+        return true;
+    }
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
 fn fill(
     rng: &mut Rng,
     opts: &Opts,
@@ -1077,45 +1301,90 @@ fn fill(
     if out.len() >= want {
         return built;
     }
-    let mut candidates: Vec<(usize, usize)> = Vec::new();
+    let mut candidates: Vec<usize> = Vec::new();
     for (idx, t) in corpus::CORPUS.iter().enumerate() {
-        if opts.family.map(|f| f != t.fam).unwrap_or(false) {
+        if !in_scope(t, weights, opts) {
             continue;
         }
         if t.cmd == "/sbin/init" {
             continue;
         }
-        if corpus::F_REPEAT & t.flags == 0 && !has_variants(t) {
-            continue;
-        }
-        let extra = parent_index(idx).map(|p| p != idx).unwrap_or(false) as usize;
-        // A candidate must be able to afford its own row plus, if it is a
-        // worker, a master that is not there yet.
-        candidates.push((idx, extra));
+        // A fixed template belongs here with room for exactly one row: the
+        // distinct pass may not have reached it, and `--repeat-max 1` must
+        // still be able to reach the number of templates in scope.
+        candidates.push(idx);
     }
     if candidates.is_empty() {
         return 0;
     }
     let need = want - out.len();
     let k = candidates.len();
-    // A template's capacity is its budget less the rows it already has: the
-    // distinct pass contributes too, and a quota that ignored that let one
-    // command reach 73 rows where the bound allowed 29.
+    // A template's capacity is its table-mode distinct supply times its
+    // per-command budget, less the rows it already has: small-range
+    // placeholders like `{n}` (9 values) cannot soak up quota they cannot
+    // fill under `--repeat-max`.
+    let caps: Vec<usize> = candidates
+        .iter()
+        .map(|&idx| {
+            let t = &corpus::CORPUS[idx];
+            if has_variants(t) {
+                table_template_supply(t).saturating_mul(budget(t, weights, opts, want))
+            } else if repeatable(t) {
+                budget(t, weights, opts, want)
+            } else {
+                1
+            }
+        })
+        .collect();
     let room: Vec<usize> = candidates
         .iter()
-        .map(|(idx, _)| budget(&corpus::CORPUS[*idx], opts, want).saturating_sub(counts[*idx]))
+        .enumerate()
+        .map(|(pos, &idx)| caps[pos].saturating_sub(counts[idx]))
         .collect();
-    // Even split, so the busiest command stays at the pigeonhole minimum; the
-    // remainder goes to the heavier templates first.
+    // Coverage first: a template with no row yet gets one before any template
+    // adds a second, because a fixed template has no later chance. This is
+    // what keeps `--repeat-max 1` from stopping short of the in-scope
+    // template count while variable templates soak up the remainder.
     let mut quota: Vec<usize> = vec![0; k];
-    let share = need / k;
+    let mut rest = need;
     for pos in 0..k {
-        quota[pos] = share.min(room[pos]);
+        if rest == 0 {
+            break;
+        }
+        if room[pos] > 0 && counts[candidates[pos]] == 0 {
+            quota[pos] = 1;
+            rest -= 1;
+        }
     }
-    let mut rest = need - quota.iter().sum::<usize>();
+    // Water-fill evenly across templates that still have room, so templates
+    // capped by `room` (fixed or small-range `{n}` templates) redistribute
+    // their unused quota to the remaining candidates.
+    while rest > 0 {
+        let active = (0..k).filter(|&pos| quota[pos] < room[pos]).count();
+        if active == 0 {
+            break;
+        }
+        let share = rest / active;
+        if share == 0 {
+            break;
+        }
+        let mut added = 0usize;
+        for pos in 0..k {
+            let avail = room[pos] - quota[pos];
+            if avail > 0 {
+                let add = share.min(avail);
+                quota[pos] += add;
+                added += add;
+            }
+        }
+        rest -= added;
+        if added == 0 {
+            break;
+        }
+    }
     let shares: Vec<u64> = candidates
         .iter()
-        .map(|(idx, _)| cand_weight(&corpus::CORPUS[*idx], weights, opts.family))
+        .map(|&idx| cand_weight(&corpus::CORPUS[idx], weights, opts.family))
         .collect();
     let total: u64 = shares.iter().sum::<u64>().max(1);
     let mut frac: Vec<(u64, usize)> = shares
@@ -1124,72 +1393,75 @@ fn fill(
         .map(|(i, w)| (w * need as u64 % total, i))
         .collect();
     frac.sort_unstable_by(|a, b| b.cmp(a));
-    let mut fi = 0usize;
-    while rest > 0 {
-        let pos = frac[fi % k].1;
-        fi += 1;
-        if quota[pos] >= room[pos] {
-            // This template is at its budget. When every one of them is, the
-            // corpus cannot reach the count and `shortfall` reports the gap.
-            if frac.iter().all(|(_, p)| quota[*p] >= room[*p]) {
-                break;
-            }
-            continue;
+    for &(_, pos) in &frac {
+        if rest == 0 {
+            break;
         }
-        quota[pos] += 1;
-        rest -= 1;
+        if quota[pos] < room[pos] {
+            quota[pos] += 1;
+            rest -= 1;
+        }
     }
     let mut emitted: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
     for p in out.iter() {
         *emitted.entry(p.cmd.clone()).or_insert(0) += 1;
     }
-    let command_bound = opts.repeat_max;
-    for (pos, (idx, _)) in candidates.iter().enumerate() {
-        let t = &corpus::CORPUS[*idx];
-        let mut parent_row = parent_index(*idx).and_then(|pidx| {
-            if pidx == *idx {
-                None
-            } else {
-                out.iter().position(|r| r.tmpl == pidx)
+    // Snapshot each candidate's pre-fill count so that if `emit_fill_row`
+    // spawns a missing parent `pidx` early (`counts[pidx] += 1`), we do not
+    // make redundant draws when the loop later visits `pidx`.
+    let initial_counts: Vec<usize> = candidates.iter().map(|&idx| counts[idx]).collect();
+    let mut exhausted = vec![false; k];
+    for (pos, &idx) in candidates.iter().enumerate() {
+        let target_total = initial_counts[pos].saturating_add(quota[pos]);
+        while counts[idx] < target_total && out.len() < want {
+            if !emit_fill_row(
+                idx,
+                rng,
+                opts,
+                out,
+                want,
+                counts,
+                &mut emitted,
+                snap,
+                user_cache,
+                &mut built,
+            ) {
+                exhausted[pos] = true;
+                break;
             }
-        });
-        for _ in 0..quota[pos] {
+        }
+    }
+    // Redistribute any slots left unfilled by an exhausted template to other
+    // in-scope candidates that still have room.
+    while out.len() < want {
+        let mut progressed = false;
+        for &(_, pos) in &frac {
             if out.len() >= want {
-                return built;
+                break;
             }
-            if parent_row.is_none() {
-                if let Some(pidx) = parent_index(*idx) {
-                    if pidx != *idx && out.len() + 1 < want {
-                        let mut pp =
-                            make_proc(&corpus::CORPUS[pidx], pidx, rng, opts, snap, user_cache);
-                        pp.parent = None;
-                        if command_allows(&emitted, &pp.cmd, command_bound) {
-                            *emitted.entry(pp.cmd.clone()).or_insert(0) += 1;
-                            counts[pidx] += 1;
-                            out.push(pp);
-                            parent_row = Some(out.len() - 1);
-                        }
-                    }
-                }
-            }
-            let mut p = make_proc(t, *idx, rng, opts, snap, user_cache);
-            built += 1;
-            if !command_allows(&emitted, &p.cmd, command_bound) {
+            let idx = candidates[pos];
+            if exhausted[pos] || counts[idx] >= caps[pos] {
                 continue;
             }
-            *emitted.entry(p.cmd.clone()).or_insert(0) += 1;
-            counts[*idx] += 1;
-            let pi = parent_row;
-            p.parent = pi;
-            if let Some(pi) = pi {
-                if let Some(parent) = out.get(pi) {
-                    if p.age > parent.age {
-                        p.age = parent.age;
-                        p.start_epoch = parent.start_epoch;
-                    }
-                }
+            if emit_fill_row(
+                idx,
+                rng,
+                opts,
+                out,
+                want,
+                counts,
+                &mut emitted,
+                snap,
+                user_cache,
+                &mut built,
+            ) {
+                progressed = true;
+            } else {
+                exhausted[pos] = true;
             }
-            out.push(p);
+        }
+        if !progressed {
+            break;
         }
     }
     built
@@ -1242,7 +1514,7 @@ pub fn fit_rows(rows: &mut [Proc], fit: &Fit) {
     }
     let page = sys::page_kb().max(1);
     let budget = fit.mem_kb.saturating_sub(fit.mem_kb / 20).max(page);
-    let total: u64 = rows.iter().map(|p| p.rss as u64).sum();
+    let total: u64 = rows.iter().map(|p| p.rss).sum();
     if total > budget {
         // The sum of every RSS is the strictest reading: a real host can hold
         // them all resident at once. Scale every row by the same factor, with
@@ -1250,7 +1522,7 @@ pub fn fit_rows(rows: &mut [Proc], fit: &Fit) {
         let factor = budget as f64 / total as f64;
         for p in rows.iter_mut() {
             let v = ((p.rss as f64) * factor).max(page as f64);
-            p.rss = crate::table::round_up(v as u64, page).min(u32::MAX as u64) as u32;
+            p.rss = crate::table::round_up(v as u64, page);
             if p.vsz < p.rss {
                 p.vsz = p.rss;
             }
@@ -1258,9 +1530,9 @@ pub fn fit_rows(rows: &mut [Proc], fit: &Fit) {
     }
     // A single row still cannot exceed the host, whatever the sum says.
     for p in rows.iter_mut() {
-        let cap = budget.min(u32::MAX as u64);
-        if p.rss as u64 > cap {
-            p.rss = crate::table::round_up(cap, page).min(u32::MAX as u64) as u32;
+        let cap = budget;
+        if p.rss > cap {
+            p.rss = crate::table::round_up(cap, page);
         }
         if p.vsz < p.rss {
             p.vsz = p.rss;
@@ -1394,7 +1666,7 @@ pub fn stub_name(cmd: &[u8]) -> &[u8] {
 mod tests {
     use super::*;
 
-    fn proc_of(rss: u32, vsz: u32) -> Proc {
+    fn proc_of(rss: u64, vsz: u64) -> Proc {
         Proc {
             cmd: b"x".to_vec(),
             tty: Vec::new(),
@@ -1425,11 +1697,7 @@ mod tests {
         };
         fit_rows(&mut rows, &fit);
         for p in &rows {
-            assert!(
-                (p.rss as u64) <= fit.mem_kb,
-                "rss {} above the 1 GiB host",
-                p.rss
-            );
+            assert!(p.rss <= fit.mem_kb, "rss {} above the 1 GiB host", p.rss);
             assert!(p.vsz >= p.rss, "vsz {} below rss {}", p.vsz, p.rss);
         }
     }
@@ -1519,6 +1787,7 @@ mod tests {
                 uniq: true,
                 repeat_max: None,
                 uptime: None,
+                profile_set: false,
             };
             let mut rng = Rng::new(3);
             let rows = gen_table(&mut rng, &opts, &fit);
@@ -1530,7 +1799,8 @@ mod tests {
                 );
             }
             assert!(
-                fit.shortfall_reason(50).is_some(),
+                fit.shortfall_reason_for(rows.len(), 50, rows.iter().any(|p| p.pid == 1))
+                    .is_some(),
                 "pid_max {} did not report a shortfall",
                 pid_max
             );
@@ -1548,6 +1818,7 @@ mod tests {
             uniq: true,
             repeat_max: None,
             uptime: None,
+            profile_set: false,
         };
         for pid_max in [10u64, 37, 100, 500] {
             let fit = Fit { mem_kb: 0, pid_max };
@@ -1573,7 +1844,8 @@ mod tests {
             );
             if rows.len() < 60 {
                 assert!(
-                    fit.shortfall_reason(60).is_some(),
+                    fit.shortfall_reason_for(rows.len(), 60, rows.iter().any(|p| p.pid == 1))
+                        .is_some(),
                     "pid_max {} silently under-delivered",
                     pid_max
                 );
@@ -1646,6 +1918,7 @@ mod tests {
             uniq: true,
             repeat_max: None,
             uptime: Some(90_000),
+            profile_set: false,
         };
         let mut rng = Rng::new(42);
         let rows = gen_table(&mut rng, &opts, &Fit::none());
@@ -1676,6 +1949,7 @@ mod tests {
                     uniq: true,
                     repeat_max: None,
                     uptime: Some(uptime),
+                    profile_set: false,
                 };
                 let mut rng = Rng::new(seed);
                 let rows = gen_table(&mut rng, &opts, &Fit::none());
@@ -1722,6 +1996,7 @@ mod tests {
                 uniq: true,
                 repeat_max: None,
                 uptime: Some(86_400),
+                profile_set: false,
             };
             let mut rng = Rng::new(2);
             let rows = gen_table(&mut rng, &opts, &Fit::none());
@@ -1774,6 +2049,7 @@ mod tests {
             uniq: true,
             repeat_max: None,
             uptime: Some(90_000),
+            profile_set: false,
         };
         let mut rng = Rng::new(1);
         let rows = gen_table(&mut rng, &opts, &Fit::none());
@@ -1813,6 +2089,7 @@ mod tests {
                         uniq: true,
                         repeat_max: None,
                         uptime: Some(uptime),
+                        profile_set: false,
                     };
                     let fit = Fit {
                         mem_kb: mem_mb * 1024,
@@ -1829,7 +2106,7 @@ mod tests {
                     for p in &rows {
                         assert!(p.rss <= p.vsz, "{:?}: rss {} > vsz {}", p.cmd, p.rss, p.vsz);
                         assert!(
-                            (p.rss as u64) * 1000 / fit.mem_kb <= 1000,
+                            p.rss * 1000 / fit.mem_kb <= 1000,
                             "{:?}: {} kB is over the {} kB host",
                             String::from_utf8_lossy(&p.cmd),
                             p.rss,
@@ -1884,5 +2161,296 @@ mod tests {
             .expect("a shim");
         assert!(has_variants(shim));
         assert!(repeatable(shim));
+    }
+
+    fn table_opts(profile: &[u8], count: usize, repeat: Option<usize>) -> Opts {
+        Opts {
+            count,
+            seed: 0,
+            profile: profile.to_vec(),
+            family: None,
+            self_user: b"root".to_vec(),
+            uniq: true,
+            repeat_max: repeat,
+            uptime: Some(90_000),
+            profile_set: true,
+        }
+    }
+
+    #[test]
+    fn repeat_max_one_reaches_the_template_count_in_a_profile() {
+        // Every template in the dev profile contributes one row under
+        // `--repeat-max 1`, including the six single-instance daemons that are
+        // fixed command lines with no `{...}` placeholder: their one row is
+        // the only row they will ever get.
+        let weights = corpus::profile_weights(b"dev");
+        for seed in 1..=5u64 {
+            let mut probe = table_opts(b"dev", 180, Some(1));
+            probe.seed = seed;
+            let scope = corpus::CORPUS
+                .iter()
+                .filter(|t| in_scope(t, &weights, &probe))
+                .count();
+            let mut rng = Rng::new(seed);
+            let rows = gen_table(&mut rng, &probe, &Fit::none());
+            assert_eq!(rows.len(), 180, "seed {} did not reach the count", seed);
+            for needle in [
+                &b"haproxy"[..],
+                &b"caddy"[..],
+                &b"varnishd"[..],
+                &b"clickhouse-server"[..],
+                &b"ceph-mon"[..],
+                &b"rpcbind"[..],
+            ] {
+                assert!(
+                    rows.iter()
+                        .any(|r| r.cmd.windows(needle.len()).any(|w| w == needle)),
+                    "seed {} is missing {}",
+                    seed,
+                    String::from_utf8_lossy(needle)
+                );
+            }
+            assert!(scope >= 170, "the dev profile should scope most templates");
+        }
+    }
+
+    #[test]
+    fn a_zero_weight_family_contributes_no_rows_under_a_profile() {
+        // server has desk at 0 and dev has mail at 0; the profile comment says
+        // a server has no desktop session and a dev machine no mail server.
+        let server = table_opts(b"server", 800, None);
+        let mut rng = Rng::new(7);
+        let rows = gen_table(&mut rng, &server, &Fit::none());
+        assert!(
+            rows.iter()
+                .all(|r| corpus::CORPUS[r.tmpl].fam != corpus::FAM_DESK),
+            "a server table drew a desktop row"
+        );
+        let dev = table_opts(b"dev", 800, None);
+        let mut rng = Rng::new(7);
+        let rows = gen_table(&mut rng, &dev, &Fit::none());
+        assert!(
+            rows.iter()
+                .all(|r| corpus::CORPUS[r.tmpl].fam != corpus::FAM_MAIL),
+            "a dev table drew a mail row"
+        );
+        // Control: an explicit family is an override, so the same profile
+        // still yields that family.
+        let weights = corpus::profile_weights(b"server");
+        let mut forced = table_opts(b"server", 50, None);
+        forced.family = Some(corpus::FAM_DESK);
+        let mut rng = Rng::new(7);
+        let rows = gen_table(&mut rng, &forced, &Fit::none());
+        assert!(!rows.is_empty(), "-f desk produced nothing");
+        assert!(
+            rows.iter()
+                .all(|r| corpus::CORPUS[r.tmpl].fam == corpus::FAM_DESK),
+            "-f desk drew another family"
+        );
+        assert!(in_scope(
+            corpus::CORPUS
+                .iter()
+                .find(|t| t.fam == corpus::FAM_DESK)
+                .expect("a desk template"),
+            &weights,
+            &forced
+        ));
+    }
+
+    #[test]
+    fn a_list_counts_the_uid_variants_the_writer_can_produce() {
+        // `{uid}` is fixed for a table run and free for a list, so the list
+        // writer and its supply estimate must agree on the six IDs.
+        let opts = Opts {
+            count: 2000,
+            seed: 0,
+            profile: b"server".to_vec(),
+            family: Some(corpus::FAM_SYS),
+            self_user: b"root".to_vec(),
+            uniq: true,
+            repeat_max: None,
+            uptime: None,
+            profile_set: false,
+        };
+        let mut rng = Rng::new(1);
+        let lines = gen_list(&mut rng, &opts);
+        assert_eq!(lines.len(), 53, "the sys family has 53 distinct lines");
+        let mut seen = BTreeSet::new();
+        for l in &lines {
+            assert!(seen.insert(l.clone()), "a uniq list repeated a line");
+        }
+        let session = lines
+            .iter()
+            .filter(|l| l.starts_with(b"/usr/bin/dbus-daemon --session"))
+            .count();
+        assert_eq!(session, 6, "six UID variants of the session bus");
+        let weights = corpus::profile_weights(b"server");
+        assert_eq!(
+            distinct_supply(Some(corpus::FAM_SYS), &weights, false),
+            53,
+            "the estimate and the writer disagree"
+        );
+        // A padded list still emits the count, and every repeated line is a
+        // repeat of one of the 53.
+        let padded = Opts {
+            count: 2000,
+            seed: 0,
+            profile: b"server".to_vec(),
+            family: Some(corpus::FAM_SYS),
+            self_user: b"root".to_vec(),
+            uniq: false,
+            repeat_max: None,
+            uptime: None,
+            profile_set: false,
+        };
+        let mut rng = Rng::new(1);
+        let lines = gen_list(&mut rng, &padded);
+        assert_eq!(lines.len(), 2000);
+        assert_eq!(lines.iter().collect::<BTreeSet<_>>().len(), 53);
+    }
+
+    #[test]
+    fn pigeonhole_uses_in_scope_templates_under_profiles() {
+        for profile in [&b"server"[..], &b"dev"[..]] {
+            let weights = corpus::profile_weights(profile);
+            let scoped = table_opts(profile, 500, None);
+            let mut unscoped = table_opts(profile, 500, None);
+            unscoped.profile_set = false;
+
+            let k_scoped = corpus::CORPUS
+                .iter()
+                .filter(|t| in_scope(t, &weights, &scoped))
+                .filter(|t| t.cmd != "/sbin/init" && repeatable(t))
+                .count();
+            let k_all = corpus::CORPUS
+                .iter()
+                .filter(|t| t.cmd != "/sbin/init" && repeatable(t))
+                .count();
+            assert!(
+                k_scoped < k_all,
+                "profile {} should exclude at least one zero-weight repeatable family",
+                String::from_utf8_lossy(profile)
+            );
+            assert_eq!(
+                pigeonhole(&weights, &scoped, 500),
+                500usize.div_ceil(k_scoped)
+            );
+            assert_eq!(
+                pigeonhole(&weights, &unscoped, 500),
+                500usize.div_ceil(k_all)
+            );
+        }
+    }
+
+    #[test]
+    fn fill_web_repeat_max_one_reaches_all_distinct_lines() {
+        let expected = corpus::CORPUS
+            .iter()
+            .filter(|t| t.fam == corpus::FAM_WEB)
+            .map(table_template_supply)
+            .sum::<usize>();
+        assert_eq!(expected, 25);
+
+        for seed in 1..=10u64 {
+            let mut opts = table_opts(b"server", 40, Some(1));
+            opts.family = Some(corpus::FAM_WEB);
+            opts.profile_set = false;
+            opts.seed = seed;
+            let mut rng = Rng::new(seed);
+            let rows = gen_table(&mut rng, &opts, &Fit::none());
+            assert_eq!(
+                rows.len(),
+                expected,
+                "seed {} produced {} rows instead of all {} distinct web lines",
+                seed,
+                rows.len(),
+                expected
+            );
+            let uniq: BTreeSet<&[u8]> = rows.iter().map(|r| r.cmd.as_slice()).collect();
+            assert_eq!(uniq.len(), expected, "seed {} repeated a command", seed);
+        }
+
+        // Mixed small-range (`{n}` = 9, `{port}` = 14) and high-cardinality
+        // (`{hex64}`) family redistributes leftover quota cleanly without
+        // dropping rows.
+        let mut ctr_opts = table_opts(b"server", 60, Some(1));
+        ctr_opts.family = Some(corpus::FAM_CTR);
+        ctr_opts.profile_set = false;
+        let mut rng = Rng::new(7);
+        let ctr_rows = gen_table(&mut rng, &ctr_opts, &Fit::none());
+        assert_eq!(ctr_rows.len(), 60);
+        let ctr_uniq: BTreeSet<&[u8]> = ctr_rows.iter().map(|r| r.cmd.as_slice()).collect();
+        assert_eq!(ctr_uniq.len(), 60);
+    }
+
+    #[test]
+    fn placeholder_values_unknown_key_returns_one() {
+        assert_eq!(placeholder_values(b"unknown"), 1);
+        assert_eq!(placeholder_values(b"hex99"), 1);
+        assert_eq!(placeholder_values(b"hex6"), SUPPLY_MAX);
+        assert_eq!(placeholder_values(b"hex8"), SUPPLY_MAX);
+        assert_eq!(placeholder_values(b"hex12"), SUPPLY_MAX);
+        assert_eq!(placeholder_values(b"hex64"), SUPPLY_MAX);
+        assert_eq!(template_supply("daemon --flag {unknown}"), 1);
+    }
+
+    #[test]
+    fn shortfall_reason_for_respects_has_init_and_pid_max() {
+        let f1 = Fit {
+            mem_kb: 0,
+            pid_max: 1,
+        };
+        assert_eq!(
+            f1.shortfall_reason_for(1, 10, true).as_deref(),
+            Some("pid_max is 1, so a snapshot can hold 1 process (PID 1 alone)")
+        );
+        assert_eq!(
+            f1.shortfall_reason_for(0, 10, false).as_deref(),
+            Some("pid_max is 1, so a snapshot can hold 0 processes (no PID beside PID 1)")
+        );
+
+        let f2 = Fit {
+            mem_kb: 0,
+            pid_max: 2,
+        };
+        assert_eq!(
+            f2.shortfall_reason_for(1, 10, true).as_deref(),
+            Some("pid_max is 2, so a snapshot can hold 1 process (PID 1 alone)")
+        );
+        assert_eq!(
+            f2.shortfall_reason_for(0, 10, false).as_deref(),
+            Some("pid_max is 2, so a snapshot can hold 0 processes (no PID beside PID 1)")
+        );
+
+        let f3 = Fit {
+            mem_kb: 0,
+            pid_max: 3,
+        };
+        assert_eq!(
+            f3.shortfall_reason_for(2, 10, true).as_deref(),
+            Some("pid_max is 3, so a snapshot can hold 2 processes (PID 1 and 2..2)")
+        );
+        assert_eq!(
+            f3.shortfall_reason_for(1, 10, false).as_deref(),
+            Some("pid_max is 3, so a snapshot can hold 1 process (PID 2..2)")
+        );
+        assert_eq!(f3.shortfall_reason_for(2, 2, true), None);
+        assert_eq!(f3.shortfall_reason_for(1, 1, false), None);
+
+        let f100 = Fit {
+            mem_kb: 0,
+            pid_max: 100,
+        };
+        assert_eq!(
+            f100.shortfall_reason_for(99, 200, true).as_deref(),
+            Some("pid_max is 100, so a snapshot can hold 99 processes (PID 1 and 2..99)")
+        );
+        assert_eq!(
+            f100.shortfall_reason_for(98, 200, false).as_deref(),
+            Some("pid_max is 100, so a snapshot can hold 98 processes (PID 2..99)")
+        );
+        // When another constraint (e.g. --repeat-max 1) capped output below
+        // pid_max capacity, pid_max is not the reason for the shortfall.
+        assert_eq!(f100.shortfall_reason_for(25, 200, false), None);
     }
 }

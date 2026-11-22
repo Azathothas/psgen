@@ -1,63 +1,66 @@
 # psgen
 
-`psgen` generates realistic Linux process lists on stdout, and can inject them
-into the real process table. After injection, `ps aux`, `ps -ef` and `/proc`
-show the synthetic processes as ordinary running processes.
+`psgen` generates realistic Linux process lists on stdout and can inject synthetic processes into the live process table.
+After injection, `ps aux`, `ps -ef`, and `/proc` display the synthetic processes as normal running processes.
 
-It is a single Rust binary with one dependency, `libc`. It is Linux-only. The
-release binaries are statically linked against musl. It uses no ptrace, no
-kernel module and no `LD_PRELOAD`; each stub is the same binary re-executed
-with the template argv.
+`psgen` is a single Linux-only Rust binary with one dependency (`libc`).
+Release binaries are statically linked against musl.
+`psgen` uses no `ptrace`, no kernel module, and no `LD_PRELOAD`.
+Each injected stub re-executes the `psgen` binary with the template argv.
 
 ## Requirements
 
-- Linux with `procfs` mounted at `/proc`.
-- Root for user switching (`setuid`, `initgroups`) and for the bind exe tier.
-  Without root, `inject` warns once and every stub runs as the invoking user.
-- The bind tier needs a private mount namespace and a bind mount. Root can
-  create both directly; an unprivileged process can create them inside an
-  unprivileged user namespace when the kernel allows it. Without either, the
-  shadow tier is used, or proc-self.
-- `python3` for `tests/invariants.py`. `cargo` and a Rust toolchain for the
-  unit tests and for building from source.
-- No runtime dependencies: the release binaries are static musl.
+- Run on Linux with `procfs` mounted at `/proc`.
+- Run as root to switch users (`setuid`, `initgroups`) or to use the `bind` executable tier directly.
+  Without root, `inject` prints one warning and runs every stub as the invoking user.
+- Provide a private mount namespace and bind-mount permission for the `bind` tier.
+  Root creates mount namespaces and bind mounts directly.
+  Unprivileged processes can create mount namespaces and bind mounts inside an unprivileged user namespace when the kernel permits user namespaces.
+  When the kernel denies bind mounts, `inject` selects the `shadow` tier or the `proc-self` tier.
+- Install `python3` to run `tests/invariants.py`.
+- Install `cargo` and a Rust toolchain to run unit tests or build from source.
+- Release binaries require no runtime dependencies because release binaries are statically linked against musl.
 
 ## Build
+
+Add the musl target and build the static release binary:
 
 ```sh
 rustup target add x86_64-unknown-linux-musl
 cargo build --release --target x86_64-unknown-linux-musl
 ```
 
-The binary is `target/x86_64-unknown-linux-musl/release/psgen`.
-`.cargo/config.toml` selects `rust-lld`; dependencies come from crates.io and
-there is no `vendor/` directory. `scripts/build-all.sh` builds that target and
-checks the result for `NEEDED` and `INTERP`.
+Cargo writes the static binary to `target/x86_64-unknown-linux-musl/release/psgen`.
+`.cargo/config.toml` selects `rust-lld`, downloads dependencies from crates.io, and uses no `vendor/` directory.
+Run `scripts/build-all.sh` to build the `x86_64-unknown-linux-musl` target and verify that the ELF binary has no `NEEDED` or `INTERP` entries.
 
-`cargo build --release` without `--target` builds for the host's default
-target, which is normally glibc. That binary works, but it is not the static
-artifact the releases ship.
+Running `cargo build --release` without `--target` builds for the host default target, which is normally glibc.
+The glibc build works on the host, but GitHub Releases ship only static musl artifacts.
 
-The release workflow builds seven targets: `x86_64-unknown-linux-musl`,
-`aarch64-unknown-linux-musl`, `armv7-unknown-linux-musleabihf`,
-`i686-unknown-linux-musl`, `riscv64gc-unknown-linux-musl`,
-`loongarch64-unknown-linux-musl` and `powerpc64le-unknown-linux-musl`.
-Non-native targets are linked with `cargo-zigbuild`; each binary is checked
-for dynamic dependencies and an interpreter before it is packaged.
+The release workflow builds seven static musl targets:
+
+- `x86_64-unknown-linux-musl`
+- `aarch64-unknown-linux-musl`
+- `armv7-unknown-linux-musleabihf`
+- `i686-unknown-linux-musl`
+- `riscv64gc-unknown-linux-musl`
+- `loongarch64-unknown-linux-musl`
+- `powerpc64le-unknown-linux-musl`
+
+The workflow links cross-compiled targets with `cargo-zigbuild` and verifies that every binary has no dynamic dependencies and no ELF interpreter before packaging.
 
 ## Install
 
-A release carries three kinds of asset:
+Each GitHub release publishes three asset types:
 
-- `psgen-<version>-<target>.tar.gz` — the directory
-  `psgen-<version>-<target>/` holding `psgen`, `LICENSE` and `README.md`;
-- `psgen-<target>` — the same binary, uncompressed;
-- `SHA256SUMS` — one `sha256sum` line for each tarball and each raw binary;
-  it does not list itself.
+- `psgen-<version>-<target>.tar.gz`: archive containing `psgen-<version>-<target>/` with `psgen`, `LICENSE`, and `README.md`.
+- `psgen-<target>`: uncompressed static binary.
+- `SHA256SUMS`: one `sha256sum` line for each tarball and each raw binary. `SHA256SUMS` does not list itself.
+
+Download, verify, and install a release tarball:
 
 ```sh
-# TAG and VERSION come from the release: TAG is the git tag, VERSION is the
-# [package] version in Cargo.toml at that tag.
+# Set TAG to the git tag and VERSION to [package].version in Cargo.toml at that tag.
 TAG=v0.0.2
 VERSION=0.0.2
 TARGET=x86_64-unknown-linux-musl
@@ -69,26 +72,24 @@ tar -xzf "psgen-$VERSION-$TARGET.tar.gz"
 install -m 0755 "psgen-$VERSION-$TARGET/psgen" /usr/local/bin/psgen
 ```
 
-`SHA256SUMS` lists every tarball and every raw binary — fourteen lines for the
-fifteen assets of a seven-target release, because the file cannot list itself —
-and a plain `sha256sum -c SHA256SUMS` fails on each one you did not download.
-`--ignore-missing` skips
-the absent files and verifies the ones that are present; it exits non-zero if
-none was verified, and it does not report a missing file as a failure, so it
-proves the assets you have are the published ones and says nothing about the
-rest. The raw binary is installed the same way, with `psgen-<target>` in place
-of the tarball.
+`SHA256SUMS` contains 14 lines for the 15 assets of a seven-target release because `SHA256SUMS` cannot list its own checksum.
+A plain `sha256sum -c SHA256SUMS` command fails on every asset that you did not download.
+Pass `--ignore-missing` to verify the downloaded files and skip absent files.
+`sha256sum -c --ignore-missing` exits non-zero if zero files match, proving that each downloaded file matches the release manifest.
+Install the raw `psgen-<target>` binary using the same verification steps.
 
-The crate is published from the release workflow for a final tag only, so
-`cargo install psgen` installs the real tool from that point on. Until then
-the crates.io name holds a `0.0.0` reservation.
+The release workflow publishes to crates.io for final tags only.
+Final tags require `CARGO_REGISTRY_TOKEN` and verify `cargo info psgen@<version>` after upload so a release cannot succeed without publishing.
+Because `v0.0.2` shipped before the `publish-crate` gate existed, crates.io currently holds only the `0.0.0` name reservation.
+Install `psgen` from GitHub release assets until a new final release publishes to crates.io.
 
 ## Commands
 
-`psgen list` prints command lines, `psgen table` prints a `ps aux` style table,
-`psgen table --live` prints the real process table in the same format, and
-`psgen inject` starts synthetic processes. The other commands are `stop`,
-`doctor`, `log`, `load`, `corpus`, `check`, `unit`, `help` and `version`.
+`psgen list` prints command lines.
+`psgen table` prints a synthetic `ps aux` table.
+`psgen table --live` prints the live process table in `ps aux` format.
+`psgen inject` starts synthetic processes in the live process table.
+The remaining subcommands are `stop`, `doctor`, `log`, `load`, `corpus`, `check`, `unit`, `help`, and `version`.
 
 ```sh
 psgen list -n 40 -s 7
@@ -114,359 +115,310 @@ Defaults and caps:
 | `log` | 20 events | 200000 |
 | `corpus` | every template | — |
 
-A cap above the limit prints it on stderr and uses it. `-n 0` means the
-default for every command; for `list` the default is one line per in-scope
-template, so `list`, `list -n 0` and `list -n 0 -p <profile>` print 181 lines
-each, and `list -s N` and `list -n 0 -s N` are byte-identical. At `-n 0` every
-template is in scope, so every profile prints the same 181 command lines; `-p`
-changes the order they are drawn in, and therefore which placeholder values each
-line gets. At a finite count `-p` changes which templates are drawn as well:
-`list -n 40 -s 7 -p server` and `-p desktop` name 10 of the same templates.
-`list` sorts its lines by default; `--no-sort` keeps draw order, which starts
-with `/sbin/init`.
+When a requested count exceeds the command cap, `psgen` prints the cap on stderr and clamps the count to the cap.
+`-n 0` selects the default count for every command.
+For `list`, the default is one line per in-scope template, so `list` and `list -n 0` both print 181 lines, and `list -s N` matches `list -n 0 -s N` byte for byte.
+
+Passing an explicit `-p` excludes every family that the profile weights at zero:
+
+- `list -n 0 -p server` prints 163 lines.
+- `list -n 0 -p dev` prints 173 lines.
+
+`list` sorts output lexicographically by default (`--sort`).
+Pass `--no-sort` to preserve weighted draw order, which starts with `/sbin/init`.
+At a finite count, `-p` also changes which templates are drawn: `list -n 40 -s 7 -p server` and `list -n 40 -s 7 -p desktop` share 10 templates.
 
 ### Counts, repeats and host limits
 
-`-n` is a guarantee for `table` and `inject`: the count is met whenever any
-in-scope template can appear more than once. A template that stands for several
-rows at once (six nginx workers) keeps its instance count, so one draw can add
-`inst` rows at a time.
+`table` and `inject` meet `-n` whenever any in-scope template can repeat.
+A multi-instance template (such as six `nginx` workers) preserves its instance count (`inst`), so one draw adds `inst` rows.
 
-The split is per template, not per row, and the bound on one command line is
-`max(inst, ceil(rows / k))`, where `k` is the number of in-scope templates that
-can repeat. `inst` is the largest instance count among them. Both terms are
-needed: the pigeonhole term `ceil(rows / k)` is what an even split over `k`
-templates can achieve at the top, and `inst` is the floor a template that
-represents several processes contributes however small the count is. For
-`-f web -n 200` that is `max(6, ceil(200 / 7)) = 29` rows for the busiest
-command; `-f mail -n 200` gives `max(1, ceil(200 / 5)) = 40`; and `-f sys -n 200`
-gives `max(2, ceil(200 / 6)) = 34`. A template whose command line contains a
-variable placeholder (`{hex64}`, `{cport}`, `{ip}`, …) can always supply another
-distinct row.
+The repeat limit applies per template, with a per-command-line bound of `max(inst, ceil(rows / k))`.
+In that formula, `k` is the count of repeatable in-scope templates and `inst` is the template's instance count.
+`ceil(rows / k)` distributes large counts evenly across repeatable templates, while `inst` sets the floor for multi-instance services:
 
-`--repeat-max N` bounds how often one command line may appear:
+- `-f web -n 200`: `max(6, ceil(200 / 7)) = 29` rows for the busiest command.
+- `-f mail -n 200`: `max(1, ceil(200 / 5)) = 40` rows.
+- `-f sys -n 200`: `max(2, ceil(200 / 6)) = 34` rows.
 
-- `--repeat-max 1` — no command line twice. The count is then whatever the
-  corpus can supply; `table -f web -n 40 --repeat-max 1` prints 17 rows and
-  says so on stderr.
-- `--repeat-max 0` — no bound on repeats.
-- omitted — the realistic bound described above.
+Any template with a variable placeholder (`{hex64}`, `{cport}`, `{ip}`, `{n}`, and similar tokens) produces a new command line on each distinct expansion.
 
-`list` never repeats a command line, so `--repeat-max` does not apply to it;
-`list --no-uniq` pads a list when that is what you want.
+`--repeat-max N` limits how many times one expanded command line may appear:
 
-Two host properties cap a table, and both are reported with the reason and the
-numbers:
+- `--repeat-max 1`: allows each distinct command line at most once.
+  In `FAM_WEB`, 17 templates (16 fixed command lines plus 1 `envoy` `{n}` template with 9 values) produce 25 distinct command lines.
+  `table -f web -n 40 --repeat-max 1` therefore prints 25 rows and reports the shortfall on stderr.
+- `--repeat-max 0`: removes the repeat cap.
+- omitted: applies the default `max(inst, ceil(rows / k))` bound.
 
-- the PID space. A snapshot cannot show two rows with the same PID, and a PID at
-  or above `pid_max` does not exist, so at most `pid_max - 1` rows can appear
-  beside PID 1. `--host-pid-max N` generates for such a host; a host with
-  `pid_max` below 3 leaves the init row alone.
-- the corpus, for a family whose every row is a fixed command line.
-  `--repeat-max` is the explicit override there.
+`list` never repeats a command line and rejects `--repeat-max` with exit 2.
+Pass `list --no-uniq` to pad a list by repeating existing command lines.
 
-`--host-mem MiB`, `--host-pid-max N` and `--host-uptime S` generate a table for
-a named host instead of this one. `--host-mem` and `--host-pid-max` reject 0
-with exit 2, because 0 means "unknown" inside the fit rules and would silently
-describe this machine instead. They exist so the fit rules can be exercised end
-to end, and so a table can be produced for a machine that is not the one
-running the tool.
+Two limits can cap a synthetic table, and `table` prints the cause and counts on stderr:
+
+- **PID space**: A snapshot cannot repeat a PID, and valid PIDs are strictly below `pid_max`.
+  A synthetic table holds at most `pid_max - 1` rows in total, including PID 1 (`pid_max - 2` rows beside PID 1).
+  When `pid_max < 3`, `table` still shows PID 1 if `/sbin/init` is in scope, with zero rows beside PID 1.
+- **Corpus supply**: A family with only fixed command lines can supply at most its distinct templates unless `--repeat-max` allows repeats.
+
+`--host-mem MiB`, `--host-pid-max N`, and `--host-uptime S` generate a synthetic table for a target host instead of the local host.
+All three options reject `0` with exit 2 because `0` means unknown inside the host-fit rules.
 
 ### Options by command
 
-The options a command honours are the options it accepts: an option that does
-not apply to the chosen subcommand exits 2 with a message naming it, rather
-than being silently ignored. A mode-selected case is rejected the same way —
-`table --live --local` and `inject --dry-run --table` are usage errors.
+Each subcommand accepts only the options that the subcommand consumes.
+Passing an unsupported option or an invalid mode combination (such as `table --live --local` or `inject --dry-run --table`) exits 2 with a message naming the option.
 
-- `list`: `-n/--count`, `-s/--seed`, `-p/--profile`, `-f/--family`,
-  `--sort`/`--no-sort`, `--uniq`/`--no-uniq`.
-- `table`: the generator options, `--utc-offset`, `--local`, `--live`,
-  `--repeat-max`, `--host-mem`, `--host-pid-max`, `--host-uptime`.
-- `inject`: the generator options, `--repeat-max`, `-d/--duration`,
-  `--pidfile`, `--mem`/`--no-mem`, `--mem-cap`, `--mem-target`, `--phys-cap`,
-  `--disk`, `--exe`/`--no-exe` (`--allow-proc-exe` is an alias of `--no-exe`),
-  `--shadow-dir`, `--no-root`, `--tty`/`--no-tty`, `--threads`/`--no-threads`,
-  `--user`/`--no-user`, `--create-users`, `--busy`, `--cpu`, `--dry-run`,
-  `--plan`, `--json`, `--table`, `--verify`, `--wait`, `--elevate`,
-  `-q/--quiet`.
+- `list`: `-n/--count`, `-s/--seed`, `-p/--profile`, `-f/--family`, `--sort`/`--no-sort`, `--uniq`/`--no-uniq`.
+- `table`: generator options, `--utc-offset`, `--local`, `--live`, `--repeat-max`, `--host-mem`, `--host-pid-max`, `--host-uptime`.
+- `inject`: generator options, `--repeat-max`, `-d/--duration`, `--pidfile`, `--mem`/`--no-mem`, `--mem-cap`, `--mem-target`, `--phys-cap`, `--disk`, `--exe`/`--no-exe` (`--allow-proc-exe` aliases `--no-exe`), `--shadow-dir`, `--no-root`, `--tty`/`--no-tty`, `--threads`/`--no-threads`, `--user`/`--no-user`, `--create-users`, `--busy`, `--cpu`, `--dry-run`, `--plan`, `--json`, `--table`, `--verify`, `--wait`, `--elevate`, `-q/--quiet`.
 - `stop`: `--pidfile`, `--force`, `--plan`, `--elevate`, `-q/--quiet`.
 - `check`: `-s/--seed`, `-f/--family`, `--binaries`, `--require-binaries`.
-- `unit`: `-n/--count`, `-s/--seed`, `-p/--profile`, `-f/--family`,
-  `--pidfile`, `--create-users`, and the inject options minus `--table`,
-  `--wait`, `--dry-run`, `--plan`, `--json`, `--repeat-max`, `--elevate` and
-  `-q`. `-n` is capped at 500.
+- `unit`: `-n/--count`, `-s/--seed`, `-p/--profile`, `-f/--family`, `--pidfile`, `--create-users`, and all `inject` options except `--table`, `--wait`, `--dry-run`, `--plan`, `--json`, `--repeat-max`, `--elevate`, and `-q`.
+  `unit` caps `-n` at 500.
 - `doctor`: `--json`, `--pidfile`.
-- `log`: `-s/--seed`, `-m/--module`, `--lines`, `--delay`, `--speed`,
-  `--log-fmt`.
-- `load`: `--cpu-util`, `--mem-util`, `--disk-util`, `-d/--duration`,
-  `--force`, `-q/--quiet`.
+- `log`: `-s/--seed`, `-m/--module`, `--lines`, `--delay`, `--speed`, `--log-fmt`.
+- `load`: `--cpu-util`, `--mem-util`, `--disk-util`, `-d/--duration`, `--force`, `-q/--quiet`.
 - `corpus`: no options.
 
-The generator options are `-n/--count`, `-s/--seed`, `-p/--profile` (`server`,
-`dev`, `desktop`) and `-f/--family` (`sys`, `web`, `db`, `ctr`, `dev`, `mon`,
-`sto`, `mail`, `desk`, `net`). `-p` weights which templates `list`, `table` and
-`inject` draw; the defaults table above says what it does to a set and to an
-order.
+Generator options are `-n/--count`, `-s/--seed`, `-p/--profile` (`server`, `dev`, `desktop`), and `-f/--family` (`sys`, `web`, `db`, `ctr`, `dev`, `mon`, `sto`, `mail`, `desk`, `net`).
+`-p` weights template draws for `list`, `table`, and `inject` and excludes families weighted at zero when `-p` is explicit.
 
 ## The table
 
-`table`, `table --live` and `inject --table` print one header and one line per
-row:
+`table`, `table --live`, and `inject --table` print one header line followed by one line per process:
 
 ```text
 USER         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND
 ```
 
-The column rules are the ones `ps aux` uses with `procps-ng`:
+The column rules match `procps-ng` `ps aux`:
 
-- **USER** is the effective uid, resolved through the passwd database; a uid
-  with no entry prints as its decimal value. A name longer than eight
-  characters is cut to seven and a `+`.
-- **%CPU** is `tics * 1000 / elapsed`, where `elapsed` comes from
-  `CLOCK_BOOTTIME` with its sub-second part, so a young process is not
-  reported several times low. Below 100.0 it prints one decimal; at or above
-  it prints an integer, which keeps the field four columns wide.
-- **%MEM** is `rss * 1000 / MemTotal` in integer arithmetic, which truncates
-  rather than rounds, and is capped at 999. A live table divides by
-  `/proc/meminfo`'s `MemTotal`, which is what `ps` uses even inside a
-  container. A synthetic table divides by this host's budget ( `MemTotal`
-  lowered to the cgroup limit when that is smaller) or by `--host-mem`.
-- **START** is `HH:MM` when the row started on the current calendar day in the
-  rendering zone, `%b%d` with a zero-padded day (`Nov05`) when it started on
-  another day of the same year, and `%Y` when it started in another year. The
-  day, not the age, decides. A synthetic row never starts before the boot of
-  the host it describes and never in the future.
-- **TIME** is total minutes and seconds of CPU time, `75:00`, never
-  `HH:MM:SS` and never a day prefix. A live row carries its real
-  `utime + stime`; a synthetic row models it from its age and the `%CPU` it
-  claims.
-- **STAT** is the state character followed by `<` for a negative nice, `N` for
-  a positive one, `L` when pages are locked, `s` for a session leader, `l` for
-  more than one thread and `+` for a foreground process group.
-- **TTY** is the device name resolved from the tty number, else `?`.
-- **COMMAND** is `/proc/PID/cmdline` up to 512 KiB, joined on spaces. A NUL or
-  a line break separates arguments, other control bytes become `?`, and a
-  zombie gets a trailing ` <defunct>`. A process with no argv prints `[comm]`.
-  A row is cut at the 128 KiB `ps` writes through one buffer.
+- **USER**: Resolves the effective UID through the passwd database, or prints the decimal UID if unresolved.
+  Names longer than 8 characters truncate to 7 characters plus `+`.
+- **%CPU**: Computes `ticks * 1000 / elapsed`, where `elapsed` uses sub-second `CLOCK_BOOTTIME`.
+  Values below 100.0 print one decimal place; values at or above 100.0 print an integer to keep four columns.
+- **%MEM**: Computes `rss * 1000 / MemTotal` using truncating integer division, capped at 999.
+  Live tables divide by `/proc/meminfo` `MemTotal`, matching `ps` inside containers.
+  Synthetic tables divide by the local memory budget (`MemTotal`, lowered to the cgroup limit if smaller) or by `--host-mem`.
+- **START**: Prints `HH:MM` for the current calendar day in the active timezone, `%b%d` (`Nov05`) for another day in the same year, and `%Y` for another year.
+  Synthetic rows never start before host boot and never start in the future.
+- **TIME**: Prints total CPU minutes and seconds (`75:00`), never `HH:MM:SS` and never a day prefix.
+  Live rows use real `utime + stime`; synthetic rows model CPU time from process age and `%CPU`.
+- **STAT**: Prints the process state character plus `<` (negative nice), `N` (positive nice), `L` (locked pages), `s` (session leader), `l` (multithreaded), and `+` (foreground process group).
+- **TTY**: Resolves the TTY device name when the device node exists, or prints `?`.
+- **COMMAND**: Reads `/proc/PID/cmdline` up to 512 KiB and joins arguments with spaces.
+  NUL bytes and line breaks separate arguments, and other control bytes become `?`.
+  Zombies receive a trailing ` <defunct>`, processes without argv print `[comm]`, and printed rows truncate at 128 KiB.
 
-`table --live` renders the host's own zone and the host's own `MemTotal`, and
-rejects `--local`, `--utc-offset`, `--repeat-max` and the `--host-*` flags:
-they describe a generated table, not this host. `inject --table` uses the same
-renderer and the same inputs, and prints in PID order.
+`table --live` uses the host timezone and host `MemTotal`, and rejects `--local`, `--utc-offset`, `--repeat-max`, and all `--host-*` flags with exit 2.
+`inject --table` uses the same live renderer and sorts rows by PID.
 
-`table` (synthetic) keeps `--utc-offset` (minutes east of UTC, `-1440..1440`,
-default 0) and `--local` as its knobs, with the same column formats, because a
-synthetic table claims to look like `ps aux`. `--local` selects the system
-timezone and overrides `--utc-offset` rather than shifting the timestamp a
-second time.
+Synthetic `table` accepts `--utc-offset` (minutes east of UTC, `-1440..1440`, default 0) and `--local`.
+`--local` selects the system timezone and overrides `--utc-offset` instead of applying both offsets.
 
 ## Injection model
 
-`inject` builds a process tree from corpus rows. A root stub forks its children
-after reading its configuration, so `ps -ef` and `pstree` show a parent chain.
-Each stub keeps the template argv set at `execve`, so `ps aux` and
-`/proc/PID/cmdline` show the template command line.
+`inject` spawns a process tree from corpus rows.
+Each root stub forks its child stubs after reading its configuration so `ps -ef` and `pstree` display realistic parent chains.
+Each stub keeps the template argv across `execve` so `ps aux` and `/proc/PID/cmdline` display the template command line.
 
 ### Exe tiers
 
-`/proc/PID/exe` is selected from three tiers:
+`inject` chooses `/proc/PID/exe` from three tiers:
 
-- **bind**: a private mount namespace, `/` made private, the template path
-  bound over the stub binary, then a re-exec through that path.
-  `/proc/PID/exe` and `/proc/PID/maps` show the template path. A missing path
-  gets a temporary `.psgen-<pid>-<row>-<n>` directory; `stop` removes it.
-- **shadow**: a copy of the binary in a per-run directory under
-  `./.psgen-stubs` (or `--shadow-dir`), executed by the stub.
-  `/proc/PID/exe` shows the shadow path. The directory is
-  `.psgen-<pid>-9000-<n>`; the copy is `psgen-stub`.
-- **proc-self**: the stub executes `/proc/self/exe`; `/proc/PID/exe` points at
-  psgen.
+- **bind**: Creates a private mount namespace, marks `/` private, bind-mounts the stub binary over the template executable path, and re-executes through the template path.
+  `/proc/PID/exe` and `/proc/PID/maps` show the template path.
+  When the template path does not exist on disk, `inject` creates a `.psgen-<pid>-<row>-<n>` staging directory that `stop` later removes.
+- **shadow**: Copies the `psgen` binary to `psgen-stub` inside `.psgen-<pid>-9000-<n>` under the shadow root (`<TMPDIR>/.psgen-stubs` by default, or `--shadow-dir`) and executes that copy.
+  `/proc/PID/exe` shows the shadow path.
+- **proc-self**: Executes `/proc/self/exe`.
+  `/proc/PID/exe` points to the `psgen` binary.
 
-The tier is chosen once per run, in this order:
+`inject` selects the tier once per run in this priority order:
 
 | condition | tier |
 | --- | --- |
-| `--no-exe` (or `--allow-proc-exe`) | proc-self, whatever else is set |
-| `--no-root` with `--shadow-dir` | shadow |
-| `--no-root` without `--shadow-dir` | proc-self |
-| root (or a usable user namespace) with mount and bind allowed | bind |
-| otherwise, with a shadow root available | shadow |
-| otherwise | proc-self, with a warning naming what was denied |
+| `--no-exe` (or `--allow-proc-exe`) | `proc-self` regardless of other flags |
+| `--no-root` with `--shadow-dir` | `shadow` |
+| `--no-root` without `--shadow-dir` | `proc-self` |
+| root (or usable user namespace) with mount namespace and bind mount allowed | `bind` |
+| otherwise, with a shadow root available | `shadow` |
+| otherwise | `proc-self`, with a warning naming the denied capability |
 
-A bind denied in a cage that allows mount namespaces leaves the default
-`./.psgen-stubs` in place, so `/proc/PID/exe` still names a plausible path.
+The default shadow root is `<TMPDIR>/.psgen-stubs`.
+When a container denies bind mounts, `inject` falls back to `<TMPDIR>/.psgen-stubs` so `/proc/PID/exe` still displays a plausible path.
+`inject` scans `<cwd>/.psgen-stubs` only to clean up leftovers from earlier versions.
 
 ### Users, tty and threads
 
-As root, and unless `--no-root` or `--no-user` is set, each stub calls
-`initgroups`, `setgid` and `setuid` for the template user. A missing user falls
-back to the invoking user with a warning; `--create-users` creates it with
-`useradd`, using the existing group when the group is present but the user is
-not. Without root, the run warns once and `--create-users` cannot create
-anything; `--elevate` re-executes `inject` or `stop` through `sudo -n` when
-passwordless `sudo` is available.
+When running as root without `--no-root` or `--no-user`, each stub calls `initgroups`, `setgid`, and `setuid` for its template user.
+If a template user does not exist, the stub warns and runs as the invoking user.
 
-`--tty` (default) gives a tty row a real pty and makes it the row's
-controlling terminal, so `ps` shows `pts/N` for it. `--no-tty` clears the tty
-and session flags and detaches every row from the caller's controlling
-terminal. `--threads` (default) gives a threaded row a second thread.
+Passing `--create-users` as root creates missing system accounts with `useradd`, reusing an existing group when the group exists without the user.
+`psgen` looks up `useradd` only at four fixed absolute paths without consulting `PATH`:
 
-A failed privilege drop is reported as a deviation, and the stub keeps running
-under the uid it already has.
+- `/usr/sbin/useradd`
+- `/usr/bin/useradd`
+- `/sbin/useradd`
+- `/run/current-system/sw/bin/useradd`
+
+Before running `useradd`, `psgen` clears the child environment with `env_clear()` and sets only `PATH=/usr/sbin:/usr/bin:/sbin:/bin` and `LC_ALL=C`.
+
+Without root, `inject` warns once and `--create-users` creates no accounts.
+`--elevate` re-executes `inject` or `stop` through `sudo -n` when passwordless `sudo` is available.
+
+`--tty` (default) allocates a real PTY for each TTY template and sets that PTY as the controlling terminal so `ps` shows `pts/N`.
+`--no-tty` clears TTY and session flags and detaches every row from the caller's controlling terminal.
+`--threads` (default) starts a second thread for threaded templates.
+
+If a privilege drop fails, the stub reports a deviation and continues running under its current UID.
 
 ### Memory and disk
 
-`--mem` (default) pads VSZ and RSS from one anonymous arena sized to the
-largest target, using `memfd_create` or an unlinked temp file. Each stub maps a
-prefix, touches its pages, trims RSS with `MADV_DONTNEED`, and pads VSZ with a
-`PROT_NONE` mapping. Reported RSS is shared, so the physical cost is smaller
-than the sum of the rows.
+`--mem` (default) pads VSZ and RSS from one shared anonymous arena sized to the largest RSS target, backed by `memfd_create` or an unlinked temporary file.
+Each stub maps a prefix, touches its pages, trims RSS with `MADV_DONTNEED`, and pads VSZ with a `PROT_NONE` mapping.
+Because stubs share the arena pages, actual physical memory usage stays smaller than the sum of reported RSS values.
 
-- `--mem-target KiB` sets a per-stub RSS target, clamped to the template's VSZ
-  minus 4 MiB.
-- `--mem-cap MiB` caps the planned RSS sum, with a 4 MiB floor per stub.
-- `--phys-cap MiB` bounds the estimated physical cost: the largest RSS, its
-  page tables and the base RSS. The default is the smaller of a quarter of RAM
-  and half the cgroup limit.
-- `--disk MiB` writes that much temp data per stub.
+- `--mem-target KiB`: sets the per-stub RSS target, clamped to template VSZ minus 4 MiB.
+- `--mem-cap MiB`: caps the sum of planned RSS targets while keeping a 4 MiB floor per stub.
+- `--phys-cap MiB`: caps estimated physical memory (largest RSS plus page tables plus base RSS).
+  When omitted, the default budget is the smaller of one quarter of host RAM and half of the cgroup memory limit.
+- `--disk MiB`: writes the requested MiB of temporary data per stub.
 
-`RLIMIT_FSIZE` is checked before the arena is sized: targets above it are
-lowered with a warning, and padding is disabled with a warning when the limit
-cannot hold the arena at all. `--verify` compares each stub's real VSZ and RSS
-with the plan within 128 kB, and has no effect with `--no-mem` (it warns).
+`inject` checks `RLIMIT_FSIZE` before sizing the arena.
+Targets above `RLIMIT_FSIZE` drop with a warning, and memory padding disables with a warning if the limit cannot hold the arena.
+`--verify` checks that each stub's real VSZ and RSS match the plan within 128 KiB, and warns with no effect under `--no-mem`.
 
 ### Previewing a run
 
-`--dry-run` prints the `user<TAB>command` pairs that would be spawned and
-nothing else, which is the format existing callers parse.
+`--dry-run` prints `user<TAB>command` lines for the rows that `inject` would spawn.
 
-`--dry-run --plan` prints the resolved plan instead:
+`--dry-run --plan` prints the resolved execution plan instead:
 
 ```text
 tier bind   mem on, tty on, threads on, busy off
-plan: 4 stubs, 2 roots; rss 67 MiB shared, ~42 MiB physical (budget 3994 MiB); staging 0 directories
+plan: 4 stubs, 2 roots; rss 67 MiB shared, ~42 MiB physical (budget 3994 MiB); staging 0 directory patterns
 row 0 root user=root vsz=13160 rss=8156 cpu=0.0 tty=no threads=no exe=/usr/sbin/nginx
 row 1 child user=www-data vsz=15444 rss=4824 cpu=0.0 tty=no threads=no exe=/usr/sbin/nginx parent=0
 row 2 root user=root vsz=60676 rss=20596 cpu=0.1 tty=no threads=no exe=/usr/sbin/php-fpm
 row 3 child user=www-data vsz=73208 rss=35680 cpu=0.1 tty=no threads=no exe=/usr/sbin/php-fpm parent=2
 ```
 
-The plan reports the tier and its shadow root, the physical estimate and
-whether it was scaled, the staging directories the run would create, and the
-users it would create. `--dry-run --json` prints the same plan as one JSON
-object, with `rows`, `staging_dirs` and `would_create` arrays. The two are
-alternatives; passing both exits 2.
+The plan line prints `from <shadow_root>` only when the resolved tier is `shadow`.
+When a run requires staging directories (`shadow`, `--disk`, or missing `bind` executables), the plan prints `staging pattern <dir>` lines.
+Those patterns include `<pid>` and `<i>` placeholders that `inject` fills at spawn time.
 
-A preview runs the same preflights as the real run — pidfile writability, disk
-space, `RLIMIT_FSIZE` — and exits non-zero for a command line the real run
-would refuse. It never elevates and never creates an account. `--plan` with
-`--create-users` keeps the template's user name and reports the accounts the
-run would create, instead of falling back to the caller's identity.
+`--dry-run --json` prints the same plan as one JSON object with `rows`, `staging_dirs`, and `would_create` arrays.
+`--plan` and `--json` are mutually exclusive; passing both exits 2.
+
+Previews execute the same preflight checks as real runs: pidfile writability, live-pidfile detection, lock-file contention, disk space, and `RLIMIT_FSIZE`.
+A preview refuses a live pidfile or an externally held `<pidfile>.lock` with exit 2 without creating or modifying files.
+Previews never elevate and never create user accounts.
+With `--create-users`, `--dry-run --plan` and `--dry-run --json` keep missing template usernames and list the accounts in `would_create` (with `null` UID/GID in JSON).
 
 ## Pidfile and stop
 
-`--pidfile FILE` records the run:
+`--pidfile FILE` writes the run record in this format:
 
 ```text
-# psgen <version> boot <boot-id>
+# psgen <version> boot <boot-id> nonce <nonce>
 # temp <absolute-temp-dir>
 <pid>\t<starttime>\t<comm>
 ```
 
-The `# temp` line is conditional: `inject` writes one per staging directory the
-run creates, and creates none when nothing in the run needs a directory. A
-proc-self run therefore has a header and its PID lines only, while a bind run
-whose template executables exist has the same, and a shadow run, a bind run
-with `--disk`, or a bind run whose template path is missing adds one `# temp`
-line per directory. The header is parsed without interpreting the version, so a
-pidfile written by another release still gets the boot-id check. A header with
-no boot id is refused by `stop` and never written by `inject`: if the boot id
-cannot be read, `inject` refuses to start.
+The header carries the boot ID and the run `nonce`.
+`inject` writes one `# temp` line for each staging directory created during the run and writes no `# temp` lines when the run creates no staging directories.
+`stop` parses the header without rejecting other version strings, so pidfiles from other releases still receive the boot-ID check.
+If `inject` cannot read `/proc/sys/kernel/random/boot_id`, `inject` refuses to start.
 
-A header-only pidfile is written before the first stub is forked. If that write
-fails, nothing is spawned; if it succeeds, a later failure still leaves a valid
-pidfile behind. The write goes through a temporary name with `O_EXCL` and is
-renamed into place. The temporary suffix shrinks through four shapes, appended
-to the target path and tried in order: `.tmp.<pid>.<16 hex>`, `.t<pid><6 hex>`,
-`.tmp.<pid>`, `.t<pid>`. On a filesystem with `NAME_MAX` 255 and a five-digit
-PID, a 247-byte basename is written and a 248-byte one exits 2 before anything
-is spawned. The bound moves with the PID's width and with `NAME_MAX`, so it is
-decided by trying the real name rather than by a constant. The preflight builds
-exactly the name the writer will use, and proves the body size, the mode and
-the rename, not just a zero-byte create.
+### Pidfile Locking, Preflight, and Recovery Sidecars
 
-An existing target must be absent, empty or a psgen pidfile. A device, FIFO,
-socket or symlink is refused with exit 2. `stop` reads through `O_NOFOLLOW`,
-so a symlinked pidfile is not followed.
+Before spawning stubs, `inject` performs these steps:
 
-`stop --pidfile FILE` checks the boot id, then each line's identity before
-signalling:
+1. Preflights the estimated final pidfile body size against directory permissions, target type, and `RLIMIT_FSIZE`.
+   `psgen` ignores `SIGXFSZ` at startup so oversize writes fail cleanly with `EFBIG` instead of terminating the process.
+2. Acquires an exclusive non-blocking `flock` on `<pidfile>.lock` (opened with `O_NOFOLLOW`) to serialize concurrent `inject` runs on the same pidfile.
+3. Re-checks that the pidfile records zero live rows while holding `<pidfile>.lock`.
+4. Writes a header-only pending pidfile through an `O_EXCL | O_NOFOLLOW` temporary file and renames the temporary file atomically into place.
 
-- a three-field line checks starttime and comm;
-- a two-field line checks starttime;
-- a one-field line checks the exe. That form identifies a proc-self row, or a
-  shadow copy inside a staging directory the caller owns. A one-field line
-  naming a bind-tier row is an error, not a silent skip, because accepting the
-  template path would also accept the host's real daemon.
+`inject` tries four temporary filename suffixes in order: `.tmp.<pid>.<16 hex>`, `.t<pid><6 hex>`, `.tmp.<pid>`, and `.t<pid>`.
+With `NAME_MAX` = 255 and a 5-digit PID, `.t<pid>` is 7 bytes.
+A 248-byte basename therefore fits, and a 249-byte basename fails preflight with exit 2.
+The lock suffix `.lock` is 5 bytes.
+Because Linux PIDs can reach 7 digits, `unit` reserves 9 bytes of suffix headroom and accepts basenames up to 246 bytes.
 
-PID 1 is never signalled. Lines are processed deepest PID first, a leader's
-process group is killed so children that never reported are reached, and the
-PID itself is signalled through a pidfd when available, or after a
-check-then-kill. A zombie is skipped, not counted: it is already dead, and a
-signal to one succeeds and does nothing.
+An existing pidfile target must be absent, empty, or an existing `psgen` pidfile.
+`inject` refuses directories, symlinks, FIFOs, sockets, and devices with exit 2.
+`stop` opens the pidfile with `O_NOFOLLOW` so symlinks are never followed.
 
-After signalling, `stop` waits, bounded at two seconds, until every signalled
-PID is gone or a zombie, so `stopped N` is true when it is printed. A line that
-needed no signal — already gone, a zombie, PID 1, an identity mismatch — counts
-as skipped, and a line it could not signal counts as failed and makes the exit
-code 1. A second `stop` on the same pidfile therefore reports
-`stopped 0 processes, skipped N`.
+If the post-spawn pidfile write fails after stubs exist, `inject` removes the pending header file if possible.
+`inject` then writes a recovery sidecar carrying the real `# temp` paths and run `nonce`.
+`inject` tries `<pidfile>.spawned` first (opened with `O_NOFOLLOW`) and falls back to `<TMPDIR>/psgen-spawned-<pid>-<nonce>.pid` if the pidfile directory is unwritable.
+`inject` then prints the exact `psgen stop --pidfile <sidecar>` command on stderr and exits 1.
 
-`--plan` prints what would be signalled and signals nothing; it also refuses
-the signal it could not send, and it never elevates. `--force` ignores only the
-boot id, and is also the escape hatch for a file with no psgen header at all. A
-`# psgen` line after the first line is a comment, not a header.
+### Stopping a Run
 
-`stop` does not unlink the pidfile, so the same path can be reused once its
-processes are gone. `stop` removes a `# temp` directory when all of these hold:
-the path is absolute; it is a real directory, not a symlink; it is owned by the
-caller and is not group- or world-writable; its basename matches
-`.psgen-<digits>-<digits>-<digits>`; its live marker names no live process; and
-no line failed. A skipped line — already gone, a zombie, PID 1, an identity
-mismatch, a malformed line — does not block the removal; a line whose signal did
-not land does. `--plan` never removes anything.
+`stop --pidfile FILE` validates the pidfile and checks each row's identity before sending signals:
 
-A run that ends by `--duration` alone leaves its staging directories, because
-the injector is gone by then and no `stop` ran. Two paths reclaim them:
+- **Format and header**: `stop` prints the path and OS error on unreadable files and exits 1.
+  `stop` refuses CRLF pidfiles.
+  `stop` accepts a `# psgen <version>...` header after leading blank or comment lines before the first content line, and ignores unrelated comments such as `# psgen-wrapper` or `# psgen: ...`.
+  When `<pidfile>` has zero process rows, `stop` automatically reads `<pidfile>.spawned` beside `<pidfile>` if that sidecar exists.
+- **Three-field lines (`pid\tstarttime\tcomm`)**: `stop` verifies both `starttime` and `comm`.
+- **Two-field lines (`pid\tstarttime`)**: `stop` verifies `starttime`.
+- **One-field lines (`pid`)**: `stop` verifies that `PSGEN_NONCE` in `/proc/PID/environ` matches the header's `nonce` across `proc-self`, `shadow`, and `bind` tiers.
+  If the header carries no nonce or the process lacks the matching `PSGEN_NONCE`, `stop` counts the row as a failure (`cannot identify`) and exits 1, never as a skip.
+  For bind-tier rows, the diagnostic message names the executable path only as a hint and never treats the executable path as a match.
 
-- `stop` on the run's pidfile removes them, the same as for a stopped run: the
-  PID lines are already gone, so `stop` reports `stopped 0 processes, skipped N`
-  and then removes each `# temp` directory whose marker names nothing alive.
-- The next `inject` prunes before it spawns. It scans the temporary directory,
-  `<cwd>/.psgen-stubs` and `<TMPDIR>/.psgen-stubs`, plus this run's
-  `--shadow-dir`. A stub appends its own identity to the directory's live marker
-  before it execs, and the prune keeps a directory while any process in that
-  marker is alive or while the owner marker names a live injector. A marker
-  records the PID namespace inode, the boot id and a run tag, so a PID from
-  another namespace is never read as dead, a marker from an earlier boot is
-  provably over, and a directory whose owner is gone and whose marker is empty
-  is removed. A directory owned by a different uid is reported and left alone.
+`stop` never signals PID 1.
+`stop` processes deepest PIDs first, signals each leader's process group to catch unreported children, and signals each target PID via `pidfd_send_signal` (or check-then-kill when `pidfd_open` is unavailable).
+`stop` skips zombies because zombies are already dead, while still signalling a zombie leader's process group.
 
-Because the default shadow root is `<cwd>/.psgen-stubs`, a run started from
-another working directory leaves a copy where a later prune never looks; give
-`--shadow-dir` a fixed path if runs are started from different directories.
+After signalling, `stop` waits up to 2 seconds until every signalled PID exits or becomes a zombie so `stopped N` is accurate when printed.
+Rows that needed no signal (already gone, zombie, PID 1, or starttime/comm mismatch) count as skipped.
+Rows that `stop` could not identify or could not signal count as failed and make `stop` exit 1.
+Running `stop` a second time on the same pidfile prints `stopped 0 processes, skipped N lines`.
 
-`--wait` requires a non-zero `--duration` (exit 2 otherwise). It blocks for the
-duration, then kills each root's process group after a starttime check, signals
-each identified PID through a pidfd or a check-then-kill, and removes the temp
-directories after asking the live marker.
+`stop --plan` prints what `stop` would signal without sending signals, verifies signal permissions, and never elevates.
+`stop --force` ignores boot-ID mismatches and allows stopping files that lack a `# psgen` header.
+
+`stop` does not unlink the pidfile so callers can reuse the same pidfile path once its processes exit.
+`stop` removes a `# temp` staging directory only when all of these conditions hold:
+
+- Zero rows failed during `stop` and `--plan` is not set.
+- `safe_temp_dir` approves the directory: absolute path, real directory (not a symlink), and not a mount point or bind mount (`is_mount_point`).
+  The directory must not sit on FUSE or overlayfs on root runs.
+  The caller must own the directory, mode bits must clear group and world write, and the basename must match `.psgen-<digits>-<digits>-<digits>`.
+- The directory's live marker names zero live processes.
+- `remove_staging_dir` confirms `is_mount_point` is false before deletion.
+
+Skipped lines (already gone, zombie, PID 1, identity mismatch, or malformed line) do not block staging directory removal.
+
+### Reclaiming Staging Directories After `--duration`
+
+A run that exits via `--duration` without `stop` leaves its staging directories on disk.
+Two mechanisms reclaim those directories:
+
+- Run `psgen stop --pidfile FILE` on the run's pidfile.
+  `stop` reports `stopped 0 processes, skipped N lines` and removes every unreferenced `# temp` directory.
+- Start a later `psgen inject` run.
+  Before spawning, `inject` prunes unreferenced staging directories in the temporary directory, `<TMPDIR>/.psgen-stubs`, `<cwd>/.psgen-stubs` (for older-version leftovers), and the current run's `--shadow-dir`.
+  Stubs append their PID, start time, PID namespace inode, boot ID, and nonce to the live marker before `execve`.
+  Pruning keeps any directory with a live marked process, an active owner marker, or a marker from another PID namespace.
+  Pruning removes directories whose boot ID is from an earlier boot or whose marked processes have all exited.
+  Directories owned by another UID are reported and left untouched.
+
+If you use a custom `--shadow-dir` outside the temporary directory, pass the same path on later runs so pruning can reach it.
+
+`--wait` requires a non-zero `--duration` (exit 2 otherwise).
+`--wait` sleeps for the duration, verifies root start times, and kills each root's process group.
+`--wait` then signals remaining identified PIDs and removes staging directories once their live markers are clear.
 
 ## unit
 
-`psgen unit` prints, without installing, a systemd unit that injects at boot.
-For a build installed at `/usr/local/bin/psgen`, `psgen unit` prints exactly
-this:
+`psgen unit` prints a boot-time systemd unit to stdout without installing the unit file.
+For a binary installed at `/usr/local/bin/psgen`, `psgen unit` prints:
 
 ```text
 [Unit]
@@ -488,77 +440,80 @@ ExecStop=-/bin/rm -f -- /run/psgen/psgen.pid
 WantedBy=multi-user.target
 ```
 
-`ExecStart` and both `ExecStop` lines name the running binary, so a unit written
-from a staged build names that build. The `RuntimeDirectory` is derived from the
-pidfile path: a pidfile directly in `/run` gets no `RuntimeDirectory` line,
-`/run/<dir>/...` declares `<dir>`, and a path outside `/run` is refused with
-exit 2 because nothing would create its parent at boot. `RuntimeDirectoryMode`
-is `0700`.
+`ExecStart` and `ExecStop` reference the running binary path.
+`unit` derives `RuntimeDirectory=` from the pidfile path: a pidfile directly inside `/run` emits no `RuntimeDirectory=`, and `/run/<dir>/<file>` emits `RuntimeDirectory=<dir>` with `RuntimeDirectoryMode=0700`.
 
-`RuntimeDirectoryPreserve=yes` keeps the directory across a stop, so stopping
-one unit cannot delete a pidfile a second unit under `/run` still uses. The
-pidfile itself is what makes the service restartable: the first `ExecStop` runs
-`psgen stop`, and the second removes the file with a leading `-`, so a pidfile
-that vanished between the check and the `rm` is not reported as a failure. The
-first `ExecStop` deliberately carries no `-`: a foreign boot id, a malformed
-pidfile or a refused signal must reach systemd instead of being reported as a
-successful stop. The absence test lives in `/bin/sh` rather than in `-`, because
-`-` cannot tell "no pidfile" from "a pidfile from another boot"; `$1` is the
-executable and `$2` the pidfile, and only positional parameters are used because
-systemd expands `$name` as its own variable.
+`unit` validates the pidfile path and exits 2 for any of these defects:
 
-Every inject option the caller gave is forwarded into `ExecStart` (`-p`, `-f`,
-`-d`, `--no-mem`, `--mem-cap`, `--mem-target`, `--phys-cap`, `--disk`,
-`--no-exe`, `--shadow-dir`, `--no-root`, `--no-tty`, `--no-threads`,
-`--no-user`, `--busy`, `--cpu`, `--verify`, `--create-users`), so
-`psgen unit -p desktop -f desk -n 40` writes a unit that injects desktop rows
-at boot. `-n` is capped at the inject cap of 500.
+- A path outside `/run`.
+- A nested path more than one directory below `/run` (such as `/run/a/b/c`).
+- A `.` or `..` component.
+- An empty path component (`//`).
+- A pidfile basename longer than 246 bytes (reserving 9 bytes for temporary and lock suffixes within `NAME_MAX`).
+- Any control byte (`< 0x20` or `0x7f`).
+- Any non-UTF-8 byte anywhere in the path.
+- Any `'`, `"`, or `\` character in the runtime directory name.
+
+`RuntimeDirectoryPreserve=yes` keeps the runtime directory across stops so stopping one unit cannot remove another unit's pidfile.
+The first `ExecStop` uses `/bin/sh -c` without a `-` prefix so an absent pidfile succeeds.
+Real stop failures (foreign boot ID, malformed pidfile, or refused signal) still fail the unit stop.
+The second `ExecStop=-/bin/rm -f -- <pidfile>` removes the pidfile so the service can restart cleanly.
+
+`unit` forwards all supplied `inject` options into `ExecStart`: `-p`, `-f`, `-d`, `--no-mem`, `--mem-cap`, `--mem-target`, `--phys-cap`, `--disk`, `--no-exe`, `--shadow-dir`, `--no-root`, `--no-tty`, `--no-threads`, `--no-user`, `--busy`, `--cpu`, `--verify`, and `--create-users`.
+`unit` caps `-n` at 500.
 
 ## corpus, check, doctor, log and load
 
-`psgen corpus` dumps the embedded corpus as `family<TAB>user<TAB>vsz<TAB>rss<TAB>command`,
-181 templates across ten families. The user column prints the sentinel `@self`
-for a template that runs as the invoking user; `list`, `table` and `inject`
-replace it with the user's name, or with the decimal uid when the uid has no
-passwd entry.
+### corpus
 
-`psgen check` expands every template and rejects placeholders, control bytes,
-empty commands and a denylist of cryptocurrency, botnet, brute-force and
-credential-dumping terms. `check -f FAMILY` narrows the run and prints the
-expanded count beside the total. `check --binaries` reports which template
-executables exist on this host: an absolute path is checked as written, a bare
-name is looked up in `PATH` and then the standard directories, and a template
-whose executable resolves through a symlink is not reported missing.
-`--binaries` always exits 0 for a host fact and `--require-binaries` exits 1
-when anything is missing, which is the form to use in CI.
+`psgen corpus` prints all 181 embedded templates across 10 families as `family<TAB>user<TAB>vsz<TAB>rss<TAB>command`.
+Templates that run as the invoking user print the `@self` sentinel in the user column.
+`list`, `table`, and `inject` replace `@self` with the invoking user's name, or with the decimal UID when `/etc/passwd` has no entry for that UID.
 
-`psgen doctor` probes the environment and prints one line per capability with
-its verdict and detail; `--json` emits the same as one object with a `checks`
-array of objects carrying `name` and `ok`, plus `core` and `core_ok` saying
-whether injection can work at all (probed through `proc_exe`, `fork` and
-`prctl_name`). `doctor --pidfile FILE` also reports whether that pidfile can be
-written.
+### check
 
-`psgen log` writes activity logs for 14 modules. `-m list` prints the module
-names on one line, then one line per module that accepts aliases, in the form
-`  <module> (<alias>, …)`; twelve of the fourteen modules have aliases, and
-`mkinitcpio` and `julia` have none, so their names appear in the first line
-only. `--log-fmt apache` is defined for `weblog` only;
-`json` and `syslog` work for every module. A closed reader stops the generator
-instead of leaving it to finish a long run.
+`psgen check` expands every template and rejects unexpanded placeholders, control bytes, empty commands, and denylisted cryptocurrency, botnet, brute-force, or credential-dumping terms.
+`check -f FAMILY` checks one family and prints both the expanded count and the total.
+`check --binaries` reports which template executables exist on the host (checking absolute paths directly, searching `PATH` and standard directories for bare names, and resolving symlinks) and always exits 0.
+`check --require-binaries` performs the same check and exits 1 if any executable is missing.
 
-`psgen load` creates real CPU, memory or disk pressure. `--mem-util PCT` is a
-percentage of `MemTotal` and is refused above `MemAvailable` unless `--force`
-is given, because a load generator that exhausts memory invokes the OOM killer
-against its own host. `--disk-util MiB` is refused above the free space of
-`TMPDIR`. The summary goes to stdout, and `-q` suppresses it.
+### doctor
+
+`psgen doctor` probes host capabilities and prints `env`, capability verdicts (`ALLOW`/`DENY` with `errno`), `probe` (sandbox posture), and `summary` sections.
+When a probe cannot fork or `TMPDIR` is missing, `doctor` reports `[not attempted]` in text mode and `"not_attempted":true` in JSON mode.
+This avoids misreporting a fork or directory failure as a kernel denial.
+The `pty` check (`check_pty`) tests full PTY allocation (`/dev/ptmx`, `TIOCSPTLCK`, `TIOCGPTN`, and `/dev/pts/<n>`).
+
+`doctor --json` prints one JSON object containing `env`, `checks` (objects with `name`, `ok`, `detail`, and optional `errno` and `not_attempted`), `probe`, `core`, and `core_ok` (`proc_exe`, `fork`, `prctl_name`).
+`doctor --json` preserves literal printable ASCII and valid UTF-8 strings, and refuses non-UTF-8 paths or environment values with exit 1 so raw bytes cannot collide with UTF-8.
+Text mode escapes control bytes, `0x7f`, `\`, and invalid UTF-8 bytes as `\xNN` (and `\\` for literal backslashes).
+
+`doctor --pidfile FILE` verifies that `FILE` is both writable and records zero live rows (`allowed` in JSON, `ALLOW`/`DENY` in text).
+
+### log
+
+`psgen log` writes activity logs for 14 modules.
+Run `psgen log -m list` to print all 14 module names on one line followed by `  <module> (<alias>, ...)` lines for the 12 modules that have aliases (`mkinitcpio` and `julia` have no aliases).
+`--log-fmt apache` applies to `weblog` only; `json` and `syslog` work for every module.
+`--lines 0` exits 2 as a usage error.
+Counts above 200000 print `log events capped at 200000` on stderr and clamp to 200000.
+On `EPIPE` (closed reader), `log` exits 0 silently; on any other stdout write error, `log` prints the errno and exits 1.
+
+### load
+
+`psgen load` generates real CPU, memory, and disk pressure and prints a summary to stdout (`-q` suppresses the summary).
+`load` exits 2 if no utilization flag is provided or if every provided utilization value is zero.
+On `EPIPE`, `load` exits 0 silently; on any other stdout write error, `load` prints the errno and exits 1.
+
+- `--mem-util PCT`: maps and touches `PCT` percent (0..95) of the tighter of `MemTotal` and the cgroup memory limit.
+  `load` walks cgroup v2 and v1 ancestors to find the tightest limit and minimum remaining headroom.
+  `load` exits 1 if current cgroup usage is unreadable.
+  Without `--force`, `load` exits 2 if the request exceeds `MemAvailable` or remaining cgroup headroom (including zero headroom).
+- `--disk-util MiB`: measures usable space in `TMPDIR` (90% budget with 10% reserved) before checking `RLIMIT_FSIZE`, so a missing `TMPDIR` reports the real cause first.
 
 ## Tests
 
-`tests/smoke.sh` expects `target/release/psgen` and runs the version, help,
-corpus, list and seed checks, `cargo test --release`, `tests/workflow.sh`,
-`tests/invariants.py`, `tests/proof_cases/report.sh` and a binary-size check.
-Stage the musl binary at `target/release/psgen` first:
+Build and stage the static musl binary at `target/release/psgen`, then run `tests/smoke.sh`:
 
 ```sh
 cargo build --release --target x86_64-unknown-linux-musl
@@ -567,138 +522,108 @@ cp target/x86_64-unknown-linux-musl/release/psgen target/release/psgen
 sh tests/smoke.sh
 ```
 
-`PSGEN_BIN=path/to/psgen python3 tests/invariants.py` runs the invariant suite
-alone against any binary.
+`tests/smoke.sh` runs every CI gate in one script:
 
-`sh tests/proof_cases/report.sh path/to/psgen [issue ...]` runs the per-issue
-proof for the report and utility surface — issues #8, #13, #19, #20, #21, #23,
-#24 and #27 — one line per case. A case is kept only if it fails on the commit
-before its fix, so the script doubles as the record of what each fix changed.
-The tree the documentation cases read is inferred from the binary's own path
-(`<tree>/target/<profile>/psgen`), so the same script can be pointed at a
-pre-fix build; `PSGEN_SRC=<tree>` overrides that.
+- `PSGEN_REQUIRE_ALL` contract verification (`tests/helpers/require_all_check.sh`)
+- CLI smoke checks (version, help, corpus check, corpus count, list count, deterministic seed)
+- `fmt` (`cargo fmt --all -- --check`)
+- `clippy` (`cargo clippy --locked --all-targets -- -D warnings`)
+- `unit tests` (`cargo test --quiet --locked --release`)
+- `package` (`cargo package --locked --no-verify`)
+- `unit` (`systemd-analyze verify` and unit assertions)
+- `workflow` (`tests/workflow.sh`)
+- `invariants` (`tests/invariants.py`)
+- all 7 per-issue proof scripts under `tests/proof_cases/`: `report.sh`, `pidfile.sh`, `generator.sh`, `table.sh`, `stop.sh`, `inject.sh`, and `surface.sh`
+- binary size check (under 1 MiB)
 
-`PSGEN_REQUIRE_ALL=1` makes every skip a failure that names the capability it
-needed. Without it, a check that cannot run on this host prints `SKIP:` and its
-reason and the suite continues; with it, the same check fails. Use it on a host
-that is supposed to have the capability (a pty, a reaping PID 1, passwordless
-`sudo`, a finite `RLIMIT_FSIZE` large enough for the free-space guard) so a
-missing capability cannot pass as a pass. The variable is read by
-`tests/smoke.sh`, `tests/invariants.py`, `tests/workflow.sh`, `tests/cross.sh`,
-`tests/proof_cases/report.sh` and `tests/vm.sh`. Both workflows set it for the
-job that runs the suite:
-`ci.yml`'s `test` job and `release.yml`'s `test` job, so a skip on a runner that
-has the capability fails the run instead of passing.
+`tests/smoke.sh` unsets `PSGEN_REQUIRE_ALL` before running `tests/proof_cases/*` so cases requiring optional host capabilities (root, PTY, PID namespaces, or live systemd) skip cleanly while regressions still fail.
 
-`tests/invariants.py` compares `table --live` against `ps aux` field by field
-for every stable row, checks every option against every subcommand, and carries
-a regression for each defect class the corpus and injection rules cover: the
-pidfile reuse rule, a second `stop`, `stop --plan`, a seed across one second,
-the family shortfall and the repeat spread, the host-fitted sizes, the
-`pid_max` bound, the live table's column offsets and `<defunct>` marker, the
-`doctor --json` shape, a pidfile header with a foreign version, the
-`--utc-offset` bound, `--local` with `--utc-offset`, the name-length preflight,
-an inherited fd 3, the staging prune, a closed log reader, `--mem-util` above
-`MemAvailable`, `check --binaries` on an installed path, and the `NAME_MAX`
-boundary.
+Run `tests/invariants.py` alone against any binary with:
 
-`tests/workflow.sh` checks the parts of the release pipeline that can run
-outside GitHub: the tag-to-notes decisions through the same
-`scripts/release-notes.sh` the workflow calls, the arguments `gh release
-create` receives (with a fake `gh`), that every `run:` block in both workflows
-parses as shell, and a sabotage case for each gate. It cannot exercise GitHub's
-own expression evaluation or the network calls.
+```sh
+PSGEN_BIN=path/to/psgen python3 tests/invariants.py
+```
+
+Run one per-issue proof script against any binary with:
+
+```sh
+sh tests/proof_cases/report.sh path/to/psgen [issue ...]
+```
+
+Set `PSGEN_SRC=<tree>` to override the source tree inferred from `<tree>/target/<profile>/psgen`.
+
+Set `PSGEN_REQUIRE_ALL=1` on capable hosts so any skipped check becomes a failure naming the missing capability.
+`tests/smoke.sh`, `tests/invariants.py`, `tests/workflow.sh`, `tests/cross.sh`, `tests/proof_cases/report.sh`, and `tests/vm.sh` all read `PSGEN_REQUIRE_ALL`.
+Both `ci.yml`'s `test` job and `release.yml`'s `test` job set `PSGEN_REQUIRE_ALL=1`.
+
+`tests/invariants.py` compares `table --live` against `ps aux` field by field and validates option acceptance across every subcommand.
+The suite also runs regressions for pidfile reuse, repeated `stop`, `stop --plan`, seed stability, repeat bounds, host-fitted sizes, and `pid_max` limits.
+Additional checks cover live table formatting, `doctor --json` structure, foreign-version headers, timezone flags, `NAME_MAX` preflight, inherited fd 3 handling, staging cleanup, closed log pipes, `--mem-util` bounds, and `check --binaries`.
+
+`tests/workflow.sh` verifies release-note selection via `scripts/release-notes.sh`, `gh release create` arguments, shell syntax for every `run:` block in both workflows, and sabotage tests for each CI gate.
 
 ### CI gates
 
 `.github/workflows/ci.yml` runs two jobs:
 
-- `lint`: `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets --
-  -D warnings`, `cargo test --locked --release`, `cargo package --locked
-  --no-verify`, `tests/workflow.sh`, and a unit check that runs
-  `systemd-analyze verify` when the tool exists and greps for
-  `RuntimeDirectory=psgen`, `ExecStop=-`, `ConditionPathExists=/proc/1/stat`
-  and the absence of a nonexistent target.
-- `test`: builds `x86_64-unknown-linux-musl`, stages the binary at
-  `target/release/psgen` and runs `tests/smoke.sh`.
+- `lint`: runs `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked --release`, `cargo package --locked --no-verify`, `tests/workflow.sh`, and a `unit` check.
+  The `unit` check runs `systemd-analyze verify` when installed and rejects any unit naming `proc-fs-nets.target`.
+  The `unit` check requires `RuntimeDirectory=psgen`, `ConditionPathExists=/proc/1/stat`, and an `ExecStop=` line running `psgen stop --pidfile` guarded by `-` or `/bin/sh -c`.
+  The `unit` check does not grep for `ExecStop=-` because the `/bin/rm` cleanup line would satisfy that grep regardless of the `psgen stop` line.
+- `test`: builds `x86_64-unknown-linux-musl`, stages the binary at `target/release/psgen`, and runs `tests/smoke.sh` with `PSGEN_REQUIRE_ALL=1`.
 
-`.github/workflows/release.yml` runs the same lint and test gates, then builds
-each of the seven targets (native or through `cargo-zigbuild`), checks the
-result for `NEEDED` and `INTERP`, registers binfmt and runs `tests/smoke.sh`
-for every target, packages a reproducible tarball and the raw binary, and
-publishes `SHA256SUMS`, build provenance, the crate (a final tag only, with
-`CARGO_REGISTRY_TOKEN`) and the GitHub release.
+`.github/workflows/release.yml` runs all of those checks in its `test` job, then builds all seven targets natively or via `cargo-zigbuild`.
+The workflow verifies that every binary has no `NEEDED` or `INTERP` entries and runs `tests/smoke.sh` per target under binfmt.
+Finally, the workflow packages reproducible tarballs and raw binaries and publishes `SHA256SUMS`, build provenance, the GitHub release, and the crates.io crate.
+Crate publishing runs for final tags only, requires `CARGO_REGISTRY_TOKEN`, and verifies `cargo info psgen@<version>`.
 
 ## Benchmarks
 
-`python3 bench/measure.py` measures the corpus, the table and injection round
-trips, and writes `bench/RESULTS.md`. It expects `target/release/psgen`.
+Run `python3 bench/measure.py` (expecting `target/release/psgen`) to measure corpus, table, and injection timings and write `bench/RESULTS.md`.
 
-`bench/sand.sh` runs `bench/guest.sh` in a sand-net container cage or microVM
-and checks the transcript. Copy the static binary to
-`dist/psgen-x86_64-unknown-linux-musl` first, then run:
+Copy the static binary to `dist/psgen-x86_64-unknown-linux-musl`, then run `bench/sand.sh` inside a `sand-net` container cage or microVM:
 
 ```sh
 SANDNET=/path/to/sand-net sh bench/sand.sh container
 SANDNET=/path/to/sand-net sh bench/sand.sh microvm
 ```
 
-It writes `bench/sand-<cage>.log` and requires the `sand-net` checkout and the
-cage image from `tests/sand/Containerfile`.
+`bench/sand.sh` writes `bench/sand-<cage>.log` and requires a `sand-net` checkout plus the image built from `tests/sand/Containerfile`.
 
 ## Limits
 
-- Linux only, with `/proc`.
-- The pidfile is trusted input: the boot id, starttime and comm are visible in
-  `/proc`, so a forged pidfile can name a process the caller may signal, and
-  can point the `# temp` cleanup at a matching directory owned by the caller.
-  Run `stop` only on a pidfile you control.
-- `stop` does not unlink the pidfile. Re-running `inject` against the same path
-  works once the processes it names are gone; the printed unit removes the
-  pidfile in `ExecStop` and keeps the `RuntimeDirectory`, so a restart finds the
-  directory and no pidfile.
-- A one-field pidfile line can only identify a proc-self row or a shadow copy
-  in a staging directory the caller owns. Bind-tier rows need the three-field
-  form.
-- An injected row's terminal is not guaranteed to be `?`. `--tty` (default) gives
-  a template the corpus marks as a tty row a real pty and makes it that row's
-  controlling terminal, so `ps` shows `pts/N`; `--no-tty` clears the tty and
-  session flags on every row and detaches each one from the caller's terminal,
-  so a later `ps` shows `?` throughout. A harness that needs a stable `?` in a
-  later `ps` should pass `--no-tty`.
-- A failed privilege drop is reported as a deviation and the stub continues
-  under the uid it already has; it does not abort the run.
-- The config memfd carries the size seals (`F_SEAL_SHRINK`, `F_SEAL_GROW`,
-  `F_SEAL_SEAL`) but not `F_SEAL_WRITE`, so the injector can still write the
-  status record through the same mapping. A descriptor holder that can write
-  the mapping can change the config after it was validated.
-- The staging leaf is validated through its opened descriptor and then
-  executed by path, so a caller who can replace it between the two steps has a
-  time-of-check/time-of-use window. The injector keeps the directory mode at
-  `0700`, which bounds who can do that.
-- `child_fds` may not name the stub's own config descriptor or fd 3, and a
-  child stub must be at stage 0, so a self-referential config cannot recurse
-  through the same descriptor. A config that names other descriptors can still
-  fork more processes than the injector planned.
-- A real FUSE mount was not available in the development cage, so the FUSE
-  branch is exercised through its predicates and through the hardlink and
-  symlink cases rather than a mounted daemon.
-- Release artifacts are static musl only; no GNU/glibc artifact is published.
-  A `cargo install` builds whatever target the host defaults to, normally
-  glibc; use `--target x86_64-unknown-linux-musl` for the artifact the releases
-  ship.
-- Cross targets are built in CI; `make build` and `scripts/build-all.sh` build
-  only `x86_64-unknown-linux-musl`.
-- A non-root `--tty` row that calls `setsid` and never reports is outside the
-  per-PID and root-group kill paths: it has no status record, so it is not in
-  the pidfile, and it has left the root's process group.
+- `psgen` runs on Linux only and requires `/proc`.
+- The pidfile is trusted input.
+  Boot IDs, start times, and `comm` values are readable from `/proc`.
+  A forged pidfile can therefore name processes that the caller can signal or staging directories that the caller owns.
+  Run `stop` only on pidfiles that you control.
+- `stop` does not unlink the pidfile.
+  Re-running `inject` with the same pidfile path works once all recorded processes exit.
+  The systemd unit removes the pidfile in `ExecStop` and preserves `RuntimeDirectory` so restarts start cleanly.
+- One-field pidfile lines require the header's run `nonce` to match `PSGEN_NONCE` in `/proc/PID/environ` across all executable tiers.
+  A header without a nonce or a process without a matching `PSGEN_NONCE` fails the row (`cannot identify`, exit 1) instead of guessing.
+- Injected rows do not guarantee `TTY` is `?` under default `--tty`.
+  Pass `--no-tty` when a harness requires `?` on every row in `ps`.
+- A failed privilege drop reports a deviation and leaves the stub running under its current UID instead of aborting the run.
+- The configuration `memfd` carries `F_SEAL_SHRINK`, `F_SEAL_GROW`, and `F_SEAL_SEAL`, but omits `F_SEAL_WRITE`.
+  Status records travel over pipe fd 5 (`status_fd`), not over fd 3.
+  `inject` omits `F_SEAL_WRITE` only so the stub can write `stage = 1` at `CFG_STAGE_OFF` on fd 3 before re-exec.
+  A process that holds a writable descriptor to that `memfd` can modify configuration bytes after validation.
+- The stub validates the shadow leaf (`psgen-stub`) through an opened descriptor and then executes the leaf by path.
+  The `0700` staging directory mode limits access to that time-of-check/time-of-use window to the owning UID and root.
+- `child_fds` cannot reference the stub's own configuration descriptor or fd 3, and child stubs must start at stage 0.
+  This blocks single-descriptor recursion, though a crafted configuration with multiple sealed descriptors can fork extra processes.
+- Development cages lacked a live FUSE daemon, so tests verify the FUSE guards through predicate unit tests, hardlinks, and symlinks.
+- Release artifacts ship static musl binaries only; no glibc release artifacts are published.
+  `cargo install` defaults to the host target (normally glibc); pass `--target x86_64-unknown-linux-musl` to build a static binary.
+- `make build` and `scripts/build-all.sh` build only `x86_64-unknown-linux-musl`; CI builds all seven targets.
+- A non-root `--tty` row that calls `setsid` and exits or stalls before reporting a status record leaves the root process group and does not appear in the pidfile.
 
 ## Security
 
-This tool deliberately spoofs process state. Read `SECURITY.md` before handing
-a pidfile from someone else to `stop`, or installing it anywhere a supervisor
-can pass it file descriptors. It must not be installed setuid; the stub refuses
-to run in that case.
+`psgen` intentionally spoofs process state.
+Read `SECURITY.md` before passing an untrusted pidfile to `stop` or allowing a supervisor to pass file descriptors to `psgen`.
+Never install `psgen` setuid or setgid; the stub refuses to run in that configuration.
 
 ## License
 

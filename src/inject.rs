@@ -46,7 +46,7 @@ pub struct Prep {
     pub caps: probe::Caps,
     pub tier: ExeTier,
     /// Root directory for the shadow copy. `--shadow-dir` when given,
-    /// otherwise `./.psgen-stubs` when a bind is denied.
+    /// otherwise `<TMPDIR>/.psgen-stubs` when a bind is denied.
     pub shadow_root: Option<Vec<u8>>,
 }
 
@@ -75,6 +75,8 @@ pub struct SpawnResult {
     /// Temp directories this run created, so a caller that kills the stubs
     /// itself can remove them.
     pub temps: Vec<std::path::PathBuf>,
+    /// Run nonce carried in every stub's environment and in the pidfile header.
+    pub nonce: Vec<u8>,
     /// Each spawned PID with the starttime and comm read back at spawn time,
     /// so a later signal can prove the PID was not reused. It covers the rows
     /// that reported a status record, plus every identity the run's live
@@ -97,8 +99,8 @@ fn auto_phys_budget_kb() -> u64 {
 }
 
 fn scale_rss(rows: &mut [Proc], budget_kb: u64, base_kb: u64, page_kb: u64) -> f64 {
-    let sum: u64 = rows.iter().map(|p| p.rss as u64).sum();
-    let max = rows.iter().map(|p| p.rss as u64).max().unwrap_or(0);
+    let sum: u64 = rows.iter().map(|p| p.rss).sum();
+    let max = rows.iter().map(|p| p.rss).max().unwrap_or(0);
     let ptes = sum / 512;
     let avail = budget_kb.saturating_sub(base_kb);
     let cost = max.saturating_add(ptes);
@@ -113,7 +115,7 @@ fn scale_rss(rows: &mut [Proc], budget_kb: u64, base_kb: u64, page_kb: u64) -> f
     for p in rows.iter_mut() {
         let v = (p.rss as f64 * factor) as u64;
         let v = v.max(floor);
-        p.rss = crate::table::round_up(v, page_kb).min(u32::MAX as u64) as u32;
+        p.rss = crate::table::round_up(v, page_kb);
     }
     factor
 }
@@ -251,8 +253,8 @@ pub fn prepare(rows: &mut [Proc], args: &Args, create_users: bool) -> Prep {
     let page = sys::page_kb();
     for p in rows.iter_mut() {
         if args.mem {
-            p.vsz = crate::table::round_up(p.vsz as u64, page).min(u32::MAX as u64) as u32;
-            p.rss = crate::table::round_up(p.rss as u64, page).min(u32::MAX as u64) as u32;
+            p.vsz = crate::table::round_up(p.vsz, page);
+            p.rss = crate::table::round_up(p.rss, page);
         } else {
             p.vsz = 0;
             p.rss = 0;
@@ -267,16 +269,16 @@ pub fn prepare(rows: &mut [Proc], args: &Args, create_users: bool) -> Prep {
             for p in rows.iter_mut() {
                 // Leave the base reserve below the template's VSZ, and never
                 // claim an RSS the stub cannot find room for.
-                let cap = (p.vsz as u64).saturating_sub(gen::BASE_RESERVE_KB as u64);
+                let cap = p.vsz.saturating_sub(gen::BASE_RESERVE_KB as u64);
                 let v = target.min(cap.max(page));
-                p.rss = crate::table::round_up(v, page).min(u32::MAX as u64) as u32;
+                p.rss = crate::table::round_up(v, page);
             }
         }
     }
 
     if args.mem_cap_mb > 0 && args.mem {
         let cap = args.mem_cap_mb.saturating_mul(1024);
-        let sum: u64 = rows.iter().map(|p| p.rss as u64).sum();
+        let sum: u64 = rows.iter().map(|p| p.rss).sum();
         if sum > cap && !rows.is_empty() {
             // The 4 MiB per-stub reserve is taken off the cap first; what is
             // left is shared in proportion to each row's RSS above it.
@@ -284,24 +286,22 @@ pub fn prepare(rows: &mut [Proc], args: &Args, create_users: bool) -> Prep {
             let base = floor.saturating_mul(rows.len() as u64);
             if base >= cap {
                 warnings.push(format!(
-                    "--mem-cap {} MiB is at or below the {} MiB floor of {} stubs; the reported RSS will be at least {} MiB",
+                    "--mem-cap {} MiB is at or below the {} MiB floor of {} {}; the reported RSS will be at least {} MiB",
                     args.mem_cap_mb,
                     base / 1024,
                     rows.len(),
+                    if rows.len() == 1 { "stub" } else { "stubs" },
                     base / 1024
                 ));
                 for p in rows.iter_mut() {
-                    p.rss = floor.min(u32::MAX as u64) as u32;
+                    p.rss = floor;
                 }
             } else {
                 let extra = cap - base;
-                let weight: u64 = rows
-                    .iter()
-                    .map(|p| (p.rss as u64).saturating_sub(floor))
-                    .sum();
+                let weight: u64 = rows.iter().map(|p| p.rss.saturating_sub(floor)).sum();
                 for p in rows.iter_mut() {
-                    let v = floor + (p.rss as u64).saturating_sub(floor) * extra / weight;
-                    p.rss = crate::table::round_up(v, page).min(u32::MAX as u64) as u32;
+                    let v = floor + p.rss.saturating_sub(floor) * extra / weight;
+                    p.rss = crate::table::round_up(v, page);
                 }
             }
         }
@@ -313,7 +313,7 @@ pub fn prepare(rows: &mut [Proc], args: &Args, create_users: bool) -> Prep {
             // as the biggest RSS target. A fault past RLIMIT_FSIZE kills the
             // stub with SIGXFSZ, so keep the targets below the limit.
             let cap_kb = (limit / 1024).saturating_sub(16 * 1024);
-            let max = rows.iter().map(|p| p.rss as u64).max().unwrap_or(0);
+            let max = rows.iter().map(|p| p.rss).max().unwrap_or(0);
             if cap_kb < page {
                 warnings.push(
                     "RLIMIT_FSIZE is too small for an RSS arena; memory padding disabled"
@@ -330,8 +330,8 @@ pub fn prepare(rows: &mut [Proc], args: &Args, create_users: bool) -> Prep {
                 ));
                 let v = cap_kb / page * page;
                 for p in rows.iter_mut() {
-                    if p.rss as u64 > v {
-                        p.rss = v as u32;
+                    if p.rss > v {
+                        p.rss = v;
                     }
                 }
             }
@@ -347,22 +347,23 @@ pub fn prepare(rows: &mut [Proc], args: &Args, create_users: bool) -> Prep {
     };
     let mut phys_estimate_kb = 0;
     if args.mem && !rows.is_empty() {
-        let sum: u64 = rows.iter().map(|p| p.rss as u64).sum();
-        let max = rows.iter().map(|p| p.rss as u64).max().unwrap_or(0);
+        let sum: u64 = rows.iter().map(|p| p.rss).sum();
+        let max = rows.iter().map(|p| p.rss).max().unwrap_or(0);
         let ptes = sum / 512;
         let est = max.saturating_add(ptes).saturating_add(base_kb);
         phys_estimate_kb = est;
         if budget > 0 && est > budget && max > 0 {
             phys_scale = scale_rss(rows, budget, base_kb, page);
-            let sum2: u64 = rows.iter().map(|p| p.rss as u64).sum();
-            let max2 = rows.iter().map(|p| p.rss as u64).max().unwrap_or(0);
+            let sum2: u64 = rows.iter().map(|p| p.rss).sum();
+            let max2 = rows.iter().map(|p| p.rss).max().unwrap_or(0);
             phys_estimate_kb = max2.saturating_add(sum2 / 512).saturating_add(base_kb);
         }
         if budget > 0 && phys_estimate_kb > budget {
+            // Integer MiB truncation made this sentence compare 30 with 30
+            // when the gap was below 1 MiB. KiB shows the actual difference.
             warnings.push(format!(
-                "the estimated physical cost is about {} MiB, above the {} MiB budget",
-                phys_estimate_kb / 1024,
-                budget / 1024
+                "the estimated physical cost is about {} KiB, above the {} KiB budget",
+                phys_estimate_kb, budget
             ));
         }
     }
@@ -401,7 +402,7 @@ pub fn prepare(rows: &mut [Proc], args: &Args, create_users: bool) -> Prep {
     // An explicit --cpu target replaces every row's duty cycle and forces the
     // row onto the busy path, including rows the corpus does not normally mark.
     if let Some(pct) = args.cpu_pct {
-        let tenths = (pct.saturating_mul(10)).min(u16::MAX as u32) as u16;
+        let tenths = pct.saturating_mul(10);
         for p in rows.iter_mut() {
             p.cpu = tenths;
             if pct == 0 {
@@ -557,12 +558,12 @@ fn make_config(
             } else {
                 0
             },
-        vsz_kb: p.vsz,
-        rss_kb: p.rss,
+        vsz_kb: p.vsz.min(u32::MAX as u64) as u32,
+        rss_kb: p.rss.min(u32::MAX as u64) as u32,
         uid: p.uid,
         gid: p.gid,
         duration: duration_for(p, args),
-        cpu: p.cpu as u32,
+        cpu: p.cpu,
         stage: 0,
         comm: gen::stub_name(&p.cmd).to_vec(),
         exe: if bind {
@@ -717,8 +718,36 @@ fn pidfile_body(pids: &[i32], temps: &[std::path::PathBuf], nonce: &[u8]) -> Opt
 /// after the fork leaves live stubs with no record. Proving the write works
 /// first, and leaving a valid psgen pidfile behind, makes the later rewrite an
 /// overwrite of a file the caller already has.
+/// The header carries a nonce of its own. A run that dies between this write
+/// and the rewrite leaves a file `stop` can identify as psgen's rather than a
+/// bare header, and the same length is what the preflight proves can be
+/// written.
+fn pending_nonce() -> Vec<u8> {
+    format!(
+        "{:016x}",
+        sys::monotonic_ns() ^ ((sys::getpid() as u64) << 32)
+    )
+    .into_bytes()
+}
+
+/// The exact size of the pending pidfile, for the preflight probe.
+pub fn pending_pidfile_len() -> usize {
+    pidfile_body(&[], &[], &pending_nonce())
+        .map(|b| b.v.len())
+        .unwrap_or(0)
+}
+
+/// Conservative upper bound on the final pidfile body size in bytes, so the
+/// pre-spawn preflight proves `RLIMIT_FSIZE` and filesystem space can hold the
+/// real body rather than only the pending header.
+pub fn estimated_pidfile_bytes(row_count: usize, temp_count: usize, tmpdir_len: usize) -> usize {
+    pending_pidfile_len()
+        .saturating_add(temp_count.saturating_mul(tmpdir_len.saturating_add(48)))
+        .saturating_add(row_count.saturating_mul(48))
+}
+
 pub fn write_pending_pidfile(path: &[u8]) -> bool {
-    write_pidfile(path, &[], &[], &[]).0
+    write_pidfile(path, &[], &[], &pending_nonce()).0
 }
 
 /// Write the pidfile, falling back to shorter temporary names when the target
@@ -785,6 +814,119 @@ fn write_pidfile(
         }
     }
     (false, libc::ENAMETOOLONG)
+}
+
+/// Lock held while this run may rewrite `path`.
+///
+/// Two injections into one pidfile both passed the live check, then both
+/// renamed their own pending file into place: the second erased the first's
+/// rows and left stubs with no record. `flock` is released by the kernel when
+/// the run dies, so a crash cannot leave a lock that blocks every later run.
+pub struct PidfileLock {
+    _file: std::fs::File,
+}
+
+/// Lock `path` for this run, or fail with `WouldBlock` when another run holds
+/// it. The lock lives beside the pidfile, so two runs that name the same path
+/// coordinate whatever their `TMPDIR`.
+pub fn lock_pidfile(path: &[u8]) -> std::io::Result<PidfileLock> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut lock_path = path.to_vec();
+    lock_path.extend_from_slice(b".lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(Path::new(std::ffi::OsStr::from_bytes(&lock_path)))?;
+    let fd = {
+        use std::os::unix::io::AsRawFd;
+        file.as_raw_fd()
+    };
+    if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(PidfileLock { _file: file })
+}
+
+/// Whether another process currently holds `<path>.lock`, without creating the
+/// lock file or modifying the filesystem. Used by `--dry-run` previews.
+pub fn pidfile_lock_held(path: &[u8]) -> bool {
+    let mut lock_path = path.to_vec();
+    lock_path.extend_from_slice(b".lock");
+    let fd = sys::open(
+        &lock_path,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0,
+    );
+    if fd < 0 {
+        return false;
+    }
+    let held = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0
+        && sys::last_error().kind() == std::io::ErrorKind::WouldBlock;
+    sys::close(fd);
+    held
+}
+
+/// Write the spawned rows to a recovery sidecar when the main pidfile write
+/// failed after spawning, returning the sidecar path on success.
+///
+/// Tries `<path>.spawned` beside the pidfile first. If the parent directory
+/// became unwritable (for example `chmod 555` mid-run), falls back to
+/// `<TMPDIR>/psgen-spawned-<pid>-<nonce>.pid` so the caller still gets a valid
+/// pidfile carrying the real nonce and `# temp` paths that `stop` can use.
+pub fn write_pid_sidecar(
+    path: &[u8],
+    pids: &[i32],
+    temps: &[std::path::PathBuf],
+    nonce: &[u8],
+) -> Option<Vec<u8>> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let buf = pidfile_body(pids, temps, nonce)?;
+    let mut side = path.to_vec();
+    side.extend_from_slice(b".spawned");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(Path::new(std::ffi::OsStr::from_bytes(&side)))
+    {
+        if f.write_all(buf.as_bytes())
+            .and_then(|()| f.sync_all())
+            .is_ok()
+        {
+            return Some(side);
+        }
+        let _ = std::fs::remove_file(Path::new(std::ffi::OsStr::from_bytes(&side)));
+    }
+    let tag = if nonce.is_empty() {
+        random_hex(8)
+    } else {
+        nonce.to_vec()
+    };
+    let tag_str = String::from_utf8_lossy(&tag);
+    let fallback =
+        std::env::temp_dir().join(format!("psgen-spawned-{}-{}.pid", sys::getpid(), tag_str));
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&fallback)
+        .ok()?;
+    if f.write_all(buf.as_bytes())
+        .and_then(|()| f.sync_all())
+        .is_ok()
+    {
+        Some(fallback.as_os_str().as_bytes().to_vec())
+    } else {
+        let _ = std::fs::remove_file(&fallback);
+        None
+    }
 }
 
 const OWNER_FILE: &[u8] = b".psgen-owner";
@@ -1331,7 +1473,7 @@ pub fn spawn(rows: &[Proc], args: &Args, prep: &Prep) -> Result<SpawnResult, Str
     }
     let bind = tier == ExeTier::Bind;
 
-    let max_rss = rows.iter().map(|p| p.rss as u64).max().unwrap_or(0);
+    let max_rss = rows.iter().map(|p| p.rss).max().unwrap_or(0);
     let mut arena_fd: i32 = -1;
     if args.mem && max_rss > 0 {
         let fd = sys::anon_file(b"cache", max_rss * 1024);
@@ -1643,8 +1785,8 @@ pub fn spawn(rows: &[Proc], args: &Args, prep: &Prep) -> Result<SpawnResult, Str
         // part of its setup missing. Only a negative status excludes a row.
         if args.verify && args.mem && *status >= 0 && (*id as usize) < rows.len() {
             if let Some((vsz, rss)) = live::read_sizes(*pid) {
-                let want_vsz = rows[*id as usize].vsz as u64;
-                let want_rss = rows[*id as usize].rss as u64;
+                let want_vsz = rows[*id as usize].vsz;
+                let want_rss = rows[*id as usize].rss;
                 if vsz.abs_diff(want_vsz) > tol || rss.abs_diff(want_rss) > tol {
                     mismatches.push((*pid, *id, want_vsz, vsz, want_rss, rss));
                 }
@@ -1726,6 +1868,7 @@ pub fn spawn(rows: &[Proc], args: &Args, prep: &Prep) -> Result<SpawnResult, Str
         dev_mem,
         tier,
         temps: all_temps,
+        nonce,
         ident,
     })
 }
@@ -2039,6 +2182,88 @@ fn read_nonce_env(pid: i32) -> Vec<u8> {
     Vec::new()
 }
 
+/// Whether `raw` is a `# psgen <version>...` pidfile header line rather than
+/// an ordinary comment such as `# psgen-wrapper` or `# psgen: note`.
+///
+/// A real header starts with `# psgen ` (including the trailing space) and
+/// either begins its version token with an ASCII digit (covering legacy
+/// headers like `# psgen 0.0.1` without a ` boot ` marker) or carries the
+/// ` boot ` marker.
+fn is_pidfile_header(raw: &[u8]) -> bool {
+    let Some(rest) = raw.strip_prefix(crate::version::PIDFILE_PREFIX) else {
+        return false;
+    };
+    let first_digit = rest.first().is_some_and(|b| b.is_ascii_digit());
+    let has_boot = str::find(rest, crate::version::PIDFILE_BOOT).is_some();
+    first_digit || has_boot
+}
+
+struct ParsedPidfile {
+    header_boot: Option<Vec<u8>>,
+    header_nonce: Vec<u8>,
+    temp_dirs: Vec<Vec<u8>>,
+    lines: Vec<StopLine>,
+    malformed: usize,
+}
+
+/// Parse a pidfile's header, `# temp` lines, and process rows.
+///
+/// Shared by `stop()` and `live_pidfile_rows()` so both agree on leading
+/// comments, blank lines, and header recognition.
+fn parse_pidfile(text: &[u8]) -> ParsedPidfile {
+    let mut header_boot: Option<Vec<u8>> = None;
+    let mut header_nonce: Vec<u8> = Vec::new();
+    let mut temp_dirs: Vec<Vec<u8>> = Vec::new();
+    let mut lines: Vec<StopLine> = Vec::new();
+    let mut malformed = 0usize;
+    // A psgen header may follow leading blank or comment lines, but not
+    // content: a comment that is not a psgen header is ignored.
+    let mut header_seen = false;
+    let mut content_seen = false;
+    for raw in text.split(|b| *b == b'\n') {
+        if raw.is_empty() {
+            continue;
+        }
+        if raw[0] == b'#' {
+            if !header_seen && !content_seen && is_pidfile_header(raw) {
+                header_boot = Some(crate::version::pidfile_boot_id(raw).unwrap_or_default());
+                header_nonce = crate::version::pidfile_nonce(raw);
+                header_seen = true;
+            }
+            if let Some(rest) = raw.strip_prefix(b"# temp ") {
+                temp_dirs.push(str::trim(rest).to_vec());
+            }
+            continue;
+        }
+        content_seen = true;
+        match parse_stop_line(raw) {
+            Some(l) => lines.push(l),
+            None => malformed += 1,
+        }
+    }
+    ParsedPidfile {
+        header_boot,
+        header_nonce,
+        temp_dirs,
+        lines,
+        malformed,
+    }
+}
+
+fn count_live_lines(lines: &[StopLine]) -> usize {
+    let mut live_rows = 0usize;
+    for line in lines {
+        let alive = match line.start {
+            Some(start) => live::read_starttime(line.pid) == Some(start) && live::alive(line.pid),
+            None => live::alive(line.pid),
+        };
+        if alive {
+            live_rows += 1;
+        }
+    }
+    live_rows
+}
+
 /// Count pidfile rows that still name a live process.
 ///
 /// A pidfile can only be overwritten safely when none of its recorded rows
@@ -2061,21 +2286,14 @@ pub fn live_pidfile_rows(path: &[u8]) -> Option<usize> {
             };
         }
     };
-    let mut live_rows = 0usize;
-    for raw in text.split(|b| *b == b'\n') {
-        if raw.is_empty() || raw[0] == b'#' {
-            continue;
-        }
-        let line = match parse_stop_line(raw) {
-            Some(l) => l,
-            None => continue,
-        };
-        let alive = match line.start {
-            Some(start) => live::read_starttime(line.pid) == Some(start) && live::alive(line.pid),
-            None => live::alive(line.pid),
-        };
-        if alive {
-            live_rows += 1;
+    let parsed = parse_pidfile(&text);
+    let mut live_rows = count_live_lines(&parsed.lines);
+    if parsed.lines.is_empty() {
+        let mut side = path.to_vec();
+        side.extend_from_slice(b".spawned");
+        if let Some(side_text) = sys::read_file_nofollow(&side, 1 << 20) {
+            let side_parsed = parse_pidfile(&side_text);
+            live_rows += count_live_lines(&side_parsed.lines);
         }
     }
     Some(live_rows)
@@ -2121,10 +2339,19 @@ fn stop_depths(lines: &[StopLine]) -> std::collections::BTreeMap<i32, usize> {
 /// again; a zombie leader's process group is still signalled, because it can
 /// hold live members. The count is of distinct PIDs, not of lines.
 pub fn stop(path: &[u8], force: bool, plan: bool, quiet: bool) -> i32 {
-    let text = match sys::read_file_nofollow(path, 1 << 20) {
-        Some(t) => t,
-        None => {
-            sys::err(b"psgen: cannot read pidfile\n");
+    let text = match sys::read_file_nofollow_res(path, 1 << 20) {
+        Ok(t) => t,
+        Err(e) => {
+            // A missing file, a mode-000 file and a directory all used to
+            // print the same bytes, so a caller could not tell a stale
+            // pidfile from a permissions problem. Name both the path and the
+            // errno; the exit status stays 1 for every read failure.
+            let msg = format!(
+                "psgen: cannot read pidfile {}: {}\n",
+                String::from_utf8_lossy(path),
+                e
+            );
+            sys::err(msg.as_bytes());
             return 1;
         }
     };
@@ -2140,37 +2367,12 @@ pub fn stop(path: &[u8], force: bool, plan: bool, quiet: bool) -> i32 {
         sys::err(out.as_bytes());
         return 1;
     }
-    let mut header_boot: Option<Vec<u8>> = None;
-    let mut header_nonce: Vec<u8> = Vec::new();
-    let mut temp_dirs: Vec<Vec<u8>> = Vec::new();
-    let mut lines: Vec<StopLine> = Vec::new();
-    let mut malformed = 0usize;
-    // Only the first line may be a psgen header. Every later line is content:
-    // a `# psgen note: ...` annotation is a comment, not a competing boot id,
-    // and treating it as one used to make a valid pidfile unstoppable, even
-    // with --force.
-    let mut first_content = true;
-    for raw in text.split(|b| *b == b'\n') {
-        if raw.is_empty() {
-            continue;
-        }
-        let is_header = first_content && raw[0] == b'#';
-        first_content = false;
-        if raw[0] == b'#' {
-            if is_header {
-                header_boot = Some(crate::version::pidfile_boot_id(raw).unwrap_or_default());
-                header_nonce = crate::version::pidfile_nonce(raw);
-            }
-            if let Some(rest) = raw.strip_prefix(b"# temp ") {
-                temp_dirs.push(str::trim(rest).to_vec());
-            }
-            continue;
-        }
-        match parse_stop_line(raw) {
-            Some(l) => lines.push(l),
-            None => malformed += 1,
-        }
-    }
+    let parsed = parse_pidfile(&text);
+    let header_boot = parsed.header_boot;
+    let mut header_nonce = parsed.header_nonce;
+    let mut temp_dirs = parsed.temp_dirs;
+    let mut lines = parsed.lines;
+    let mut malformed = parsed.malformed;
     // A file with no psgen header is not a psgen pidfile. Failing open here
     // signalled whatever a made-up file named, and removed whatever a `# temp`
     // line named, which is the one check that exists to prevent exactly that.
@@ -2184,6 +2386,55 @@ pub fn stop(path: &[u8], force: bool, plan: bool, quiet: bool) -> i32 {
         if !force && (hb.is_empty() || cur.is_empty() || *hb != cur) {
             sys::err(b"psgen: pidfile is from another boot; use --force to ignore\n");
             return 1;
+        }
+    }
+    // If the main pidfile has no rows (for example a leftover pending header
+    // after a post-spawn write failure) and `<path>.spawned` exists beside it,
+    // stop the rows from that recovery sidecar too and remove it once every
+    // row stops cleanly.
+    let mut used_sidecar: Option<Vec<u8>> = None;
+    if lines.is_empty() && malformed == 0 {
+        let mut side_path = path.to_vec();
+        side_path.extend_from_slice(b".spawned");
+        if let Ok(side_text) = sys::read_file_nofollow_res(&side_path, 1 << 20) {
+            if let Some(line) = crlf_line(&side_text) {
+                let mut out = Buf::new();
+                out.push_str("psgen: the recovery sidecar has CRLF line endings (line ");
+                out.push_u64(line as u64);
+                out.push_str(
+                    "); convert it to LF (for example with dos2unix) and run stop again\n",
+                );
+                sys::err(out.as_bytes());
+                return 1;
+            }
+            let side = parse_pidfile(&side_text);
+            if side.header_boot.is_none() && !force {
+                sys::err(
+                    b"psgen: recovery sidecar is not a psgen pidfile (no '# psgen' header); use --force to stop anyway\n",
+                );
+                return 1;
+            }
+            if let Some(hb) = &side.header_boot {
+                let cur = util::boot_id();
+                if !force && (hb.is_empty() || cur.is_empty() || *hb != cur) {
+                    sys::err(
+                        b"psgen: recovery sidecar is from another boot; use --force to ignore\n",
+                    );
+                    return 1;
+                }
+            }
+            if !quiet {
+                let mut msg = Buf::new();
+                msg.push_str("psgen: reading recovery sidecar ");
+                msg.push_bytes(&side_path);
+                msg.push(b'\n');
+                sys::err(msg.as_bytes());
+            }
+            header_nonce = side.header_nonce;
+            temp_dirs.extend(side.temp_dirs);
+            lines = side.lines;
+            malformed = side.malformed;
+            used_sidecar = Some(side_path);
         }
     }
     let me = current_exe_bytes();
@@ -2463,6 +2714,9 @@ pub fn stop(path: &[u8], force: bool, plan: bool, quiet: bool) -> i32 {
                 let _ = sys::remove_staging_dir(p);
             }
         }
+        if let Some(side) = &used_sidecar {
+            let _ = std::fs::remove_file(Path::new(std::ffi::OsStr::from_bytes(side)));
+        }
     }
     // The noun matters: an older message said "processes" while counting
     // pidfile lines, so one process named five times read as five.
@@ -2546,6 +2800,151 @@ mod tests {
         assert_eq!(read[0].start, 999);
         assert_eq!(read[0].boot, b"boot-xyz".to_vec());
         assert_eq!(read[0].ns, pid_ns_inode());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pidfile_header_parser_distinguishes_comments_from_headers() {
+        // `# note` before a valid header must not disarm header recognition.
+        let p = parse_pidfile(b"# note\n# psgen 9.9.9 boot abc-123 nonce deadbeef\n42\t99\tfoo\n");
+        assert_eq!(p.header_boot, Some(b"abc-123".to_vec()));
+        assert_eq!(p.header_nonce, b"deadbeef".to_vec());
+        assert_eq!(p.lines.len(), 1);
+
+        // `# psgen-wrapper` and `# psgen: note` are ordinary comments, not
+        // headers with empty boot IDs.
+        let p = parse_pidfile(
+            b"# psgen-wrapper\n# psgen 9.9.9 boot abc-123 nonce 01234567\n42\t99\tfoo\n",
+        );
+        assert_eq!(p.header_boot, Some(b"abc-123".to_vec()));
+        assert_eq!(p.header_nonce, b"01234567".to_vec());
+
+        let p = parse_pidfile(
+            b"# psgen: generated by wrapper\n# psgen 9.9.9 boot abc-123 nonce 89abcdef\n42\t99\tfoo\n",
+        );
+        assert_eq!(p.header_boot, Some(b"abc-123".to_vec()));
+        assert_eq!(p.header_nonce, b"89abcdef".to_vec());
+
+        // Without a real header, `# psgen-wrapper` alone is not a header.
+        let p = parse_pidfile(b"# psgen-wrapper\n42\t99\tfoo\n");
+        assert_eq!(p.header_boot, None);
+
+        // Leading blank lines before a valid header are allowed.
+        let p = parse_pidfile(b"\n\n# psgen 9.9.9 boot xyz nonce cafe\n42\t99\tfoo\n");
+        assert_eq!(p.header_boot, Some(b"xyz".to_vec()));
+        assert_eq!(p.header_nonce, b"cafe".to_vec());
+
+        // Legacy `# psgen 0.0.1` header without ` boot ` is still recognized as
+        // a header (with empty boot id so `stop` refuses without `--force`).
+        let p = parse_pidfile(b"# psgen 0.0.1\n42\t99\tfoo\n");
+        assert_eq!(p.header_boot, Some(Vec::new()));
+
+        // A header appearing after a content line must be ignored.
+        let p = parse_pidfile(b"42\t99\tfoo\n# psgen 9.9.9 boot abc-123 nonce deadbeef\n");
+        assert_eq!(p.header_boot, None);
+        assert_eq!(p.lines.len(), 1);
+    }
+
+    #[test]
+    fn estimated_pidfile_bytes_scales_with_rows_and_temps() {
+        let base = estimated_pidfile_bytes(0, 0, 4);
+        assert_eq!(base, pending_pidfile_len());
+        let with_rows = estimated_pidfile_bytes(60, 0, 4);
+        assert!(with_rows >= base + 60 * 48);
+        let with_temps = estimated_pidfile_bytes(10, 5, 20);
+        assert!(with_temps >= base + 5 * 68 + 10 * 48);
+    }
+
+    #[test]
+    fn pidfile_lock_held_is_read_only_and_detects_active_lock() {
+        let dir = std::env::temp_dir().join(format!(".psgen-lock-test-{}", sys::getpid()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("test.pid");
+        let lockfile = dir.join("test.pid.lock");
+        let pbytes = pidfile.as_os_str().as_bytes().to_vec();
+
+        // Preview check must not create `.lock`.
+        assert!(!pidfile_lock_held(&pbytes));
+        assert!(!lockfile.exists());
+
+        // While locked, `pidfile_lock_held` reports true and a second
+        // `lock_pidfile` fails with WouldBlock.
+        let lock = lock_pidfile(&pbytes).expect("acquire lock");
+        assert!(pidfile_lock_held(&pbytes));
+        assert_eq!(
+            lock_pidfile(&pbytes).err().map(|e| e.kind()),
+            Some(std::io::ErrorKind::WouldBlock)
+        );
+        drop(lock);
+        assert!(!pidfile_lock_held(&pbytes));
+
+        // Symlink at `.lock` must be refused by O_NOFOLLOW.
+        let _ = std::fs::remove_file(&lockfile);
+        let target = dir.join("target");
+        std::fs::write(&target, b"x").unwrap();
+        std::os::unix::fs::symlink(&target, &lockfile).unwrap();
+        assert!(lock_pidfile(&pbytes).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_pid_sidecar_carries_temps_and_nonce_and_falls_back_to_tmpdir() {
+        if util::boot_id().is_empty() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!(".psgen-sidecar-test-{}", sys::getpid()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let temp_entry = dir.join(".psgen-1-0-0");
+        let nonce = b"deadbeef01234567";
+
+        // 1. Writable parent: writes `<path>.spawned` beside the pidfile with
+        // real `# temp` and real `nonce`.
+        let pidfile = dir.join("run.pid");
+        let pbytes = pidfile.as_os_str().as_bytes().to_vec();
+        let side = write_pid_sidecar(
+            &pbytes,
+            &[sys::getpid()],
+            std::slice::from_ref(&temp_entry),
+            nonce,
+        )
+        .expect("sidecar beside writable parent");
+        assert!(side.ends_with(b".spawned"));
+        let body = std::fs::read(Path::new(std::ffi::OsStr::from_bytes(&side))).unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains(" nonce deadbeef01234567\n"), "{text}");
+        assert!(
+            text.contains(&format!("# temp {}\n", temp_entry.display())),
+            "{text}"
+        );
+
+        // 2. Unwritable / absent parent: falls back to `TMPDIR/psgen-spawned-...pid`.
+        let missing_parent_pid = dir.join("no-such-dir").join("run.pid");
+        let mpbytes = missing_parent_pid.as_os_str().as_bytes().to_vec();
+        let fallback = write_pid_sidecar(
+            &mpbytes,
+            &[sys::getpid()],
+            std::slice::from_ref(&temp_entry),
+            nonce,
+        )
+        .expect("fallback sidecar in temp_dir");
+        let fb_path = Path::new(std::ffi::OsStr::from_bytes(&fallback));
+        assert!(fb_path.exists());
+        let fb_name = fb_path.file_name().unwrap().to_string_lossy();
+        assert!(
+            fb_name.starts_with("psgen-spawned-") && fb_name.ends_with(".pid"),
+            "{fb_name}"
+        );
+        let fb_text = String::from_utf8_lossy(&std::fs::read(fb_path).unwrap()).into_owned();
+        assert!(fb_text.contains(" nonce deadbeef01234567\n"), "{fb_text}");
+        assert!(
+            fb_text.contains(&format!("# temp {}\n", temp_entry.display())),
+            "{fb_text}"
+        );
+        let _ = std::fs::remove_file(fb_path);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

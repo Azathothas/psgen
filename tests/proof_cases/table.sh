@@ -3,7 +3,7 @@
 #
 #   sh tests/proof_cases/table.sh <binary> [issue ...]
 #
-# Covers issues #3, #12 and #17. Each case prints one line — `PASS <n> <what>`,
+# Covers issues #3, #12, #17 and #41. Each case prints one line — `PASS <n> <what>`,
 # `FAIL <n> <what>: <why>` or `SKIP <n> <what>: <why>` — and the script exits
 # non-zero when any case failed.
 #
@@ -609,10 +609,12 @@ case_3_3() {
 	pass_c
 }
 
-# 3d: a VSZ wider than its six-column slot. `ps` keeps STAT, START, TIME and
-# COMMAND at the header offsets by letting the overflow eat the TTY padding;
-# a fixed eight-wide TTY field pushes every column after it to the right. The
-# fixture reserves 12 GiB of address space, which costs no memory, and is
+# 3d: a VSZ wider than its six-column slot, and on 64-bit past `u32::MAX` KiB
+# (> 4 TiB, issue #40). `ps` keeps STAT, START, TIME and COMMAND at the header
+# offsets by letting the overflow eat the TTY padding; a fixed eight-wide TTY
+# field pushes every column after it to the right. On 64-bit hosts the fixture
+# tries a 5 TiB `PROT_NONE | MAP_NORESERVE` reservation (falling back to 12 GiB
+# when overcommit or VA limits refuse it), which costs no memory, and is
 # started in its own session so its TTY is `?` — the shape the issue verified.
 case_3_4() {
 	have python3 || {
@@ -625,13 +627,26 @@ case_3_4() {
 	}
 	_w=$TMP/3_4
 	mkdir -p "$_w"
+	_try_wide64=0
+	case $(uname -m 2>/dev/null) in
+		x86_64 | aarch64) _try_wide64=1 ;;
+	esac
 	setsid python3 -c '
 import mmap, os, sys, time
-m = mmap.mmap(-1, 12 << 30, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+try_wide = sys.argv[2] == "1"
+m = None
+if try_wide:
+    flags = mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | getattr(mmap, "MAP_NORESERVE", 0x4000)
+    try:
+        m = mmap.mmap(-1, 5 << 40, flags=flags, prot=getattr(mmap, "PROT_NONE", 0))
+    except (OSError, OverflowError, ValueError):
+        m = None
+if m is None:
+    m = mmap.mmap(-1, 12 << 30, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
 with open(sys.argv[1], "w") as f:
     f.write(str(os.getpid()))
 time.sleep(30)
-' "$_w/pid" </dev/null >/dev/null 2>"$_w/start.err" &
+' "$_w/pid" "$_try_wide64" </dev/null >/dev/null 2>"$_w/start.err" &
 	_bg=$!
 	bank_pid "$_bg"
 	if ! wait_ready "$_w/pid"; then
@@ -668,6 +683,17 @@ time.sleep(30)
 	if [ "$_mine" != "$_ref" ]; then
 		fail_c "STAT/START/TIME/COMMAND start at '$_mine', ps puts them at '$_ref' (a wide VSZ shifted the row)"
 		return
+	fi
+	# When the 5 TiB reservation succeeded, prove VSZ past u32::MAX KiB is
+	# reported accurately rather than clamped.
+	if awk -v v="$_v" 'BEGIN { exit !(v + 0 > 4294967295) }'; then
+		_ps_vsz=$(awk -v want="$_p" 'NR > 1 && $2 == want { print $5; exit }' "$_w/ps")
+		_live_vsz=$(awk -v want="$_p" 'NR > 1 && $2 == want { print $5; exit }' "$_w/live")
+		if [ -z "$_live_vsz" ] || [ "$_live_vsz" != "$_ps_vsz" ] ||
+			! awk -v v="$_live_vsz" 'BEGIN { exit !(v + 0 > 4294967295) }'; then
+			fail_c "VSZ past u32::MAX KiB was '${_live_vsz:-missing}', ps reports '${_ps_vsz:-missing}'"
+			return
+		fi
 	fi
 	pass_c
 }
@@ -921,10 +947,14 @@ case_12_4() {
 	_dirs=$(awk '$1 == "plan:" { for (i = 1; i <= NF; i++) if ($i == "staging") print $(i + 1) }' "$_w/plan")
 	_under=$(awk '$1 == "plan:" { for (i = 1; i <= NF; i++) if ($i == "under") print $(i + 1) }' "$_w/plan")
 	if [ "$_total" != 2 ] || [ "$_dirs" != 2 ] || [ "$_under" != "$_d" ]; then
-		fail_c "the plan says disk '${_total:-none}' MiB over '${_dirs:-none}' staging directories under '${_under:-none}'"
+		fail_c "the plan says disk '${_total:-none}' MiB over '${_dirs:-none}' staging directory patterns under '${_under:-none}'"
 		return
 	fi
-	_stage=$(awk '$1 == "staging" { print $2 }' "$_w/plan" | grep -cF "$_d/.psgen-<pid>-")
+	# The leaf carries the injector's PID and a retry index, neither of which
+	# exists before the spawn, so the plan prints a pattern. The parent is the
+	# real directory the run will use.
+	_stage=$(awk '$1 == "staging" && $2 == "pattern" { print $3 }' "$_w/plan" |
+		grep -cF "$_d/.psgen-<pid>-")
 	if [ "$_stage" -ne 2 ]; then
 		fail_c "the plan named $_stage staging paths under $_d"
 		return
@@ -942,6 +972,57 @@ case_12_4() {
 	if ! wait_pids "$_pf" 2; then
 		stop_pidfile "$_pf"
 		fail_c "the real run recorded $(pids_of "$_pf" | grep -c .) of 2 pids"
+		return
+	fi
+	sed -n 's/^staging pattern //p' "$_w/plan" >"$_w/patterns"
+	sed -n 's/^# temp //p' "$_pf" >"$_w/temps"
+	_pat_n=$(wc -l <"$_w/patterns" | tr -d ' ')
+	_tmp_n=$(wc -l <"$_w/temps" | tr -d ' ')
+	if [ "$_pat_n" -ne 2 ] || [ "$_tmp_n" -ne "$_pat_n" ]; then
+		stop_pidfile "$_pf"
+		fail_c "the plan printed $_pat_n staging pattern(s) but the pidfile recorded $_tmp_n # temp path(s)"
+		return
+	fi
+	_mismatch=$(awk '
+		function matches(line, p,    i1, pre, rest, i2, mid, suf, rem) {
+			i1 = index(p, "<pid>")
+			if (i1 == 0) return 0
+			pre = substr(p, 1, i1 - 1)
+			rest = substr(p, i1 + 5)
+			i2 = index(rest, "<i>")
+			if (i2 == 0) return 0
+			mid = substr(rest, 1, i2 - 1)
+			suf = substr(rest, i2 + 3)
+			if (substr(line, 1, length(pre)) != pre) return 0
+			rem = substr(line, length(pre) + 1)
+			if (rem !~ /^[0-9]+/) return 0
+			sub(/^[0-9]+/, "", rem)
+			if (substr(rem, 1, length(mid)) != mid) return 0
+			rem = substr(rem, length(mid) + 1)
+			if (rem !~ /^[0-9]+/) return 0
+			sub(/^[0-9]+/, "", rem)
+			return rem == suf
+		}
+		FNR == NR {
+			npat++
+			pat[npat] = $0
+			next
+		}
+		{
+			ok = 0
+			for (k = 1; k <= npat; k++) {
+				if (!used[k] && matches($0, pat[k])) {
+					used[k] = 1
+					ok = 1
+					break
+				}
+			}
+			if (!ok) printf "temp %s matched no unused staging pattern\n", $0
+		}
+	' "$_w/patterns" "$_w/temps" | head -1)
+	if [ -n "$_mismatch" ]; then
+		stop_pidfile "$_pf"
+		fail_c "the pidfile # temp paths did not match --plan staging patterns: $_mismatch"
 		return
 	fi
 	_made=$(find "$_d" -maxdepth 1 -type d -name '.psgen-*' | wc -l)
@@ -1173,6 +1254,100 @@ case_17_2() {
 	pass_c
 }
 
+# ----------------------------------------------------------------- issue #41
+# `%CPU` must use `CLOCK_BOOTTIME` rather than `/proc/uptime`: a virtualized
+# procfs (lxcfs) that reports a shorter container uptime must not inflate `%CPU`,
+# and a disagreement between the two clocks must be warned on stderr.
+case_41() {
+	have unshare || {
+		skip_c "no unshare to bind-mount a private /proc/uptime"
+		return
+	}
+	[ -r /proc/uptime ] && [ -r /proc/1/stat ] || {
+		skip_c "/proc/uptime or /proc/1/stat is not readable here"
+		return
+	}
+	_real_up=$(awk '{ printf "%d", $1 }' /proc/uptime 2>/dev/null)
+	case $_real_up in
+		"" | *[!0-9]*)
+			skip_c "could not parse /proc/uptime"
+			return
+			;;
+	esac
+	_ref_cpu=$(ps -o pcpu= -p 1 2>/dev/null | tr -d ' ')
+	if [ -z "$_ref_cpu" ]; then
+		skip_c "PID 1 is not visible to ps"
+		return
+	fi
+	_w=$TMP/41
+	mkdir -p "$_w"
+	# Pick a fake /proc/uptime that disagrees with CLOCK_BOOTTIME by well over
+	# 2 s, even on a freshly booted VM.
+	if [ "$_real_up" -ge 30 ]; then
+		printf '10.00 10.00\n' >"$_w/uptime"
+	else
+		printf '99999.00 99999.00\n' >"$_w/uptime"
+	fi
+	_mode=
+	if unshare -Urm -- sh -c 'mount --bind "$1" /proc/uptime' _ "$_w/uptime" >/dev/null 2>&1; then
+		_mode=userns
+	elif [ "$(id -u)" = 0 ] && unshare -m -- sh -c 'mount --bind "$1" /proc/uptime' _ "$_w/uptime" >/dev/null 2>&1; then
+		_mode=root
+	elif have sudo && sudo -n true >/dev/null 2>&1 &&
+		sudo -n unshare -m -- sh -c 'mount --bind "$1" /proc/uptime' _ "$_w/uptime" >/dev/null 2>&1; then
+		_mode=sudo
+	else
+		skip_c "cannot bind-mount a private /proc/uptime in a mount namespace"
+		return
+	fi
+	case $_mode in
+		userns)
+			tmo 60 unshare -Urm -- sh -c 'mount --bind "$1" /proc/uptime || exit 111; shift; exec "$@"' _ \
+				"$_w/uptime" "$BIN" table --live >"$_w/live" 2>"$_w/live.err"
+			_rc=$?
+			;;
+		root)
+			tmo 60 unshare -m -- sh -c 'mount --bind "$1" /proc/uptime || exit 111; shift; exec "$@"' _ \
+				"$_w/uptime" "$BIN" table --live >"$_w/live" 2>"$_w/live.err"
+			_rc=$?
+			;;
+		sudo)
+			tmo 60 sudo -n unshare -m -- sh -c 'mount --bind "$1" /proc/uptime || exit 111; shift; exec "$@"' _ \
+				"$_w/uptime" "$BIN" table --live >"$_w/live" 2>"$_w/live.err"
+			_rc=$?
+			;;
+	esac
+	if [ "$_rc" -eq 111 ]; then
+		skip_c "cannot bind-mount a private /proc/uptime in a mount namespace"
+		return
+	fi
+	if [ "$_rc" -ne 0 ]; then
+		fail_c "table --live exited $_rc under a skewed /proc/uptime: $(head -1 "$_w/live.err")"
+		return
+	fi
+	if ! grep -Fq 'differs from CLOCK_BOOTTIME' "$_w/live.err" ||
+		! grep -Fq '%CPU uses CLOCK_BOOTTIME' "$_w/live.err"; then
+		fail_c "table --live did not warn about /proc/uptime vs CLOCK_BOOTTIME skew: $(head -1 "$_w/live.err")"
+		return
+	fi
+	_got_cpu=$(awk 'NR > 1 && $2 == 1 { print $3; exit }' "$_w/live")
+	if [ -z "$_got_cpu" ]; then
+		fail_c "table --live printed no row for PID 1"
+		return
+	fi
+	_ref_cpu2=$(ps -o pcpu= -p 1 2>/dev/null | tr -d ' ')
+	if ! awk -v got="$_got_cpu" -v a="$_ref_cpu" -v b="${_ref_cpu2:-$_ref_cpu}" '
+		BEGIN {
+			da = got - a; if (da < 0) da = -da
+			db = got - b; if (db < 0) db = -db
+			exit !(da <= 0.25 || db <= 0.25)
+		}'; then
+		fail_c "PID 1 %CPU was $_got_cpu under skewed /proc/uptime, ps reports $_ref_cpu..${_ref_cpu2:-$_ref_cpu}"
+		return
+	fi
+	pass_c
+}
+
 # ------------------------------------------------------------------ driver
 
 run_case 3.1 3 "a line break in argv stays inside one COMMAND field" case_3_1
@@ -1185,6 +1360,7 @@ run_case 12.3 12 "the plan's exe tier is the exe the kernel reports" case_12_3
 run_case 12.4 12 "--disk totals and staging directories match the filesystem" case_12_4
 run_case 17.1 17 "--local overrides --utc-offset instead of shifting twice" case_17_1
 run_case 17.2 17 "--utc-offset outside -1440..1440 is refused" case_17_2
+run_case 41 41 "table --live uses CLOCK_BOOTTIME and warns when /proc/uptime is skewed" case_41
 
 if [ "$RAN" = 0 ]; then
 	echo "table.sh: no case matched '$SELECTED'" >&2

@@ -102,6 +102,33 @@ pub fn valid_name(name: &[u8]) -> bool {
         .all(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
 }
 
+/// Absolute paths `useradd` may live at, in order. Never a bare name: this
+/// runs as root, and a bare name resolves through the caller's `PATH`, which
+/// is CWE-426 whichever caller it is.
+const USERADD_CANDIDATES: &[&str] = &[
+    "/usr/sbin/useradd",
+    "/usr/bin/useradd",
+    "/sbin/useradd",
+    "/run/current-system/sw/bin/useradd",
+];
+
+/// First existing executable regular file at an absolute path in `candidates`,
+/// or `None`. Never consults `PATH`.
+fn find_useradd_in<'a>(candidates: &[&'a str]) -> Option<&'a str> {
+    use std::os::unix::fs::PermissionsExt;
+    candidates.iter().copied().find(|p| {
+        std::path::Path::new(p).is_absolute()
+            && std::fs::metadata(p)
+                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+    })
+}
+
+/// The `useradd` this host has, by absolute path, or `None`.
+fn useradd() -> Option<&'static str> {
+    find_useradd_in(USERADD_CANDIDATES)
+}
+
 /// Look up a user, optionally creating it with `useradd` when it is missing.
 /// Returns the uid and gid, whether this call created the account, and the
 /// error text when creation failed or the create succeeded without NSS
@@ -119,6 +146,17 @@ pub fn ensure(name: &[u8], create: bool) -> (Option<(u32, u32)>, bool, Option<St
     let name_str = match std::str::from_utf8(name) {
         Ok(s) => s,
         Err(_) => return (None, false, Some("invalid user name".to_string())),
+    };
+    // Resolve the tool once. A bare name would run whatever the inherited
+    // PATH puts first, as root; refusing is better than trusting it.
+    let useradd_bin = match useradd() {
+        Some(p) => p,
+        None => {
+            let mut msg = String::from("no useradd at ");
+            msg.push_str(&USERADD_CANDIDATES.join(", "));
+            msg.push_str("; --create-users needs one of them");
+            return (None, false, Some(msg));
+        }
     };
     // Ordered from most to least specific. The first attempt creates the
     // group with the user; the third uses a group that already exists, which
@@ -175,7 +213,10 @@ pub fn ensure(name: &[u8], create: bool) -> (Option<(u32, u32)>, bool, Option<St
     ];
     let mut first_error = String::new();
     for opts in attempts.iter() {
-        let mut cmd = std::process::Command::new("useradd");
+        let mut cmd = std::process::Command::new(useradd_bin);
+        cmd.env_clear()
+            .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+            .env("LC_ALL", "C");
         for o in opts.iter() {
             cmd.arg(o);
         }
@@ -216,4 +257,63 @@ pub fn ensure(name: &[u8], create: bool) -> (Option<(u32, u32)>, bool, Option<St
         "useradd failed".to_string()
     };
     (None, false, Some(msg))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn candidates_are_all_absolute_and_include_nixos() {
+        assert!(!USERADD_CANDIDATES.is_empty());
+        for p in USERADD_CANDIDATES {
+            assert!(
+                std::path::Path::new(p).is_absolute(),
+                "candidate {:?} must be an absolute path",
+                p
+            );
+        }
+        assert!(USERADD_CANDIDATES.contains(&"/run/current-system/sw/bin/useradd"));
+    }
+
+    #[test]
+    fn find_useradd_in_skips_dirs_and_non_exec_and_picks_first_exec() {
+        let dir = std::env::temp_dir().join(format!(".psgen-users-test-{}", sys::getpid()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let sub = dir.join("subdir");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let non_exec = dir.join("not-exec");
+        std::fs::write(&non_exec, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&non_exec, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let first_exec = dir.join("first-exec");
+        std::fs::write(&first_exec, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&first_exec, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let second_exec = dir.join("second-exec");
+        std::fs::write(&second_exec, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&second_exec, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let missing = dir.join("missing");
+
+        let sub_s = sub.to_str().unwrap();
+        let non_exec_s = non_exec.to_str().unwrap();
+        let first_s = first_exec.to_str().unwrap();
+        let second_s = second_exec.to_str().unwrap();
+        let missing_s = missing.to_str().unwrap();
+
+        assert_eq!(
+            find_useradd_in(&[missing_s, sub_s, non_exec_s, first_s, second_s]),
+            Some(first_s)
+        );
+        assert_eq!(find_useradd_in(&[missing_s, sub_s, non_exec_s]), None);
+        assert_eq!(find_useradd_in(&[]), None);
+        assert_eq!(find_useradd_in(&["useradd", "sh"]), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

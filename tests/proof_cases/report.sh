@@ -257,9 +257,11 @@ for i, item in enumerate(checks):
     for k in ("ok", "detail"):
         if k not in item:
             errs.append("checks[%d] has no %s field" % (i, k))
-    extra = set(item) - {"name", "ok", "detail", "errno"}
+    extra = set(item) - {"name", "ok", "detail", "errno", "not_attempted"}
     if extra:
         errs.append("checks[%d] has unexpected keys %s" % (i, sorted(extra)))
+    if "not_attempted" in item and not isinstance(item["not_attempted"], bool):
+        errs.append("checks[%d].not_attempted is not a boolean" % i)
 names = [c.get("name") for c in checks if isinstance(c, dict)]
 if "core_ok" not in d:
     errs.append("no core_ok field")
@@ -862,7 +864,9 @@ case_20_1() {
 }
 
 # A create that succeeds but which NSS cannot see must be one call per name.
-# Both trees call `useradd`; only the fixed one stops after the create lands.
+# `psgen --create-users` ignores PATH and invokes the first executable candidate
+# at a fixed absolute path, so the shim is bind-mounted over that candidate
+# inside a private mount namespace rather than placed on PATH.
 _shim_log() { printf '%s/log' "$TMP"; }
 install_shim() { # install_shim <script-body>
 	_sd=$TMP/shim
@@ -871,24 +875,58 @@ install_shim() { # install_shim <script-body>
 	chmod 755 "$_sd/useradd"
 }
 
+find_real_useradd() {
+	for _u in /usr/sbin/useradd /usr/bin/useradd /sbin/useradd /run/current-system/sw/bin/useradd; do
+		if [ -f "$_u" ] && [ -x "$_u" ]; then
+			printf '%s' "$_u"
+			return 0
+		fi
+	done
+	return 1
+}
+
+need_useradd_shim_ns() {
+	have_sudo || {
+		skip_c "needs sudo, because --create-users only runs as root"
+		return 1
+	}
+	have unshare || {
+		skip_c "no unshare to bind-mount a private useradd shim"
+		return 1
+	}
+	_real_ua=$(find_real_useradd) || {
+		skip_c "no useradd at the fixed absolute paths to bind-mount a shim over"
+		return 1
+	}
+	asroot unshare -m -- true >/dev/null 2>&1 || {
+		skip_c "this host cannot create a mount namespace for the useradd shim"
+		return 1
+	}
+	return 0
+}
+
 count_shim_calls() { # count_shim_calls -> "<count> <name>" lines
 	awk '{ print $NF }' "$TMP/log" 2>/dev/null | sort | uniq -c | awk '{ print $1, $2 }'
 }
 
 case_20_2() {
-	have_sudo || {
-		skip_c "needs sudo, because --create-users only runs as root"
-		return
-	}
-	install_shim "echo \"\$*\" >> $(_shim_log)
+	need_useradd_shim_ns || return
+	install_shim "echo \"\$*\" >> \"$(_shim_log)\"
 exit 0"
 	: >"$TMP/log"
 	mkdir -p "$TMP/shimtmp"
 	_pf=$TMP/20_2.pid
-	asroot env PATH="$TMP/shim:/usr/bin:/bin" TMPDIR="$TMP/shimtmp" \
+	asroot unshare -m -- sh -c 'mount --bind "$1" "$2" || exit 111; shift 2; exec "$@"' _ \
+		"$TMP/shim/useradd" "$_real_ua" \
+		env TMPDIR="$TMP/shimtmp" \
 		"$BIN" inject -f mail -n 30 -s 8 --create-users --user --no-exe \
 		--no-mem --no-tty --no-threads --pidfile "$_pf" >/dev/null 2>&1
+	_rc=$?
 	stop_pidfile "$_pf"
+	if [ "$_rc" -eq 111 ]; then
+		skip_c "cannot bind-mount a private useradd shim over $_real_ua"
+		return
+	fi
 	_lines=$(count_shim_calls)
 	if [ -z "$_lines" ]; then
 		fail_c "the run never invoked useradd, so the count cannot be checked"
@@ -905,25 +943,30 @@ exit 0"
 # The retry used to overwrite the first error, so the caller saw "already
 # exists" — the second attempt's complaint — instead of the real one.
 case_20_3() {
-	have_sudo || {
-		skip_c "needs sudo, because --create-users only runs as root"
-		return
-	}
-	mkdir -p "$TMP/shimtmp" "$TMP/seen"
+	need_useradd_shim_ns || return
+	rm -rf "$TMP/seen-20-3"
+	mkdir -p "$TMP/shimtmp" "$TMP/seen-20-3"
 	install_shim "for a; do last=\$a; done
-echo \"\$*\" >> $(_shim_log)
-if [ -e \"$TMP/seen/\$last\" ]; then
+echo \"\$*\" >> \"$(_shim_log)\"
+if [ -e \"$TMP/seen-20-3/\$last\" ]; then
 	echo \"useradd: user '\$last' already exists\" >&2
 	exit 9
 fi
-: >\"$TMP/seen/\$last\"
+: >\"$TMP/seen-20-3/\$last\"
 exit 0"
 	: >"$TMP/log"
 	_pf=$TMP/20_3.pid
-	_err=$(asroot env PATH="$TMP/shim:/usr/bin:/bin" TMPDIR="$TMP/shimtmp" \
+	_err=$(asroot unshare -m -- sh -c 'mount --bind "$1" "$2" || exit 111; shift 2; exec "$@"' _ \
+		"$TMP/shim/useradd" "$_real_ua" \
+		env TMPDIR="$TMP/shimtmp" \
 		"$BIN" inject -f mail -n 30 -s 8 --create-users --user --no-exe \
 		--no-mem --no-tty --no-threads --pidfile "$_pf" 2>&1 >/dev/null)
+	_rc=$?
 	stop_pidfile "$_pf"
+	if [ "$_rc" -eq 111 ]; then
+		skip_c "cannot bind-mount a private useradd shim over $_real_ua"
+		return
+	fi
 	_lines=$(count_shim_calls)
 	[ -n "$_lines" ] || {
 		fail_c "the run never invoked useradd, so the message cannot be checked"
@@ -952,18 +995,21 @@ exit 0"
 # A dry run must not create accounts, but must not fall back to the caller's
 # identity either: it has to name what the real run would use.
 case_20_4() {
-	have_sudo || {
-		skip_c "needs sudo, because --create-users only runs as root"
-		return
-	}
+	need_useradd_shim_ns || return
 	mkdir -p "$TMP/shimtmp"
-	install_shim "echo \"\$*\" >> $(_shim_log)
+	install_shim "echo \"\$*\" >> \"$(_shim_log)\"
 exit 1"
 	: >"$TMP/log"
-	_err=$(asroot env PATH="$TMP/shim:/usr/bin:/bin" TMPDIR="$TMP/shimtmp" \
+	_err=$(asroot unshare -m -- sh -c 'mount --bind "$1" "$2" || exit 111; shift 2; exec "$@"' _ \
+		"$TMP/shim/useradd" "$_real_ua" \
+		env TMPDIR="$TMP/shimtmp" \
 		"$BIN" inject -f mail -n 30 -s 8 --user --create-users --dry-run \
 		--no-exe --no-mem --no-tty --no-threads 2>&1 >/dev/null)
 	_rc=$?
+	if [ "$_rc" -eq 111 ]; then
+		skip_c "cannot bind-mount a private useradd shim over $_real_ua"
+		return
+	fi
 	_calls=$(wc -l <"$TMP/log" 2>/dev/null || echo 0)
 	if [ "$_calls" -ne 0 ]; then
 		fail_c "the dry run invoked useradd $_calls times"
@@ -980,6 +1026,42 @@ exit 1"
 			return
 			;;
 	esac
+	pass_c
+}
+
+# `--create-users` runs as root, so a poison `useradd` placed first in PATH
+# must never be invoked: only the fixed absolute path is consulted.
+case_20_5() {
+	need_useradd_shim_ns || return
+	mkdir -p "$TMP/shimtmp" "$TMP/poison"
+	printf '#!/bin/sh\necho "$*" >> "%s/poison.log"\nexit 99\n' "$TMP" >"$TMP/poison/useradd"
+	chmod 755 "$TMP/poison/useradd"
+	: >"$TMP/poison.log"
+	install_shim "echo \"\$*\" >> \"$(_shim_log)\"
+exit 0"
+	: >"$TMP/log"
+	_pf=$TMP/20_5.pid
+	asroot unshare -m -- sh -c 'mount --bind "$1" "$2" || exit 111; shift 2; exec "$@"' _ \
+		"$TMP/shim/useradd" "$_real_ua" \
+		env PATH="$TMP/poison:/usr/sbin:/usr/bin:/sbin:/bin" TMPDIR="$TMP/shimtmp" \
+		"$BIN" inject -f mail -n 30 -s 8 --create-users --user --no-exe \
+		--no-mem --no-tty --no-threads --pidfile "$_pf" >/dev/null 2>&1
+	_rc=$?
+	stop_pidfile "$_pf"
+	if [ "$_rc" -eq 111 ]; then
+		skip_c "cannot bind-mount a private useradd shim over $_real_ua"
+		return
+	fi
+	_poison_calls=$(wc -l <"$TMP/poison.log" 2>/dev/null | tr -d ' ')
+	if [ "${_poison_calls:-0}" -ne 0 ]; then
+		fail_c "--create-users invoked a poison useradd from PATH ($_poison_calls call(s))"
+		return
+	fi
+	_lines=$(count_shim_calls)
+	if [ -z "$_lines" ]; then
+		fail_c "the run never invoked fixed-path useradd, so PATH isolation was not exercised"
+		return
+	fi
 	pass_c
 }
 
@@ -1251,6 +1333,26 @@ case_23_3() {
 			return
 			;;
 	esac
+	case $_out in
+		*"cgroup memory limit"*) ;;
+		*)
+			fail_c "the refusal does not name the cgroup memory limit denominator: $(printf '%s' "$_out" | head -1)"
+			return
+			;;
+	esac
+	case $_out in
+		*"this cgroup can still allocate"*)
+			fail_c "the refusal blamed cgroup headroom when host MemAvailable (16 MiB) was tighter: $(printf '%s' "$_out" | head -1)"
+			return
+			;;
+	esac
+	case $_out in
+		*"16 MiB MemAvailable"*) ;;
+		*)
+			fail_c "the refusal does not name 16 MiB MemAvailable as the tighter ceiling: $(printf '%s' "$_out" | head -1)"
+			return
+			;;
+	esac
 	pass_c
 }
 
@@ -1359,8 +1461,8 @@ case_24_3() {
 		fail_c "log --lines 2000000000 emitted $_bytes bytes"
 		return
 	fi
-	grep -qi 'cap' "$TMP/24_3.err" || {
-		fail_c "the capped line count was not reported"
+	grep -Fq 'log events capped' "$TMP/24_3.err" || {
+		fail_c "the capped event count was not reported as 'log events capped' ($(head -1 "$TMP/24_3.err"))"
 		return
 	}
 	# The cap is on events, and one event can be several rows, so the emitted
@@ -1426,14 +1528,26 @@ unit_pids() {
 		done
 }
 
-# wait_gone <pid> — a signalled process needs a moment to leave /proc.
+# proc_state <pid> — the state letter from /proc/PID/stat, empty when gone.
+proc_state() {
+	sed -n 's/^[0-9]* (.*) \([^ ]*\).*/\1/p' "/proc/$1/stat" 2>/dev/null
+}
+
+# alive <pid> — the tool's own definition of alive: a zombie is already dead,
+# even when PID 1 does not reap it.
+alive() {
+	_alive_state=$(proc_state "$1")
+	[ -n "$_alive_state" ] && [ "$_alive_state" != Z ]
+}
+
+# wait_gone <pid> — a signalled process needs a moment to stop being alive.
 wait_gone() {
 	_i=0
-	while [ -d "/proc/$1" ] && [ "$_i" -lt 30 ]; do
+	while alive "$1" && [ "$_i" -lt 30 ]; do
 		sleep 0.1
 		_i=$((_i + 1))
 	done
-	[ ! -d "/proc/$1" ]
+	! alive "$1"
 }
 
 case_27_1() {
@@ -1537,7 +1651,7 @@ case_27_2() {
 		return
 	fi
 	for _p in $_pids; do
-		if [ ! -d "/proc/$_p" ]; then
+		if ! alive "$_p"; then
 			fail_c "stopping the second unit killed the first unit's stub $_p"
 			unit_stop "$_a"
 			unit_stop "$_b"
@@ -1641,7 +1755,7 @@ EOF
 	fi
 	_alive=0
 	for _p in $_stage_pids; do
-		[ -d "/proc/$_p" ] && _alive=$((_alive + 1))
+		alive "$_p" && _alive=$((_alive + 1))
 	done
 	_want=$(printf '%s\n' "$_stage_pids" | grep -c .)
 	if [ "$_alive" -ne "$_want" ]; then
@@ -1675,6 +1789,7 @@ run_case 20.1 20 "--create-users repairs a group-only host" case_20_1
 run_case 20.2 20 "one useradd per missing name" case_20_2
 run_case 20.3 20 "a create NSS cannot see is not retried" case_20_3
 run_case 20.4 20 "--create-users --dry-run names the identity" case_20_4
+run_case 20.5 20 "--create-users ignores a useradd earlier on PATH" case_20_5
 run_case 21.1 21 "an existing absolute path is reported present" case_21_1
 run_case 21.2 21 "a bare name resolves against PATH" case_21_2
 run_case 21.3 21 "a name-mapped binary is not reported missing" case_21_3

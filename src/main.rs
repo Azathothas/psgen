@@ -22,6 +22,7 @@ mod util;
 mod version;
 
 fn main() {
+    sys::ignore_sigxfsz();
     stub::maybe_run();
     let code = cli::run();
     sys::exit(code);

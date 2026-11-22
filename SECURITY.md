@@ -1,174 +1,155 @@
-# Security policy
+# Security Policy
 
-`psgen` deliberately spoofs process state. That is the feature, and it is also
-why a deployment decision matters more here than for an ordinary tool.
+`psgen` intentionally spoofs Linux process state.
+Deployment boundaries matter more for `psgen` than for an ordinary command-line tool.
 
-## Requirements
+## Deployment Requirements
 
-- Never install `psgen` setuid or setgid. The stub refuses to run in that case:
-  `maybe_run()` compares the effective uid and gid with the real ones and exits
-  2 when they differ, before it reads any configuration.
-- Do not let a supervisor, wrapper or `sudoers` rule hand an arbitrary
-  descriptor 3 to a privileged `psgen`. The descriptor is the trust boundary;
-  see below for what the stub checks and what it cannot know.
-- Run `stop` only on a pidfile you wrote, or on one from a caller you trust as
-  much as yourself.
+- Never install `psgen` with setuid or setgid bits set.
+  Before reading any configuration, `stub::maybe_run()` compares effective and real UIDs and GIDs.
+  If the real and effective IDs differ, `psgen` exits with status 2.
+- Never allow a supervisor, wrapper, or `sudoers` rule to pass an arbitrary file descriptor 3 to a privileged `psgen` process.
+  File descriptor 3 is a trust boundary.
+- Run `psgen stop` only on a pidfile that you control or trust completely.
 
-## What the threat model assumes
+## Threat Model and Enforcement
 
-- The pidfile is trusted input. `/proc` makes the boot id, starttime and comm
-  visible, so a forged pidfile can name a process the caller may signal
-  anyway, and can point the `# temp` cleanup at a directory with the right
-  name that the caller owns. `stop` refuses a file with no psgen header at all
-  and refuses a header whose boot id is empty or from another boot, but a
-  header with today's boot id and a real process's fields is accepted.
+### Pidfile Trust Boundary
 
-- The fd-3 gate checks the descriptor and the environment, and trusts neither
-  to prove who created the descriptor. The stub acts on a config only when all
-  of these hold:
+`psgen` treats the pidfile as trusted input.
+`/proc` exposes boot IDs, process start times, and command names (`comm`) to local readers.
+A forged pidfile can name any process that the caller has permission to signal.
+A forged pidfile can also point `# temp` cleanup at a matching staging directory that the caller owns.
 
-  1. the process is not setuid or setgid;
-  2. the descriptor's filesystem is not FUSE or overlayfs, where ownership and
-     link counts can be forged;
-  3. `fstat` says the descriptor is owned by the uid the stub runs as;
-  4. the descriptor is a regular file with no links left, and either a memfd
-     carrying `F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL` or an unlinked
-     temporary file;
-  5. the config's nonce equals `PSGEN_NONCE` in the process environment.
+`stop` enforces these protections on pidfiles and sidecars:
 
-  Conditions 3 and 4 ask about the inode, not about the process that opened it.
-  Under `sudo` the uid is 0, so any root-owned inode the caller can open and
-  then unlink satisfies them, including one root wrote into a directory the
-  caller owns. A memfd is told from an unlinked file by its mode: `0777` is the
-  mode `memfd_create` gives, anything else is treated as the unlinked case and
-  skips the seal check, so `fchmod(0600)` on a memfd created without
-  `MFD_ALLOW_SEALING` also satisfies them. What the gate does enforce is that a
-  *named* descriptor is refused, that a memfd left at `0777` must carry the
-  seals, that ownership must match the uid the stub runs as, and that a FUSE or
-  overlayfs path is refused. It does not prove who created the descriptor.
+- `stop` opens the pidfile and `<pidfile>.spawned` sidecar with `O_NOFOLLOW`, so `stop` never follows symlinks.
+- `stop` refuses any file that has no `# psgen` header unless the caller passes `--force`.
+- `stop` refuses any header with an empty boot ID or a boot ID from another boot unless the caller passes `--force`.
+- `stop` refuses pidfiles with CRLF line endings.
+- `inject` opens `<pidfile>.lock`, `<pidfile>.spawned`, and fallback sidecar files with `O_NOFOLLOW` to prevent symlink replacement.
 
-- The nonce is a run tag, not authentication. It is written into the stub's
-  environment, which is the same trust plane as the descriptor, so a caller
-  who controls fd 3 can also set `PSGEN_NONCE` and match it. What the nonce
-  does is reject a stray descriptor from an unrelated run of the same user, and
-  refuse a supervisor that inherits fd 3 without choosing the environment. It
-  is 8 random bytes from `getrandom`, or a pid/clock mix when `getrandom`
-  fails, printed as hex. It must stay in the environment for the process
-  lifetime so every re-exec can read it, so it is visible in
-  `/proc/PID/environ` and to `ps e` for whoever may read that process. Do not
-  treat it as a secret. It is not a password, not a MAC, and not evidence that
-  a config came from psgen.
+### File Descriptor 3 Gate
 
-- The stub only writes into, and only executes from, a staging directory that
-  passes the ownership and name rule `stop` uses to decide whether it may
-  remove one: absolute, a real directory, owned by the uid the stub runs as,
-  not group- or world-writable, basename matching
-  `.psgen-<digits>-<digits>-<digits>`. The rule describes the directory, not
-  which run created it, so two runs of the same uid share one namespace of
-  acceptable directories.
+The stub inspects file descriptor 3 and the process environment before entering stub mode.
+The stub acts on a configuration descriptor only when all five conditions hold:
 
-- The staging leaf it executes is identified by the *opened descriptor*: a
-  regular file, one link, owned by the caller, and for a root run not on FUSE
-  or overlayfs. A hardlink or a FUSE type spoof is refused.
+1. The process is not setuid or setgid.
+2. The descriptor's filesystem is neither FUSE nor overlayfs.
+   FUSE and overlayfs can forge file ownership and link counts.
+3. `fstat` shows that the descriptor is owned by the stub's effective UID.
+4. `fd_kind()` confirms a regular file with zero links (`nlink == 0`) where `sys::fd_sealed(fd)` returns true.
+   `sys::fd_sealed(fd)` requires a sealed `memfd` carrying `F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL`.
+5. The configuration nonce equals `PSGEN_NONCE` in the process environment.
 
-- `--elevate` runs `sudo -n` with the same argv as the unprivileged call, minus
-  `--elevate` itself. A preview never elevates: `--plan` and `--dry-run`
-  describe what the caller's own privileges reach. `--elevate` is a
-  convenience for a caller who already has passwordless `sudo` for `psgen`,
-  not a way to obtain privileges.
+`sys::fd_sealed(fd)` is the sole discriminator for descriptor type.
+The stub ignores file mode bits, so `fchmod` cannot reclassify an unsealed `memfd`.
+The stub refuses every unsealed, anonymous, unlinked, and `O_TMPFILE` descriptor regardless of its file mode.
+`inject` has no unlinked-file configuration fallback.
+If the kernel denies `memfd_create` with `MFD_ALLOW_SEALING`, `inject` refuses to start instead of spawning stubs.
 
-### What an attacker who controls fd 3 and the environment can still do
+This gate blocks named files, hardlinks, symlinks, unlinked temporary files, and `O_TMPFILE` inodes.
+This gate also blocks unsealed `memfd` descriptors, `fchmod`-modified `memfd` descriptors, foreign-UID descriptors, FUSE or overlayfs descriptors, and missing or mismatched `PSGEN_NONCE` values.
+Non-seekable objects such as FIFOs, sockets, and devices fail `pread` in `read_config()` and do not trigger stub mode.
 
-The gate decides on the inode's metadata and on the environment, and both are
-under the caller's control. Three shapes pass that should not:
+### Run Nonce Scope
 
-- **A root-owned unlinked file opened by an unprivileged caller.** `fstat` says
-  `uid 0`, so under `sudo` the ownership condition holds, and `nlink 0` selects
-  the unlinked case, which needs no seals. Ownership of an inode says nothing
-  about who opened it: root writing any file into a directory the caller owns
-  is enough. Measured on this tree: a root-owned `0644` file, opened and then
-  unlinked by uid 1000, with a matching `PSGEN_NONCE`, was acted on by a root
-  stub, which took the config's `comm` and kept running.
-- **A memfd reclassified by `fchmod`.** `memfd_create(name, 0)` cannot be
-  sealed, but `fchmod(0600)` moves it out of the `0777` memfd arm and into the
-  unlinked arm, which skips the seal check. Measured: accepted, and a `pwrite`
-  after acceptance still succeeded, so the config can change after it was
-  validated.
-- **A root-owned staging directory of another run.** `safe_temp_dir` checks the
-  directory's own metadata, so a root run accepts any root-owned
-  `.psgen-<d>-<d>-<d>` that is not group- or world-writable. With `--disk` in
-  the config, the stub truncated an 8 KiB root-owned `data.bin` inside another
-  root run's `0700` staging directory and rewrote it as 512 KiB.
+`PSGEN_NONCE` is a run tag, not cryptographic authentication.
+The injector writes `PSGEN_NONCE` into the stub's environment, which shares the same trust plane as file descriptor 3.
+A caller who controls both file descriptor 3 and the process environment can supply a matching `PSGEN_NONCE`.
 
-With those shapes the attacker chooses the stub's `comm`, flags (threads, tty,
-busy CPU), duration, children and disk size, and gets a process that keeps
-running as the uid the target `psgen` runs as. What was **not** demonstrated:
-execution of the config's `exe` or `cmd` — the bind source is always
-`/proc/self/exe`, and a proc-self stub never rewrites its argv — and any write
-to a path that is not a staging directory passing the ownership and name rule.
+`PSGEN_NONCE` rejects stray descriptors from unrelated runs of the same user and from supervisors that inherit file descriptor 3 without setting `PSGEN_NONCE`.
+The injector generates `PSGEN_NONCE` from 8 random bytes via `getrandom`, or from a PID and clock mix if `getrandom` fails, encoded as hexadecimal.
+Because each re-exec reads `PSGEN_NONCE`, the variable remains in `/proc/PID/environ` for the stub's lifetime.
+Do not treat `PSGEN_NONCE` as a secret or a message authentication code.
 
-What the gate does refuse, measured on the same tree: a named regular file, a
-hardlinked file, a symlink to one, a memfd left at `0777` without the seals, a
-memfd sealed with `SEAL` only, a descriptor owned by another uid, a descriptor
-on FUSE or overlayfs, a mismatched nonce, and a missing nonce. A FIFO, socket or
-device is not acted on either, because `read_config` reads with `pread` and
-fails on a non-seekable object, so the process falls through to the normal
-command line. The setuid and setgid refusal also holds: a root-owned `4755`
-install on a filesystem without `nosuid` exits 2 before reading any config.
+### Staging Directories and Mount-Point Refusal
 
-The conditions above are what the tree implements today. The branch that owns
-the fd-3 rules is re-checking them; when its gate lands, re-measure this
-section against the new conditions.
+The stub writes into and executes from a staging directory only if `safe_temp_dir()` approves the directory.
+`stop` applies the same `safe_temp_dir()` check before calling `sys::remove_staging_dir()`.
 
-## What counts as a vulnerability
+`safe_temp_dir()` requires all of the following conditions:
 
-- A way to make `psgen` signal a process the pidfile does not name, or to
-  execute a binary it was not told to execute.
-- A way to make the stub act on a config descriptor it did not create, without
-  already controlling the uid the stub runs as.
-- A write outside a staging directory that passes the ownership and name rule,
-  or through a path whose metadata does not describe what is under it, such as
-  a bind mount over a staging name.
-- A crash or an abort that leaves live stubs with no record of how to stop
-  them.
-- A symlink, FIFO, socket or device being replaced by a pidfile.
+- The path is absolute.
+- On root runs, the path is not on FUSE or overlayfs.
+- `symlink_metadata` confirms a real directory, not a symlink.
+- `sys::is_mount_point()` confirms the path is not a mount point or bind mount.
+  `sys::is_mount_point()` compares the directory's device ID (`st_dev`) with its parent's device ID and checks `/proc/self/mountinfo`.
+- The directory is owned by the effective UID and is neither group-writable nor world-writable (`mode & 0o022 == 0`).
+- The directory basename matches `.psgen-<digits>-<digits>-<digits>`.
 
-## Residual limits
+`sys::remove_staging_dir()` calls `sys::is_mount_point()` again before removing any directory.
+These checks block bind-mount attacks that mount an arbitrary directory over a `.psgen-<d>-<d>-<d>` path.
 
-These are known and accepted, not unreported defects.
+Because `safe_temp_dir()` checks ownership and naming rather than per-run provenance, two runs under the same UID share the namespace of valid staging directories.
+An attacker who controls the stub's UID, a sealed `memfd` on fd 3, and `PSGEN_NONCE` can target another staging directory owned by that UID with `--disk` writes.
+Even in that scenario, the stub binds only `/proc/self/exe` and never executes an arbitrary path from the configuration.
 
-- The nonce is visible in `/proc/PID/environ` for the process lifetime, so a
-  process that can read that file can replay it. It binds a descriptor to the
-  environment the injector set; it is not a secret.
-- The config memfd carries the size seals but not `F_SEAL_WRITE`, because the
-  stub writes its status record through the same mapping. A descriptor holder
-  that can write the mapping can change the config after it was validated.
-- The staging leaf is validated through its opened descriptor and then executed
-  by path, so a caller who can replace that leaf between the two steps has a
-  time-of-check/time-of-use window. The injector keeps the directory mode at
-  `0700`, which bounds who can do that.
-- `safe_temp_dir` validates the path with `symlink_metadata`, so a symlink is
-  refused, but a bind mount over a `.psgen-<d>-<d>-<d>` name reports the
-  *mounted* filesystem's root as its metadata and passes every arm when that
-  root has the caller's uid, mode `0700` and the right basename. `stop` then
-  calls `remove_dir_all`, which recurses through the mount and deletes what is
-  under it. See the paragraph above.
-- `child_fds` may not name the stub's own config descriptor or fd 3, and a
-  child stub must be at stage 0, so a self-referential config cannot recurse
-  through the same descriptor. A config that names other descriptors can still
-  fork more processes than the injector planned.
-- A failed privilege drop is reported as a deviation, and the stub continues
-  under the uid it already has rather than aborting the run.
-- `psgen` is designed to be spoofed. It does not try to defeat a monitor that
-  compares `/proc` with a source it trusts, and it does not hide its own
-  staging directories.
-- A real FUSE mount was not available in the development environment, so the
-  FUSE branch is exercised through its predicates and through the hardlink and
-  symlink cases rather than a mounted daemon.
+### Staging Leaf Validation
 
-## Reporting
+Before executing a shadow copy (`psgen-stub`), the stub validates the opened file descriptor with `O_NOFOLLOW`:
 
-Open a private security advisory on the repository, or mail the maintainer
-address in `Cargo.toml`. Do not open a public issue for an exploitable report.
-Please include the exact command line, the psgen version, the kernel, and the
-capabilities of the environment (`psgen doctor` is a good summary).
+- `fstat` confirms a regular file with link count 1 (`nlink == 1`).
+- The file is owned by the stub's effective UID.
+- On root runs, the descriptor's filesystem is neither FUSE nor overlayfs.
+
+Hardlinks, symlinks, foreign-owned files, and root-run FUSE or overlayfs files fail this check.
+
+### User Creation (`--create-users`)
+
+When running as root with `--create-users`, `psgen` searches only four fixed absolute paths for `useradd`:
+
+- `/usr/sbin/useradd`
+- `/usr/bin/useradd`
+- `/sbin/useradd`
+- `/run/current-system/sw/bin/useradd`
+
+`psgen` never looks up `useradd` through the caller's `PATH`.
+Before executing `useradd`, `psgen` clears the child environment with `env_clear()` and sets only `PATH=/usr/sbin:/usr/bin:/sbin:/bin` and `LC_ALL=C`.
+
+### Privilege Elevation (`--elevate`)
+
+`--elevate` runs `sudo -n` with the current arguments minus `--elevate`.
+Previews (`--dry-run` and `stop --plan`) never elevate.
+`--elevate` is a convenience for callers who already hold passwordless `sudo` access for `psgen`.
+
+## What Counts as a Vulnerability
+
+Report any of the following defects as security vulnerabilities:
+
+- A method that makes `psgen` signal a process not named in the pidfile or execute an unintended binary.
+- A method that makes the stub accept a configuration descriptor without already controlling the stub's effective UID.
+- A write outside a validated staging directory, or any traversal into a mount point or bind mount.
+- A crash or write failure that leaves live stubs with no pidfile or recovery sidecar to stop the stubs.
+- Replacement of a symlink, FIFO, socket, or device by a pidfile, lock file, or sidecar file.
+
+## Residual Limits
+
+The following limits are known design trade-offs, not unreported defects:
+
+- `PSGEN_NONCE` remains visible in `/proc/PID/environ` for the process lifetime.
+  Any process allowed to read `/proc/PID/environ` can read the run nonce.
+- The configuration `memfd` carries `F_SEAL_SHRINK`, `F_SEAL_GROW`, and `F_SEAL_SEAL`, but omits `F_SEAL_WRITE`.
+  Status records travel over pipe fd 5 (`status_fd`), not over the `memfd`.
+  `inject` omits `F_SEAL_WRITE` only so `set_stage()` can write `stage = 1` at `CFG_STAGE_OFF` on fd 3 before re-exec.
+  A process that already holds a writable descriptor to that `memfd` can modify configuration bytes after validation.
+- The stub validates the shadow leaf (`psgen-stub`) through an opened descriptor and then executes the leaf by path.
+  A caller who can modify files inside the `0700` staging directory between validation and `execve` has a time-of-check/time-of-use window.
+  The `0700` directory mode limits access to the owning UID and root.
+- `child_fds` cannot reference the stub's own configuration descriptor or fd 3, and child stubs must start at stage 0.
+  This prevents recursion through one descriptor, but a crafted configuration with distinct sealed descriptors can fork more processes than the injector planned.
+- A failed privilege drop logs a deviation and lets the stub continue under its current UID rather than aborting the run.
+- `psgen` does not hide its staging directories and does not try to defeat monitors that compare `/proc` against trusted out-of-band records.
+- Development cages lacked a live FUSE daemon, so tests exercise the FUSE checks through predicate unit tests, hardlinks, and symlinks.
+
+## Reporting a Vulnerability
+
+Open a private GitHub Security Advisory on the repository, or send email to Azathothas <AjamX101@gmail.com>.
+Do not open a public GitHub issue for an exploitable security defect.
+
+Include the following details in your report:
+
+- The exact command line.
+- The `psgen` version.
+- The Linux kernel version.
+- The output of `psgen doctor`.
