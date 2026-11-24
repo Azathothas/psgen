@@ -814,7 +814,7 @@ pub fn read_all() -> Vec<Proc> {
             }
         }
     }
-    pids.sort_unstable();
+    crate::json::shell_sort_by(&mut pids, |a, b| a > b);
     let mut rows = Vec::with_capacity(pids.len());
     let mut warned = false;
     for pid in pids {
@@ -840,7 +840,7 @@ pub fn read_pids(pids: &[i32]) -> Vec<Proc> {
     }
     // `ps aux` is PID-ordered, so a caller that diffs or greps by position
     // needs the same order even when the input list is not sorted.
-    rows.sort_unstable_by_key(|p| p.pid);
+    crate::json::shell_sort_by(&mut rows, |a, b| a.pid > b.pid);
     rows
 }
 

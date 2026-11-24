@@ -16,6 +16,170 @@ use std::vec::Vec;
 
 const DEFAULT_DURATION_SHORT: u32 = 120;
 
+fn buf_to_string(b: Buf) -> String {
+    String::from_utf8(b.v).unwrap_or_default()
+}
+
+fn push_os_err(b: &mut Buf, errno: i32) {
+    let e = std::io::Error::from_raw_os_error(errno);
+    b.push_str(&e.to_string());
+}
+
+fn err_with_errno(prefix: &str, errno: i32) -> String {
+    let mut b = Buf::new();
+    b.push_str(prefix);
+    push_os_err(&mut b, errno);
+    buf_to_string(b)
+}
+
+fn close_fds(fds: &[i32]) {
+    for &fd in fds {
+        if fd >= 0 {
+            sys::close(fd);
+        }
+    }
+}
+
+fn remove_dirs(dirs: &[std::path::PathBuf]) {
+    for d in dirs {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+fn sort_dedup_i32(v: &mut Vec<i32>) {
+    const GAPS: [usize; 6] = [57, 23, 10, 4, 1, 0];
+    let n = v.len();
+    for &g in &GAPS {
+        if g == 0 || g >= n {
+            continue;
+        }
+        for i in g..n {
+            let cur = v[i];
+            let mut j = i;
+            while j >= g && v[j - g] > cur {
+                v[j] = v[j - g];
+                j -= g;
+            }
+            v[j] = cur;
+        }
+    }
+    v.dedup();
+}
+
+fn sort_dedup_pid_start(v: &mut Vec<(i32, u64)>) {
+    const GAPS: [usize; 6] = [57, 23, 10, 4, 1, 0];
+    let n = v.len();
+    for &g in &GAPS {
+        if g == 0 || g >= n {
+            continue;
+        }
+        for i in g..n {
+            let cur = v[i];
+            let mut j = i;
+            while j >= g && v[j - g] > cur {
+                v[j] = v[j - g];
+                j -= g;
+            }
+            v[j] = cur;
+        }
+    }
+    v.dedup();
+}
+
+fn open_status_pipe(install_fd5: bool) -> Result<(i32, i32), String> {
+    let mut pfd = [0i32; 2];
+    if let Err(e) = sys::pipe2_checked(&mut pfd, sys::O_CLOEXEC) {
+        return Err(err_with_errno("pipe2: ", e));
+    }
+    for slot in &mut pfd {
+        let need_move = if install_fd5 { *slot == 5 } else { *slot < 6 };
+        if need_move {
+            let n = if install_fd5 {
+                sys::fcntl_dup(*slot, 6)
+            } else {
+                unsafe { libc::fcntl(*slot, libc::F_DUPFD_CLOEXEC, 6) }
+            };
+            if n < 0 {
+                let e = sys::errno();
+                close_fds(&pfd);
+                return Err(err_with_errno("fcntl(F_DUPFD,6): ", e));
+            }
+            sys::close(*slot);
+            *slot = n;
+        }
+    }
+    if install_fd5 {
+        if sys::dup2(pfd[1], 5) != 5 {
+            let e = sys::errno();
+            close_fds(&pfd);
+            return Err(err_with_errno("dup2(status,5): ", e));
+        }
+        if pfd[1] != 5 {
+            sys::close(pfd[1]);
+        }
+        Ok((pfd[0], 5))
+    } else {
+        Ok((pfd[0], pfd[1]))
+    }
+}
+
+fn alloc_sealed_cfg_fds(count: usize, name: &[u8], named: bool) -> Result<Vec<i32>, String> {
+    let mut fds = Vec::with_capacity(count);
+    for _ in 0..count {
+        let raw = if named {
+            sys::anon_sealable_file_named(name, 0)
+        } else {
+            sys::anon_sealable_file(name, 0)
+        };
+        if raw < 0 {
+            let e = sys::errno();
+            close_fds(&fds);
+            let mut b = Buf::new();
+            b.push_str("cannot create the config memfd (");
+            push_os_err(&mut b, e);
+            b.push_str("); a stub only acts on a sealed memfd");
+            return Err(buf_to_string(b));
+        }
+        let fd = if raw < 6 {
+            let n = sys::fcntl_dup(raw, 6);
+            sys::close(raw);
+            n
+        } else {
+            raw
+        };
+        if fd < 0 {
+            let e = sys::errno();
+            close_fds(&fds);
+            let mut b = Buf::new();
+            b.push_str("cannot move the config memfd to a holding descriptor (");
+            push_os_err(&mut b, e);
+            b.push(b')');
+            return Err(buf_to_string(b));
+        }
+        fds.push(fd);
+    }
+    Ok(fds)
+}
+
+fn collect_node_fds(
+    idx: usize,
+    children: &[Vec<usize>],
+    fd_of: &[i32],
+) -> (Vec<i32>, Vec<i32>, i32) {
+    let mut keep = Vec::new();
+    descendants(idx, children, &mut keep);
+    let child_fds: Vec<i32> = children[idx].iter().map(|c| fd_of[*c]).collect();
+    let keep_fds: Vec<i32> = keep.iter().map(|d| fd_of[*d]).collect();
+    let mut max_fd = 5;
+    if idx < fd_of.len() {
+        max_fd = max_fd.max(fd_of[idx]);
+    }
+    for &fd in child_fds.iter().chain(keep_fds.iter()) {
+        max_fd = max_fd.max(fd);
+    }
+    (child_fds, keep_fds, max_fd)
+}
+
 /// How `/proc/PID/exe` is made to look right, best tier first.
 #[derive(Clone, Copy, PartialEq)]
 pub enum ExeTier {
@@ -139,10 +303,11 @@ pub fn prepare(rows: &mut [Proc], args: &Args, create_users: bool) -> Prep {
     let switch_users = args.user && !args.no_root;
 
     if switch_users && !root {
-        warnings.push(format!(
-            "user switching needs root; running as {} (use sudo, --elevate, or --no-root)",
-            String::from_utf8_lossy(&me.name)
-        ));
+        let mut b = Buf::new();
+        b.push_str("user switching needs root; running as ");
+        b.push_bytes(&me.name);
+        b.push_str(" (use sudo, --elevate, or --no-root)");
+        warnings.push(buf_to_string(b));
     }
     if args.no_root && args.user {
         warnings.push(
@@ -285,14 +450,18 @@ pub fn prepare(rows: &mut [Proc], args: &Args, create_users: bool) -> Prep {
             let floor = 4096u64;
             let base = floor.saturating_mul(rows.len() as u64);
             if base >= cap {
-                warnings.push(format!(
-                    "--mem-cap {} MiB is at or below the {} MiB floor of {} {}; the reported RSS will be at least {} MiB",
-                    args.mem_cap_mb,
-                    base / 1024,
-                    rows.len(),
-                    if rows.len() == 1 { "stub" } else { "stubs" },
-                    base / 1024
-                ));
+                let mut b = Buf::new();
+                b.push_str("--mem-cap ");
+                b.push_u64(args.mem_cap_mb);
+                b.push_str(" MiB is at or below the ");
+                b.push_u64(base / 1024);
+                b.push_str(" MiB floor of ");
+                b.push_u64(rows.len() as u64);
+                b.push_str(if rows.len() == 1 { " stub" } else { " stubs" });
+                b.push_str("; the reported RSS will be at least ");
+                b.push_u64(base / 1024);
+                b.push_str(" MiB");
+                warnings.push(buf_to_string(b));
                 for p in rows.iter_mut() {
                     p.rss = floor;
                 }
@@ -323,11 +492,13 @@ pub fn prepare(rows: &mut [Proc], args: &Args, create_users: bool) -> Prep {
                     p.rss = 0;
                 }
             } else if max > cap_kb {
-                warnings.push(format!(
-                    "RLIMIT_FSIZE is {} MiB; RSS targets capped at {} MiB",
-                    limit / 1024 / 1024,
-                    cap_kb / 1024
-                ));
+                let mut b = Buf::new();
+                b.push_str("RLIMIT_FSIZE is ");
+                b.push_u64(limit / 1024 / 1024);
+                b.push_str(" MiB; RSS targets capped at ");
+                b.push_u64(cap_kb / 1024);
+                b.push_str(" MiB");
+                warnings.push(buf_to_string(b));
                 let v = cap_kb / page * page;
                 for p in rows.iter_mut() {
                     if p.rss > v {
@@ -361,10 +532,13 @@ pub fn prepare(rows: &mut [Proc], args: &Args, create_users: bool) -> Prep {
         if budget > 0 && phys_estimate_kb > budget {
             // Integer MiB truncation made this sentence compare 30 with 30
             // when the gap was below 1 MiB. KiB shows the actual difference.
-            warnings.push(format!(
-                "the estimated physical cost is about {} KiB, above the {} KiB budget",
-                phys_estimate_kb, budget
-            ));
+            let mut b = Buf::new();
+            b.push_str("the estimated physical cost is about ");
+            b.push_u64(phys_estimate_kb);
+            b.push_str(" KiB, above the ");
+            b.push_u64(budget);
+            b.push_str(" KiB budget");
+            warnings.push(buf_to_string(b));
         }
     }
 
@@ -453,14 +627,15 @@ pub fn prepare(rows: &mut [Proc], args: &Args, create_users: bool) -> Prep {
         ExeTier::ProcSelf
     };
     if tier == ExeTier::ProcSelf && !args.no_exe && !args.no_root {
-        warnings.push(format!(
-            "cannot bind the template path here ({}); /proc/PID/exe will point at psgen",
-            if !caps.mount_ns {
-                "mount namespaces denied"
-            } else {
-                "the bind was denied"
-            }
-        ));
+        let mut b = Buf::new();
+        b.push_str("cannot bind the template path here (");
+        b.push_str(if !caps.mount_ns {
+            "mount namespaces denied"
+        } else {
+            "the bind was denied"
+        });
+        b.push_str("); /proc/PID/exe will point at psgen");
+        warnings.push(buf_to_string(b));
     }
 
     Prep {
@@ -531,20 +706,7 @@ fn make_config(
 ) -> stub::Config {
     let bind = run.bind;
     let p = &rows[row];
-    let mut keep = Vec::new();
-    descendants(row, children, &mut keep);
-    let child_fds: Vec<i32> = children[row].iter().map(|c| fd_of[*c]).collect();
-    let keep_fds: Vec<i32> = keep.iter().map(|d| fd_of[*d]).collect();
-    let mut max_fd = 5;
-    if row < fd_of.len() {
-        max_fd = max_fd.max(fd_of[row]);
-    }
-    for fd in &child_fds {
-        max_fd = max_fd.max(*fd);
-    }
-    for fd in &keep_fds {
-        max_fd = max_fd.max(*fd);
-    }
+    let (child_fds, keep_fds, max_fd) = collect_node_fds(row, children, fd_of);
     let disk_kb = args
         .disk_mb
         .unwrap_or(0)
@@ -583,6 +745,17 @@ fn make_config(
         arena_fd: if p.rss > 0 { 4 } else { -1 },
         status_fd: 5,
         id: row as u32,
+        cwd: Vec::new(),
+        env_block: Vec::new(),
+        memfd_label: Vec::new(),
+        decoy_token: Vec::new(),
+        thread_comms: Vec::new(),
+        fd_specs: Vec::new(),
+        wchan_mode: 0,
+        seccomp_filters: 0,
+        jitter_ms: 0,
+        vm_lck_kb: 0,
+        rss_shmem_kb: 0,
     }
 }
 
@@ -697,8 +870,7 @@ fn pidfile_body(pids: &[i32], temps: &[std::path::PathBuf], nonce: &[u8]) -> Opt
         buf.push(b'\n');
     }
     let mut sorted = pids.to_vec();
-    sorted.sort_unstable();
-    sorted.dedup();
+    sort_dedup_i32(&mut sorted);
     for pid in &sorted {
         let st = live::read_starttime(*pid).unwrap_or(0);
         let comm = live::read_comm(*pid).unwrap_or_default();
@@ -723,11 +895,13 @@ fn pidfile_body(pids: &[i32], temps: &[std::path::PathBuf], nonce: &[u8]) -> Opt
 /// bare header, and the same length is what the preflight proves can be
 /// written.
 fn pending_nonce() -> Vec<u8> {
-    format!(
-        "{:016x}",
-        sys::monotonic_ns() ^ ((sys::getpid() as u64) << 32)
-    )
-    .into_bytes()
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let v = sys::monotonic_ns() ^ ((sys::getpid() as u64) << 32);
+    let mut out = Vec::with_capacity(16);
+    for shift in (0..64).step_by(4).rev() {
+        out.push(HEX[((v >> shift) & 0x0f) as usize]);
+    }
+    out
 }
 
 /// The exact size of the pending pidfile, for the preflight probe.
@@ -748,6 +922,13 @@ pub fn estimated_pidfile_bytes(row_count: usize, temp_count: usize, tmpdir_len: 
 
 pub fn write_pending_pidfile(path: &[u8]) -> bool {
     write_pidfile(path, &[], &[], &pending_nonce()).0
+}
+
+/// Write a standard 3-field pidfile (`pid\tstarttime\tcomm`) for externally
+/// spawned decoy PIDs so `psgen stop --pidfile` can clean them up cleanly.
+pub fn write_external_pidfile(path: &[u8], pids: &[i32]) -> bool {
+    let nonce = random_hex(8);
+    write_pidfile(path, pids, &[], &nonce).0
 }
 
 /// Write the pidfile, falling back to shorter temporary names when the target
@@ -908,9 +1089,13 @@ pub fn write_pid_sidecar(
     } else {
         nonce.to_vec()
     };
-    let tag_str = String::from_utf8_lossy(&tag);
-    let fallback =
-        std::env::temp_dir().join(format!("psgen-spawned-{}-{}.pid", sys::getpid(), tag_str));
+    let mut fb_name = Buf::new();
+    fb_name.push_str("psgen-spawned-");
+    fb_name.push_u64(sys::getpid() as u64);
+    fb_name.push(b'-');
+    fb_name.push_bytes(&tag);
+    fb_name.push_str(".pid");
+    let fallback = std::env::temp_dir().join(std::ffi::OsStr::from_bytes(fb_name.as_bytes()));
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -958,26 +1143,26 @@ pub fn pid_ns_inode() -> u64 {
 /// the run that wrote it, so a marker from an older run in the same namespace
 /// is not mistaken for the current one.
 pub fn marker_line(pid: i32, start: u64, boot: &[u8], nonce: &[u8]) -> Vec<u8> {
-    let mut line = Vec::new();
-    line.extend_from_slice(pid.to_string().as_bytes());
+    let mut line = Buf::new();
+    line.push_u64(pid as u64);
     line.push(b' ');
-    line.extend_from_slice(start.to_string().as_bytes());
+    line.push_u64(start);
     line.push(b' ');
-    line.extend_from_slice(pid_ns_inode().to_string().as_bytes());
+    line.push_u64(pid_ns_inode());
     line.push(b' ');
     if boot.is_empty() {
         line.push(b'-');
     } else {
-        line.extend_from_slice(boot);
+        line.push_bytes(boot);
     }
     line.push(b' ');
     if nonce.is_empty() {
         line.push(b'-');
     } else {
-        line.extend_from_slice(nonce);
+        line.push_bytes(nonce);
     }
     line.push(b'\n');
-    line
+    line.v
 }
 
 /// Append marker lines to `dir`'s file, never truncating it.
@@ -1097,8 +1282,16 @@ fn make_temp_dir(idx: usize, nonce: &[u8]) -> Option<std::path::PathBuf> {
 fn make_temp_dir_in(base: &Path, idx: usize, nonce: &[u8]) -> Option<std::path::PathBuf> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     let _ = std::fs::create_dir_all(base);
+    let mut name = Buf::new();
     for i in 0..100 {
-        let p = base.join(format!(".psgen-{}-{}-{}", sys::getpid(), idx, i));
+        name.v.clear();
+        name.push_str(".psgen-");
+        name.push_u64(sys::getpid() as u64);
+        name.push(b'-');
+        name.push_u64(idx as u64);
+        name.push(b'-');
+        name.push_u64(i);
+        let p = base.join(std::ffi::OsStr::from_bytes(name.as_bytes()));
         let made = std::fs::DirBuilder::new().mode(0o700).create(&p).is_ok();
         if !made {
             continue;
@@ -1426,10 +1619,11 @@ pub fn spawn(rows: &[Proc], args: &Args, prep: &Prep) -> Result<SpawnResult, Str
             .expect("an exe tier of shadow needs a shadow root");
         let made = make_temp_dir_in(Path::new(std::ffi::OsStr::from_bytes(dir)), 9_000, &nonce)
             .ok_or_else(|| {
-                format!(
-                    "cannot create a directory in {} for --shadow-dir",
-                    String::from_utf8_lossy(dir)
-                )
+                let mut b = Buf::new();
+                b.push_str("cannot create a directory in ");
+                b.push_bytes(dir);
+                b.push_str(" for --shadow-dir");
+                buf_to_string(b)
             });
         let copied = made.and_then(|d| {
             let dst = d.join("psgen-stub");
@@ -1441,11 +1635,12 @@ pub fn spawn(rows: &[Proc], args: &Args, prep: &Prep) -> Result<SpawnResult, Str
                 }
                 Err(e) => {
                     let _ = std::fs::remove_dir_all(&d);
-                    Err(format!(
-                        "cannot copy the stub into {}: {}",
-                        String::from_utf8_lossy(dir),
-                        e
-                    ))
+                    let mut b = Buf::new();
+                    b.push_str("cannot copy the stub into ");
+                    b.push_bytes(dir);
+                    b.push_str(": ");
+                    b.push_str(&e.to_string());
+                    Err(buf_to_string(b))
                 }
             }
         });
@@ -1482,19 +1677,21 @@ pub fn spawn(rows: &[Proc], args: &Args, prep: &Prep) -> Result<SpawnResult, Str
                 let _ = std::fs::remove_dir_all(d);
             }
             let e = sys::errno();
-            return Err(format!(
-                "cannot create the RSS arena ({} KiB): {}",
-                max_rss,
-                std::io::Error::from_raw_os_error(e)
-            ));
+            let mut b = Buf::new();
+            b.push_str("cannot create the RSS arena (");
+            b.push_u64(max_rss);
+            b.push_str(" KiB): ");
+            push_os_err(&mut b, e);
+            return Err(buf_to_string(b));
         }
         let target = sys::dup2(fd, 4);
         if target != 4 {
+            let e = sys::errno();
             sys::close(fd);
             if let Some(d) = &shadow_dir {
                 let _ = std::fs::remove_dir_all(d);
             }
-            return Err(format!("dup2(arena,4): {}", sys::last_error()));
+            return Err(err_with_errno("dup2(arena,4): ", e));
         }
         if fd != 4 {
             sys::close(fd);
@@ -1502,69 +1699,18 @@ pub fn spawn(rows: &[Proc], args: &Args, prep: &Prep) -> Result<SpawnResult, Str
         arena_fd = 4;
     }
 
-    let mut pfd = [0i32; 2];
-    if let Err(e) = sys::pipe2_checked(&mut pfd, sys::O_CLOEXEC) {
-        if arena_fd >= 0 {
-            sys::close(arena_fd);
-        }
-        if let Some(d) = &shadow_dir {
-            let _ = std::fs::remove_dir_all(d);
-        }
-        return Err(format!("pipe2: {}", std::io::Error::from_raw_os_error(e)));
-    }
-    if pfd[0] == 5 {
-        let n = sys::fcntl_dup(pfd[0], 6);
-        if n < 0 {
-            sys::close(pfd[0]);
-            sys::close(pfd[1]);
+    let (status_read, _) = match open_status_pipe(true) {
+        Ok(pair) => pair,
+        Err(e) => {
             if arena_fd >= 0 {
                 sys::close(arena_fd);
             }
             if let Some(d) = &shadow_dir {
                 let _ = std::fs::remove_dir_all(d);
             }
-            let e = sys::errno();
-            return Err(format!(
-                "fcntl(F_DUPFD,6): {}",
-                std::io::Error::from_raw_os_error(e)
-            ));
+            return Err(e);
         }
-        sys::close(pfd[0]);
-        pfd[0] = n;
-    }
-    // dup2 onto the same descriptor is a no-op and leaves O_CLOEXEC set, so
-    // move the write end off 5 before it is installed for the stub.
-    if pfd[1] == 5 {
-        let n = sys::fcntl_dup(pfd[1], 6);
-        if n < 0 {
-            sys::close(pfd[0]);
-            sys::close(pfd[1]);
-            if arena_fd >= 0 {
-                sys::close(arena_fd);
-            }
-            if let Some(d) = &shadow_dir {
-                let _ = std::fs::remove_dir_all(d);
-            }
-            let e = sys::errno();
-            return Err(format!(
-                "fcntl(F_DUPFD,6): {}",
-                std::io::Error::from_raw_os_error(e)
-            ));
-        }
-        sys::close(pfd[1]);
-        pfd[1] = n;
-    }
-    if sys::dup2(pfd[1], 5) != 5 {
-        let e = sys::errno();
-        return Err(format!(
-            "dup2(status,5): {}",
-            std::io::Error::from_raw_os_error(e)
-        ));
-    }
-    if pfd[1] != 5 {
-        sys::close(pfd[1]);
-    }
-    let status_read = pfd[0];
+    };
 
     // Orphaned stub children reparent to this process, so --wait can reap
     // them instead of leaving zombies under PID 1.
@@ -1583,52 +1729,16 @@ pub fn spawn(rows: &[Proc], args: &Args, prep: &Prep) -> Result<SpawnResult, Str
     for root in roots {
         let mut nodes = Vec::new();
         subtree(root, &children, &mut nodes);
+        let cfg_fds = match alloc_sealed_cfg_fds(nodes.len(), b"cfg", false) {
+            Ok(fds) => fds,
+            Err(e) => {
+                remove_dirs(&all_temps);
+                return Err(e);
+            }
+        };
         let mut fd_of = vec![0i32; rows.len()];
-        let mut cfg_fds: Vec<i32> = Vec::with_capacity(nodes.len());
-        let mut refusal: Option<String> = None;
-        for node in &nodes {
-            // The config is a sealed memfd, and only a sealed memfd is acted
-            // on. There is no unlinked fallback: a temporary file cannot be
-            // sealed, so its holder could rewrite it between the stub's check
-            // and its use, and a descriptor an unprivileged caller opened is
-            // the shape a forged config has. A kernel that refuses
-            // `memfd_create` cannot feed a stub, so the run refuses rather than
-            // handing one a config nothing may act on.
-            let fd = sys::anon_sealable_file(b"cfg", 0);
-            if fd < 0 {
-                let e = sys::errno();
-                refusal = Some(format!(
-                    "cannot create the config memfd ({}); a stub only acts on a sealed memfd",
-                    std::io::Error::from_raw_os_error(e)
-                ));
-                break;
-            }
-            let fd = if fd < 6 {
-                let n = sys::fcntl_dup(fd, 6);
-                sys::close(fd);
-                n
-            } else {
-                fd
-            };
-            if fd < 0 {
-                let e = sys::errno();
-                refusal = Some(format!(
-                    "cannot move the config memfd to a holding descriptor ({})",
-                    std::io::Error::from_raw_os_error(e)
-                ));
-                break;
-            }
-            fd_of[*node] = fd;
-            cfg_fds.push(fd);
-        }
-        if refusal.is_some() {
-            for fd in &cfg_fds {
-                sys::close(*fd);
-            }
-            for t in &all_temps {
-                let _ = std::fs::remove_dir_all(t);
-            }
-            return Err(refusal.unwrap_or_default());
+        for (&node, &fd) in nodes.iter().zip(cfg_fds.iter()) {
+            fd_of[node] = fd;
         }
         let mut failed = false;
         let mut root_temps: Vec<std::path::PathBuf> = Vec::new();
@@ -1675,12 +1785,8 @@ pub fn spawn(rows: &[Proc], args: &Args, prep: &Prep) -> Result<SpawnResult, Str
             }
         }
         if failed {
-            for fd in &cfg_fds {
-                sys::close(*fd);
-            }
-            for t in &root_temps {
-                let _ = std::fs::remove_dir_all(t);
-            }
+            close_fds(&cfg_fds);
+            remove_dirs(&root_temps);
             continue;
         }
         all_temps.extend(root_temps.iter().cloned());
@@ -1715,9 +1821,7 @@ pub fn spawn(rows: &[Proc], args: &Args, prep: &Prep) -> Result<SpawnResult, Str
             // and is the identity `--wait` checks.
             root_pids.push((pid, live::read_starttime(pid).unwrap_or(0)));
         }
-        for fd in &cfg_fds {
-            sys::close(*fd);
-        }
+        close_fds(&cfg_fds);
     }
 
     sys::close(5);
@@ -2304,25 +2408,43 @@ pub fn live_pidfile_rows(path: &[u8]) -> Option<usize> {
 /// The pidfile does not store a parent, so the depth is read from `/proc`. A
 /// row whose parent is not in the pidfile is a root. The walk is bounded so a
 /// corrupted `/proc` cannot loop.
-fn stop_depths(lines: &[StopLine]) -> std::collections::BTreeMap<i32, usize> {
-    let mut depths = std::collections::BTreeMap::new();
-    for line in lines {
-        let mut depth = 0usize;
-        let mut cur = line.pid;
-        for _ in 0..64 {
-            let ppid = match live::read_stat(cur) {
-                Some(s) => s.ppid as i32,
-                None => break,
-            };
-            if ppid <= 1 || !lines.iter().any(|l| l.pid == ppid) {
-                break;
-            }
-            depth += 1;
-            cur = ppid;
+fn stop_depth_of(pid: i32, lines: &[StopLine]) -> usize {
+    let mut depth = 0usize;
+    let mut cur = pid;
+    for _ in 0..64 {
+        let ppid = match live::read_stat(cur) {
+            Some(s) => s.ppid as i32,
+            None => break,
+        };
+        if ppid <= 1 || !lines.iter().any(|l| l.pid == ppid) {
+            break;
         }
-        depths.insert(line.pid, depth);
+        depth += 1;
+        cur = ppid;
     }
-    depths
+    depth
+}
+
+fn sort_stop_lines(lines: &mut [StopLine]) {
+    let mut keys: Vec<(usize, i32)> = lines
+        .iter()
+        .map(|l| (stop_depth_of(l.pid, lines), l.pid))
+        .collect();
+    const GAPS: [usize; 6] = [57, 23, 10, 4, 1, 0];
+    let n = lines.len();
+    for &g in &GAPS {
+        if g == 0 || g >= n {
+            continue;
+        }
+        for i in g..n {
+            let mut j = i;
+            while j >= g && keys[j - g] < keys[j] {
+                keys.swap(j - g, j);
+                lines.swap(j - g, j);
+                j -= g;
+            }
+        }
+    }
 }
 
 /// Stop (or, with `plan`, describe) every process a pidfile names.
@@ -2346,12 +2468,13 @@ pub fn stop(path: &[u8], force: bool, plan: bool, quiet: bool) -> i32 {
             // print the same bytes, so a caller could not tell a stale
             // pidfile from a permissions problem. Name both the path and the
             // errno; the exit status stays 1 for every read failure.
-            let msg = format!(
-                "psgen: cannot read pidfile {}: {}\n",
-                String::from_utf8_lossy(path),
-                e
-            );
-            sys::err(msg.as_bytes());
+            let mut out = Buf::new();
+            out.push_str("psgen: cannot read pidfile ");
+            out.push_bytes(path);
+            out.push_str(": ");
+            out.push_str(&e.to_string());
+            out.push(b'\n');
+            sys::err(out.as_bytes());
             return 1;
         }
     };
@@ -2443,13 +2566,7 @@ pub fn stop(path: &[u8], force: bool, plan: bool, quiet: bool) -> i32 {
     // their own lines are reached. Sorting by depth gives every line its own
     // signal even when a PID wrap makes a child's number lower than its
     // parent's.
-    let depths = stop_depths(&lines);
-    lines.sort_unstable_by_key(|l| {
-        (
-            std::cmp::Reverse(depths.get(&l.pid).copied().unwrap_or(0)),
-            std::cmp::Reverse(l.pid),
-        )
-    });
+    sort_stop_lines(&mut lines);
 
     let mut signalled: Vec<(i32, u64)> = Vec::new();
     // The distinct PIDs a line named, so `plan` counts processes rather than
@@ -2493,9 +2610,10 @@ pub fn stop(path: &[u8], force: bool, plan: bool, quiet: bool) -> i32 {
         if info.is_none() {
             // Gone, or unreadable. A PID that still has a /proc entry but
             // cannot be inspected is a failure, not a successful stop.
-            let mut procpath = b"/proc/".to_vec();
-            procpath.extend_from_slice(pid.to_string().as_bytes());
-            if Path::new(std::ffi::OsStr::from_bytes(&procpath)).exists() {
+            let mut procpath = Buf::new();
+            procpath.push_str("/proc/");
+            procpath.push_u64(pid as u64);
+            if Path::new(std::ffi::OsStr::from_bytes(procpath.as_bytes())).exists() {
                 failed += 1;
                 note(quiet, b"cannot read", pid, Some(b"/proc entry unreadable"));
             } else {
@@ -2672,8 +2790,7 @@ pub fn stop(path: &[u8], force: bool, plan: bool, quiet: bool) -> i32 {
     // reach children whose own lines follow. Counting signals therefore counts
     // the same process more than once; dedupe by PID so the summary is a count
     // of processes.
-    signalled.sort_unstable();
-    signalled.dedup();
+    sort_dedup_pid_start(&mut signalled);
     let mut stopped = 0usize;
     if !plan && !signalled.is_empty() {
         // A `SIGKILL` returns before the process has exited, and a zombie is
@@ -2750,6 +2867,1091 @@ pub fn stop(path: &[u8], force: bool, plan: bool, quiet: bool) -> i32 {
     } else {
         0
     }
+}
+
+/// Tree node specification for spawning matched decoy processes.
+#[derive(Clone, Default)]
+#[cfg_attr(test, derive(Debug))]
+pub struct DecoyNodeSpec {
+    pub comm: Vec<u8>,
+    pub argv: Vec<Vec<u8>>,
+    pub cmdline_raw_nuls: Option<usize>,
+    pub exe: Vec<u8>,
+    pub exe_memfd: bool,
+    pub memfd_label: Vec<u8>,
+    pub cwd: Vec<u8>,
+    pub uid: u32,
+    pub gid: u32,
+    pub user: Vec<u8>,
+    pub rss_kb: u32,
+    pub vsz_kb: u32,
+    pub vm_lck_kb: u32,
+    pub rss_shmem_kb: u32,
+    pub environ: Vec<Vec<u8>>,
+    pub thread_comms: Vec<Vec<u8>>,
+    pub fd_specs: Vec<(i32, Vec<u8>)>,
+    pub wchan_mode: u8,
+    pub non_dumpable: bool,
+    pub no_new_privs: bool,
+    pub seccomp_filters: u8,
+    pub ptrace_children: bool,
+    pub decoy_token: Vec<u8>,
+    pub jitter_ms: u32,
+    pub children: Vec<DecoyNodeSpec>,
+}
+
+/// Spawn options for `spawn_decoy_trees` and `spawn_interleaved_target`.
+#[derive(Clone)]
+#[cfg_attr(test, derive(Debug))]
+pub struct DecoySpawnOpts {
+    pub duration: u32,
+    pub pidfile: Option<Vec<u8>>,
+    pub clean_env: bool,
+    pub jitter_ms: u32,
+    pub churn: u32,
+    pub seed: u64,
+    pub quiet: bool,
+    pub wait: bool,
+    pub bind_exe: bool,
+}
+
+impl Default for DecoySpawnOpts {
+    fn default() -> Self {
+        Self {
+            duration: 0,
+            pidfile: None,
+            clean_env: true,
+            jitter_ms: 0,
+            churn: 0,
+            seed: 1234,
+            quiet: true,
+            wait: false,
+            bind_exe: false,
+        }
+    }
+}
+
+/// Parse a symbolic `--wchan` mode name into the numeric `stub::Config::wchan_mode`.
+pub fn parse_wchan_mode(name: &str) -> Option<u8> {
+    if name.eq_ignore_ascii_case("pause") {
+        Some(0)
+    } else if name.eq_ignore_ascii_case("epoll") || name.eq_ignore_ascii_case("epoll_wait") {
+        Some(1)
+    } else if name.eq_ignore_ascii_case("poll") {
+        Some(2)
+    } else if name.eq_ignore_ascii_case("nanosleep") || name.eq_ignore_ascii_case("sleep") {
+        Some(3)
+    } else if name.eq_ignore_ascii_case("futex") {
+        Some(4)
+    } else if name.eq_ignore_ascii_case("read") || name.eq_ignore_ascii_case("pipe_read") {
+        Some(5)
+    } else {
+        None
+    }
+}
+
+fn contains_ascii_ci(hay: &str, needle: &str) -> bool {
+    let h = hay.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() || n.len() > h.len() {
+        return n.is_empty();
+    }
+    h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+}
+
+fn wchan_mode_from_profile(wchan: &str, syscall: &str) -> u8 {
+    if contains_ascii_ci(wchan, "ep_poll")
+        || contains_ascii_ci(wchan, "epoll")
+        || contains_ascii_ci(syscall, "epoll")
+    {
+        1
+    } else if contains_ascii_ci(wchan, "poll")
+        || syscall.eq_ignore_ascii_case("poll")
+        || syscall.eq_ignore_ascii_case("ppoll")
+        || contains_ascii_ci(syscall, "select")
+    {
+        2
+    } else if contains_ascii_ci(wchan, "nanosleep")
+        || contains_ascii_ci(wchan, "hrtimer")
+        || contains_ascii_ci(syscall, "nanosleep")
+    {
+        3
+    } else if contains_ascii_ci(wchan, "futex") || contains_ascii_ci(syscall, "futex") {
+        4
+    } else if contains_ascii_ci(wchan, "pipe_read") || syscall.eq_ignore_ascii_case("read") {
+        5
+    } else {
+        0
+    }
+}
+
+fn clamp_no_nul(src: &[u8], cap: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(src.len().min(cap));
+    for &b in src {
+        if b == 0 {
+            continue;
+        }
+        if out.len() >= cap {
+            break;
+        }
+        out.push(b);
+    }
+    out
+}
+
+fn push_nul_bounded(buf: &mut Vec<u8>, entry: &[u8], cap: usize) -> bool {
+    let clean_len = entry.iter().filter(|&&b| b != 0).count();
+    if buf.len().saturating_add(clean_len).saturating_add(1) > cap {
+        return false;
+    }
+    for &b in entry {
+        if b != 0 {
+            buf.push(b);
+        }
+    }
+    buf.push(0);
+    true
+}
+
+fn serialize_cmd(argv: &[Vec<u8>], comm: &[u8], raw_nuls: Option<usize>) -> Vec<u8> {
+    const CAP: usize = 4096;
+    let mut out = Vec::new();
+    if argv.is_empty() {
+        let fallback = if comm.is_empty() { b"worker" } else { comm };
+        let _ = push_nul_bounded(&mut out, fallback, CAP);
+    } else {
+        for arg in argv {
+            if !push_nul_bounded(&mut out, arg, CAP) {
+                break;
+            }
+        }
+        if out.is_empty() {
+            let fallback = if comm.is_empty() { b"worker" } else { comm };
+            let _ = push_nul_bounded(&mut out, fallback, CAP);
+        }
+    }
+    if let Some(want_nuls) = raw_nuls {
+        let cur_nuls = out.iter().rev().take_while(|&&b| b == 0).count();
+        let extra = want_nuls.saturating_sub(cur_nuls);
+        for _ in 0..extra {
+            if out.len() >= CAP {
+                break;
+            }
+            out.push(0);
+        }
+    }
+    out
+}
+
+fn serialize_env_block(env: &[Vec<u8>]) -> Vec<u8> {
+    const CAP: usize = 65536;
+    let mut out = Vec::new();
+    for item in env {
+        if item.starts_with(b"PSGEN_NONCE=") {
+            continue;
+        }
+        if item.is_empty() {
+            continue;
+        }
+        if !push_nul_bounded(&mut out, item, CAP) {
+            break;
+        }
+    }
+    out
+}
+
+fn serialize_thread_comms(comms: &[Vec<u8>]) -> Vec<u8> {
+    const CAP: usize = 4096;
+    let mut out = Vec::new();
+    for comm in comms.iter().take(64) {
+        let trimmed = clamp_no_nul(comm, 15);
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !push_nul_bounded(&mut out, &trimmed, CAP) {
+            break;
+        }
+    }
+    out
+}
+
+fn serialize_fd_specs(specs: &[(i32, Vec<u8>)]) -> Vec<u8> {
+    const CAP: usize = 16384;
+    let mut out = Vec::new();
+    let mut line = Buf::new();
+    for (fd, kind) in specs {
+        if *fd < 0 || *fd > 1024 || kind.is_empty() {
+            continue;
+        }
+        line.v.clear();
+        line.push_u64(*fd as u64);
+        line.push(b':');
+        line.push_bytes(kind);
+        if !push_nul_bounded(&mut out, line.as_bytes(), CAP) {
+            break;
+        }
+    }
+    out
+}
+
+fn profile_tree_has_token(p: &crate::profile::Profile) -> bool {
+    p.memory.token_present || p.children.iter().any(profile_tree_has_token)
+}
+
+fn map_profile_fd_kind(fd: i32, target: &str) -> Option<Vec<u8>> {
+    if !(0..=1024).contains(&fd) {
+        return None;
+    }
+    if target == "/dev/null" {
+        Some(b"null".to_vec())
+    } else if target.starts_with("pipe:") {
+        Some(b"pipe".to_vec())
+    } else if target.starts_with("socket:") {
+        Some(b"socket".to_vec())
+    } else if target.contains("eventfd") {
+        Some(b"eventfd".to_vec())
+    } else if let Some(rest) = target.strip_prefix("/memfd:") {
+        let lbl = rest.strip_suffix(" (deleted)").unwrap_or(rest);
+        let clean = clamp_no_nul(lbl.as_bytes(), 64);
+        let mut kind = b"memfd:".to_vec();
+        if clean.is_empty() {
+            kind.extend_from_slice(b"anon");
+        } else {
+            kind.extend_from_slice(&clean);
+        }
+        Some(kind)
+    } else if fd <= 2 {
+        Some(b"null".to_vec())
+    } else {
+        None
+    }
+}
+
+/// Convert a captured or parsed `Profile` tree into a `DecoyNodeSpec` tree at
+/// the requested fidelity `level` (1..=6).
+pub fn profile_to_decoy_tree(
+    p: &crate::profile::Profile,
+    level: u8,
+    decoy_token: Option<&[u8]>,
+    jitter_ms: u32,
+) -> DecoyNodeSpec {
+    profile_to_decoy_inner(
+        p,
+        level,
+        decoy_token,
+        jitter_ms,
+        true,
+        profile_tree_has_token(p),
+    )
+}
+
+fn profile_to_decoy_inner(
+    p: &crate::profile::Profile,
+    level: u8,
+    decoy_token: Option<&[u8]>,
+    jitter_ms: u32,
+    is_root: bool,
+    tree_has_tok: bool,
+) -> DecoyNodeSpec {
+    let raw_comm = if !p.identity.comm.is_empty() {
+        p.identity.comm.as_bytes()
+    } else if !p.status.name.is_empty() {
+        p.status.name.as_bytes()
+    } else {
+        b"worker"
+    };
+    let comm = clamp_no_nul(raw_comm, 15);
+    let mut argv: Vec<Vec<u8>> = Vec::with_capacity(p.identity.argv.len().max(1));
+    for a in &p.identity.argv {
+        argv.push(a.as_bytes().to_vec());
+    }
+    if argv.is_empty() {
+        argv.push(comm.clone());
+    }
+    let user = users::lookup_uid(p.identity.uid)
+        .map(|(n, _)| n)
+        .unwrap_or_else(|| {
+            if p.identity.uid == sys::geteuid() {
+                util::current_user().name
+            } else {
+                Vec::new()
+            }
+        });
+
+    let mut spec = DecoyNodeSpec {
+        comm: comm.clone(),
+        argv,
+        cmdline_raw_nuls: p.identity.cmdline_raw_nuls,
+        uid: p.identity.uid,
+        gid: p.identity.gid,
+        user,
+        rss_kb: 0,
+        vsz_kb: 0,
+        jitter_ms: if is_root { jitter_ms } else { 0 },
+        ..DecoyNodeSpec::default()
+    };
+
+    if level >= 3 {
+        // Exclude the main thread (tid == pid) so the spawned extra threads
+        // plus main thread yield the exact thread count N (not N+1).
+        let mut extras: Vec<Vec<u8>> = Vec::new();
+        let has_main = p.task.iter().any(|t| t.tid == p.identity.pid);
+        for (i, t) in p.task.iter().enumerate() {
+            if (has_main && t.tid == p.identity.pid) || (!has_main && i == 0) {
+                continue;
+            }
+            extras.push(if t.comm.is_empty() {
+                comm.clone()
+            } else {
+                clamp_no_nul(t.comm.as_bytes(), 15)
+            });
+        }
+        if extras.is_empty() {
+            let total_threads = p.status.threads.max(p.stat.num_threads);
+            if total_threads > 1 {
+                extras.resize((total_threads - 1).min(64) as usize, comm.clone());
+            }
+        }
+        spec.thread_comms = extras;
+
+        spec.children.reserve(p.children.len());
+        for c in &p.children {
+            spec.children.push(profile_to_decoy_inner(
+                c,
+                level,
+                decoy_token,
+                0,
+                false,
+                tree_has_tok,
+            ));
+        }
+    }
+
+    if level >= 4 {
+        let memfd_src = p
+            .identity
+            .exe_memfd
+            .as_deref()
+            .or_else(|| p.identity.exe.strip_prefix("/memfd:"));
+        if let Some(raw) = memfd_src {
+            let s = raw.strip_prefix("/memfd:").unwrap_or(raw);
+            let s = s.strip_suffix(" (deleted)").unwrap_or(s);
+            spec.exe_memfd = true;
+            spec.memfd_label = clamp_no_nul(s.as_bytes(), 240);
+        } else if p.identity.exe.starts_with('/') && p.identity.exe != "<redacted>" {
+            spec.exe = clamp_no_nul(p.identity.exe.as_bytes(), 4096);
+        }
+
+        if p.identity.cwd.starts_with('/') && p.identity.cwd != "<redacted>" {
+            spec.cwd = clamp_no_nul(p.identity.cwd.as_bytes(), 4096);
+        }
+
+        for e in &p.environ {
+            if !e.starts_with("PSGEN_NONCE=") {
+                spec.environ.push(e.as_bytes().to_vec());
+            }
+        }
+
+        for fd_entry in &p.fds {
+            if let Some(kind) = map_profile_fd_kind(fd_entry.fd, &fd_entry.target) {
+                spec.fd_specs.push((fd_entry.fd, kind));
+            }
+        }
+
+        spec.wchan_mode = wchan_mode_from_profile(&p.syscall.wchan, &p.syscall.syscall);
+        spec.non_dumpable = p.dumpable == Some(false);
+        spec.no_new_privs = p.status.no_new_privs != 0;
+        let filters = if p.status.seccomp_filters > 0 {
+            p.status.seccomp_filters.min(8) as u8
+        } else if p.status.seccomp == 2 {
+            1
+        } else {
+            0
+        };
+        spec.seccomp_filters = filters;
+        spec.ptrace_children = p.children.iter().any(|c| c.status.tracer_pid != 0);
+        spec.rss_kb = (p.stat.rss.saturating_mul(sys::page_kb())).min(8192) as u32;
+        spec.vsz_kb = (p.stat.vsize / 1024).min(65536) as u32;
+        spec.vm_lck_kb = p.status.vm_lck.unwrap_or(0).min(64) as u32;
+        spec.rss_shmem_kb = p.status.rss_shmem.unwrap_or(0).min(512) as u32;
+    }
+
+    if level >= 5 {
+        if let Some(tok) = decoy_token {
+            let place = p.memory.token_present || (!tree_has_tok && is_root);
+            if place && !tok.is_empty() {
+                spec.decoy_token = tok[..tok.len().min(4096)].to_vec();
+            }
+        }
+    }
+
+    spec
+}
+
+/// Apply deterministic seeded memory jitter (`+- 64 KiB` RSS, `+- 128 KiB` VSZ)
+/// recursively across a decoy tree so level >= 6 decoys vary naturally.
+pub fn apply_decoy_mem_jitter(spec: &mut DecoyNodeSpec, rng: &mut crate::rng::Rng) {
+    if spec.rss_kb > 0 {
+        let delta = (rng.below(33) as i64 - 16) * 4;
+        spec.rss_kb = ((spec.rss_kb as i64) + delta).clamp(4, 8192) as u32;
+    }
+    if spec.vsz_kb > 0 {
+        let delta = (rng.below(65) as i64 - 32) * 4;
+        spec.vsz_kb = ((spec.vsz_kb as i64) + delta).clamp(4, 65536) as u32;
+    }
+    for c in &mut spec.children {
+        apply_decoy_mem_jitter(c, rng);
+    }
+}
+
+fn decoy_rng_next(state: &mut u64) -> u64 {
+    let mut x = *state;
+    if x == 0 {
+        x = 0x9e37_79b9_7f4a_7c15;
+    }
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    x
+}
+
+fn sleep_jitter_ms(jitter_ms: u32, rng: &mut u64) {
+    if jitter_ms == 0 {
+        return;
+    }
+    let ms = decoy_rng_next(rng) % (jitter_ms as u64 + 1);
+    if ms > 0 {
+        sys::nanosleep(ms / 1000, (ms % 1000) * 1_000_000);
+    }
+}
+
+fn run_churn_batch(count: u32, rng: &mut u64) {
+    if count == 0 {
+        return;
+    }
+    let mut pids = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let pid = sys::fork();
+        if pid == 0 {
+            sys::prctl_set_name(b"sh");
+            let ns = (decoy_rng_next(rng) % 3 + 1) * 1_000_000;
+            sys::nanosleep(0, ns);
+            sys::exit(0);
+        } else if pid > 0 {
+            pids.push(pid);
+        }
+        let _ = sys::reap_children_nonblock();
+    }
+    for cpid in pids {
+        let mut st: i32 = 0;
+        unsafe {
+            libc::waitpid(cpid, &mut st, 0);
+        }
+    }
+    let _ = sys::reap_children_nonblock();
+}
+
+fn count_decoy_nodes(node: &DecoyNodeSpec) -> usize {
+    1 + node.children.iter().map(count_decoy_nodes).sum::<usize>()
+}
+
+fn max_decoy_rss(node: &DecoyNodeSpec) -> u64 {
+    let mut m = node.rss_kb as u64;
+    for c in &node.children {
+        m = m.max(max_decoy_rss(c));
+    }
+    m
+}
+
+fn flatten_decoy_tree<'a>(
+    node: &'a DecoyNodeSpec,
+    nodes: &mut Vec<&'a DecoyNodeSpec>,
+    children: &mut Vec<Vec<usize>>,
+) -> usize {
+    let idx = nodes.len();
+    nodes.push(node);
+    children.push(Vec::new());
+    let mut child_idxs = Vec::with_capacity(node.children.len());
+    for c in &node.children {
+        let cidx = flatten_decoy_tree(c, nodes, children);
+        child_idxs.push(cidx);
+    }
+    children[idx] = child_idxs;
+    idx
+}
+
+fn decoy_stub_exe_paths() -> Result<(Vec<u8>, Vec<u8>), String> {
+    let self_exe =
+        std::env::current_exe().map_err(|_| String::from("cannot resolve current_exe"))?;
+    let fallback = self_exe.as_os_str().as_bytes().to_vec();
+    #[cfg(test)]
+    {
+        if let Some(target_bin) = self_exe
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("psgen"))
+        {
+            let b = target_bin.as_os_str().as_bytes().to_vec();
+            if sys::access(&b, libc::X_OK) {
+                return Ok((b.clone(), b));
+            }
+        }
+    }
+    Ok((b"/proc/self/exe".to_vec(), fallback))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn make_decoy_config(
+    idx: usize,
+    nodes: &[&DecoyNodeSpec],
+    children: &[Vec<usize>],
+    fd_of: &[i32],
+    opts: &DecoySpawnOpts,
+    arena_fd: i32,
+    nonce: &[u8],
+    temp: &[u8],
+    global_id: u32,
+) -> stub::Config {
+    let n = nodes[idx];
+    let (child_fds, keep_fds, max_fd) = collect_node_fds(idx, children, fd_of);
+    let comm = {
+        let c = clamp_no_nul(&n.comm, 15);
+        if c.is_empty() {
+            b"worker".to_vec()
+        } else {
+            c
+        }
+    };
+    let use_bind = opts.bind_exe && !n.exe_memfd && !n.exe.is_empty();
+    let mut flags: u32 = 0;
+    if idx == 0 {
+        flags |= stub::F_ROOT;
+    }
+    if opts.clean_env {
+        flags |= stub::F_CLEAN_ENV;
+    }
+    if n.exe_memfd {
+        flags |= stub::F_EXE_MEMFD;
+    }
+    if n.non_dumpable {
+        flags |= stub::F_NON_DUMPABLE;
+    }
+    if n.no_new_privs {
+        flags |= stub::F_NO_NEW_PRIVS;
+    }
+    if n.ptrace_children {
+        flags |= stub::F_PTRACE_CHILDREN;
+    }
+    if (0..nodes.len()).any(|p| nodes[p].ptrace_children && children[p].contains(&idx)) {
+        flags |= stub::F_WAIT_TRACER;
+    }
+    if use_bind && sys::geteuid() != 0 {
+        flags |= stub::F_USERNS;
+    }
+    stub::Config {
+        flags,
+        vsz_kb: n.vsz_kb,
+        rss_kb: n.rss_kb,
+        uid: n.uid,
+        gid: n.gid,
+        duration: opts.duration,
+        cpu: 0,
+        stage: 0,
+        comm: comm.clone(),
+        exe: if use_bind {
+            clamp_no_nul(&n.exe, 4096)
+        } else {
+            Vec::new()
+        },
+        cmd: serialize_cmd(&n.argv, &comm, n.cmdline_raw_nuls),
+        user: clamp_no_nul(&n.user, 64),
+        temp: temp.to_vec(),
+        disk_kb: 0,
+        self_copy: Vec::new(),
+        nonce: nonce.to_vec(),
+        child_fds,
+        keep_fds,
+        max_fd,
+        arena_fd: if !opts.clean_env && n.rss_kb > 0 && arena_fd >= 0 {
+            4
+        } else {
+            -1
+        },
+        status_fd: 5,
+        id: global_id,
+        cwd: clamp_no_nul(&n.cwd, 4096),
+        env_block: serialize_env_block(&n.environ),
+        memfd_label: clamp_no_nul(&n.memfd_label, 240),
+        decoy_token: n.decoy_token[..n.decoy_token.len().min(4096)].to_vec(),
+        thread_comms: serialize_thread_comms(&n.thread_comms),
+        fd_specs: serialize_fd_specs(&n.fd_specs),
+        wchan_mode: n.wchan_mode,
+        seccomp_filters: n.seccomp_filters.min(8),
+        jitter_ms: 0,
+        vm_lck_kb: n.vm_lck_kb.min(64),
+        rss_shmem_kb: n.rss_shmem_kb.min(512),
+    }
+}
+
+struct CloseFd(i32);
+impl Drop for CloseFd {
+    fn drop(&mut self) {
+        if self.0 >= 0 {
+            sys::close(self.0);
+        }
+    }
+}
+
+/// Spawn one or more arbitrary-depth decoy process trees with clean-env
+/// authentication, seeded startup jitter, optional churn workers, and 3-field
+/// pidfile recording compatible with `psgen stop`.
+pub fn spawn_decoy_trees(
+    trees: &[DecoyNodeSpec],
+    opts: &DecoySpawnOpts,
+) -> Result<Vec<i32>, String> {
+    let _ = sys::prctl_set_subreaper();
+    let mut rng = opts.seed ^ 0xa076_1d64_78bd_642f;
+    let nonce = random_hex(8);
+
+    if trees.is_empty() {
+        run_churn_batch(opts.churn, &mut rng);
+        if let Some(path) = &opts.pidfile {
+            if !write_pidfile(path, &[], &[], &nonce).0 {
+                return Err(String::from("cannot write pidfile"));
+            }
+        }
+        return Ok(Vec::new());
+    }
+
+    let (primary_exe, fallback_exe) = decoy_stub_exe_paths()?;
+    let mut total_nodes = 0usize;
+    let mut max_rss = 0u64;
+    for t in trees {
+        total_nodes += count_decoy_nodes(t);
+        max_rss = max_rss.max(max_decoy_rss(t));
+    }
+
+    let arena_fd = CloseFd(if !opts.clean_env && max_rss > 0 {
+        let fd = sys::anon_file(b"cache", max_rss * 1024);
+        if fd < 0 {
+            return Err(String::from("cannot create RSS arena"));
+        }
+        let duped = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 6) };
+        sys::close(fd);
+        if duped < 0 {
+            return Err(String::from("cannot duplicate RSS arena fd"));
+        }
+        duped
+    } else {
+        -1
+    });
+
+    let mut memfd_name = b"pg:".to_vec();
+    memfd_name.extend_from_slice(&nonce);
+
+    let mut pids: Vec<i32> = Vec::with_capacity(total_nodes);
+    let mut root_pids: Vec<(i32, u64)> = Vec::with_capacity(trees.len());
+    let mut all_temps: Vec<std::path::PathBuf> = Vec::new();
+    let mut next_id: u32 = 0;
+
+    let churn_per_tree = opts.churn / (trees.len() as u32);
+    let mut churn_rem = opts.churn % (trees.len() as u32);
+
+    for (tree_idx, tree) in trees.iter().enumerate() {
+        let mut nodes: Vec<&DecoyNodeSpec> = Vec::new();
+        let mut children: Vec<Vec<usize>> = Vec::new();
+        flatten_decoy_tree(tree, &mut nodes, &mut children);
+
+        let cfg_name: &[u8] = if opts.clean_env { &memfd_name } else { b"cfg" };
+        let fd_of = match alloc_sealed_cfg_fds(nodes.len(), cfg_name, opts.clean_env) {
+            Ok(fds) => fds,
+            Err(err) => {
+                remove_dirs(&all_temps);
+                return Err(err);
+            }
+        };
+
+        let mut root_temps: Vec<std::path::PathBuf> = Vec::new();
+        let mut root_cmd = Vec::new();
+        let mut root_env_block = Vec::new();
+        let mut write_ok = true;
+
+        for i in 0..nodes.len() {
+            let n = nodes[i];
+            let need_dir = opts.bind_exe
+                && !n.exe_memfd
+                && !n.exe.is_empty()
+                && !Path::new(std::ffi::OsStr::from_bytes(&n.exe)).exists();
+            let temp = if need_dir {
+                match make_temp_dir(next_id as usize, &nonce) {
+                    Some(p) => {
+                        root_temps.push(p.clone());
+                        p.as_os_str().as_bytes().to_vec()
+                    }
+                    None => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
+            let cfg = make_decoy_config(
+                i, &nodes, &children, &fd_of, opts, arena_fd.0, &nonce, &temp, next_id,
+            );
+            if i == 0 {
+                root_cmd = cfg.cmd.clone();
+                root_env_block = cfg.env_block.clone();
+            }
+            next_id = next_id.wrapping_add(1);
+            if !write_config_fd(fd_of[i], &cfg) || !sys::fd_add_seals(fd_of[i]) {
+                write_ok = false;
+                break;
+            }
+        }
+
+        if !write_ok {
+            close_fds(&fd_of);
+            remove_dirs(&root_temps);
+            continue;
+        }
+        all_temps.extend(root_temps);
+
+        let (sr, sw) = match open_status_pipe(false) {
+            Ok(p) => p,
+            Err(err) => {
+                close_fds(&fd_of);
+                remove_dirs(&all_temps);
+                return Err(err);
+            }
+        };
+        let status_read = CloseFd(sr);
+        let status_write = CloseFd(sw);
+
+        let root_cfg_fd = fd_of[0];
+        let pid = sys::fork();
+        if pid == 0 {
+            sys::close(status_read.0);
+            if sys::dup2(root_cfg_fd, 3) != 3 {
+                sys::exit(127);
+            }
+            sys::close(root_cfg_fd);
+            if arena_fd.0 >= 0 {
+                if sys::dup2(arena_fd.0, 4) != 4 {
+                    sys::exit(127);
+                }
+                sys::close(arena_fd.0);
+            }
+            if sys::dup2(status_write.0, 5) != 5 {
+                sys::exit(127);
+            }
+            sys::close(status_write.0);
+            redirect_stdio();
+            let (argv_buf, argv) = stub::build_argv(&root_cmd);
+            let (_env_keep, env) = if opts.clean_env {
+                stub::build_envp_clean(&root_env_block)
+            } else {
+                let nonce_line = stub::nonce_env_line(&nonce);
+                let env = stub::envp_with(&nonce_line);
+                (nonce_line, env)
+            };
+            if sys::execve(&primary_exe, &argv, &env) < 0 {
+                sys::execve(&fallback_exe, &argv, &env);
+            }
+            let _ = &argv_buf;
+            sys::exit(127);
+        }
+        close_fds(&fd_of);
+        drop(status_write);
+
+        if pid > 0 {
+            root_pids.push((pid, live::read_starttime(pid).unwrap_or(0)));
+            let timeout = 3_000u64
+                .saturating_add((nodes.len() as u64).saturating_mul(50))
+                .min(10_000);
+            let records = read_status_records(status_read.0, nodes.len(), timeout);
+            let before = pids.len();
+            for (rpid, status, _, _) in &records {
+                if *status >= 0 {
+                    pids.push(*rpid);
+                }
+            }
+            if pids.len() == before {
+                pids.push(pid);
+            }
+        }
+        drop(status_read);
+
+        let batch = churn_per_tree
+            + if churn_rem > 0 {
+                churn_rem -= 1;
+                1
+            } else {
+                0
+            };
+        run_churn_batch(batch, &mut rng);
+
+        if tree_idx + 1 < trees.len() {
+            sleep_jitter_ms(opts.jitter_ms.max(tree.jitter_ms), &mut rng);
+        }
+    }
+
+    drop(arena_fd);
+    write_live_marker(&all_temps, &root_pids, &nonce);
+    sort_dedup_i32(&mut pids);
+
+    if pids.is_empty() {
+        remove_dirs(&all_temps);
+        all_temps.clear();
+    } else if !all_temps.is_empty() {
+        let mut live_ids = Vec::with_capacity(pids.len());
+        for &pid in &pids {
+            live_ids.push((pid, live::read_starttime(pid).unwrap_or(0)));
+        }
+        write_live_marker(&all_temps, &live_ids, &nonce);
+    }
+
+    if let Some(path) = &opts.pidfile {
+        if !write_pidfile(path, &pids, &all_temps, &nonce).0 && !opts.quiet {
+            sys::err(b"psgen: cannot write pidfile\n");
+        }
+    }
+
+    if opts.wait && opts.duration > 0 && !root_pids.is_empty() {
+        let deadline = sys::monotonic_ns()
+            .saturating_add((opts.duration as u64 + 2).saturating_mul(1_000_000_000));
+        loop {
+            let _ = sys::reap_children_nonblock();
+            let any_live = root_pids
+                .iter()
+                .any(|(pid, st)| live::read_starttime(*pid) == Some(*st) && live::alive(*pid));
+            if !any_live || sys::monotonic_ns() >= deadline {
+                break;
+            }
+            sys::nanosleep(0, 20_000_000);
+        }
+        let _ = sys::reap_children_nonblock();
+        for t in &all_temps {
+            if !staging_busy(t) && safe_temp_dir(t.as_os_str().as_bytes()) {
+                let _ = sys::remove_staging_dir(t);
+            }
+        }
+    }
+
+    let _ = sys::reap_children_nonblock();
+    Ok(pids)
+}
+
+pub fn make_decoy_token(prefix: &str, rng: &mut crate::rng::Rng) -> Vec<u8> {
+    let target_len = if prefix.len() < 32 {
+        32
+    } else {
+        prefix.len() + 16
+    };
+    let mut out = vec![0u8; target_len];
+    out[..prefix.len()].copy_from_slice(prefix.as_bytes());
+    let hex_len = target_len - prefix.len();
+    rng.hex(hex_len, &mut out[prefix.len()..]);
+    out
+}
+
+fn maybe_prepend_exec(cmd: &str) -> String {
+    let t = cmd.trim();
+    if t.is_empty()
+        || t.starts_with("exec ")
+        || t.starts_with("exec\t")
+        || t.bytes()
+            .any(|b| matches!(b, b';' | b'|' | b'&' | b'\n' | b'(' | b')' | b'`'))
+    {
+        return cmd.to_string();
+    }
+    let bytes = t.as_bytes();
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        let start = pos;
+        while pos < bytes.len() && !bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        let tok = &t[start..pos];
+        let is_env = tok.find('=').map(|eq| {
+            eq > 0
+                && !tok.contains('\'')
+                && !tok.contains('"')
+                && tok.as_bytes()[..eq]
+                    .iter()
+                    .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        }) == Some(true);
+        if !is_env {
+            if tok == "exec" {
+                return cmd.to_string();
+            }
+            let mut out = String::with_capacity(t.len() + 5);
+            out.push_str(&t[..start]);
+            out.push_str("exec ");
+            out.push_str(&t[start..]);
+            return out;
+        }
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+    }
+    cmd.to_string()
+}
+
+fn spawn_shell_child(cmd: &str, duration: u32, extra_env: Option<&[u8]>) -> Result<i32, String> {
+    let sh = b"/bin/sh\0";
+    let dash_c = b"-c\0";
+    let effective = maybe_prepend_exec(cmd);
+    let mut cmd_c = clamp_no_nul(effective.as_bytes(), 32768);
+    cmd_c.push(0);
+
+    let mut env_block = Vec::new();
+    for (k, v) in std::env::vars_os() {
+        let kb = k.as_bytes();
+        if kb == stub::NONCE_ENV.as_bytes() {
+            continue;
+        }
+        let mut entry = Vec::with_capacity(kb.len() + v.as_bytes().len() + 1);
+        entry.extend_from_slice(kb);
+        entry.push(b'=');
+        entry.extend_from_slice(v.as_bytes());
+        if !push_nul_bounded(&mut env_block, &entry, 65536) {
+            break;
+        }
+    }
+    if let Some(extra) = extra_env {
+        let _ = push_nul_bounded(&mut env_block, extra, 65536);
+    }
+
+    let pid = sys::fork();
+    if pid < 0 {
+        return Err(String::from("fork failed"));
+    }
+    if pid == 0 {
+        sys::setsid();
+        redirect_stdio();
+        if duration > 0 {
+            sys::alarm(duration);
+        }
+        let argv = [
+            sh.as_ptr(),
+            dash_c.as_ptr(),
+            cmd_c.as_ptr(),
+            std::ptr::null(),
+        ];
+        let (env_buf, env) = stub::build_envp_clean(&env_block);
+        sys::execve(b"/bin/sh", &argv, &env);
+        let _ = &env_buf;
+        sys::exit(127);
+    }
+    Ok(pid)
+}
+
+/// Spawn `count` live decoy processes via an external `masker_cmd` shell command
+/// template, applying seeded startup jitter and optional deterministic decoy
+/// tokens (`{DECOY_TOKEN}` / `PSGEN_DECOY_TOKEN` and `{DURATION}`).
+pub fn spawn_masker_decoys(
+    masker_cmd: &str,
+    count: usize,
+    duration: u32,
+    jitter_ms: u32,
+    seed: u64,
+    decoy_token_prefix: Option<&str>,
+) -> Result<Vec<i32>, String> {
+    if masker_cmd.trim().is_empty() {
+        return Err(String::from("masker_cmd is empty"));
+    }
+    let _ = sys::prctl_set_subreaper();
+    let mut rng_state = seed ^ 0x517c_c1b7_2722_0a95;
+    let mut tok_rng = crate::rng::Rng::new(rng_state);
+    let dur_str = crate::json::u64_str(duration as u64);
+
+    let mut pids = Vec::with_capacity(count);
+    for _ in 0..count {
+        sleep_jitter_ms(jitter_ms, &mut rng_state);
+        let mut cmd = masker_cmd.replace("{DURATION}", &dur_str);
+        let extra_env = if let Some(prefix) = decoy_token_prefix {
+            let tok = make_decoy_token(prefix, &mut tok_rng);
+            let tok_str = String::from_utf8_lossy(&tok);
+            cmd = cmd.replace("{DECOY_TOKEN}", &tok_str);
+            let mut kv = b"PSGEN_DECOY_TOKEN=".to_vec();
+            kv.extend_from_slice(&tok);
+            Some(kv)
+        } else {
+            None
+        };
+        let pid = spawn_shell_child(&cmd, duration, extra_env.as_deref())?;
+        pids.push(pid);
+        let _ = sys::reap_children_nonblock();
+    }
+    let _ = sys::reap_children_nonblock();
+    Ok(pids)
+}
+
+fn kill_pids_now(pids: &[i32]) {
+    for &pid in pids {
+        let _ = sys::kill(pid, sys::SIGKILL);
+    }
+    let _ = sys::reap_children_nonblock();
+}
+
+/// Spawn `prefix` decoy trees, then `target_cmd`, then `suffix` decoy trees so
+/// the target's `starttime` and PID sit naturally inside the decoy distribution.
+pub fn spawn_interleaved_target(
+    prefix: &[DecoyNodeSpec],
+    target_cmd: &str,
+    suffix: &[DecoyNodeSpec],
+    opts: &DecoySpawnOpts,
+) -> Result<(Vec<i32>, i32, Vec<i32>), String> {
+    if target_cmd.trim().is_empty() {
+        return Err(String::from("target_cmd is empty"));
+    }
+    let _ = sys::prctl_set_subreaper();
+    let mut rng = opts.seed ^ 0x2545_f491_4f6c_dd1d;
+
+    let half_churn = opts.churn / 2;
+    let mut sub_opts = DecoySpawnOpts {
+        pidfile: None,
+        wait: false,
+        churn: half_churn,
+        ..opts.clone()
+    };
+    let prefix_pids = spawn_decoy_trees(prefix, &sub_opts)?;
+
+    sleep_jitter_ms(opts.jitter_ms, &mut rng);
+    let target_pid = match spawn_shell_child(target_cmd, opts.duration, None) {
+        Ok(pid) => pid,
+        Err(e) => {
+            kill_pids_now(&prefix_pids);
+            return Err(e);
+        }
+    };
+    sys::nanosleep(0, 40_000_000);
+    sleep_jitter_ms(opts.jitter_ms, &mut rng);
+
+    sub_opts.churn = opts.churn.saturating_sub(half_churn);
+    sub_opts.seed = opts.seed ^ 0x517c_c1b7_2722_0a95;
+    let suffix_pids = match spawn_decoy_trees(suffix, &sub_opts) {
+        Ok(pids) => pids,
+        Err(e) => {
+            let _ = sys::kill(-target_pid, sys::SIGKILL);
+            let _ = sys::kill(target_pid, sys::SIGKILL);
+            kill_pids_now(&prefix_pids);
+            return Err(e);
+        }
+    };
+
+    if let Some(path) = &opts.pidfile {
+        let mut all_decoys = Vec::with_capacity(prefix_pids.len() + suffix_pids.len());
+        all_decoys.extend_from_slice(&prefix_pids);
+        all_decoys.extend_from_slice(&suffix_pids);
+        let nonce = random_hex(8);
+        let (ok, _) = write_pidfile(path, &all_decoys, &[], &nonce);
+        if !ok && !opts.quiet {
+            sys::err(b"psgen: cannot write pidfile\n");
+        }
+    }
+
+    let _ = sys::reap_children_nonblock();
+    Ok((prefix_pids, target_pid, suffix_pids))
 }
 
 #[cfg(test)]
@@ -2946,5 +4148,668 @@ mod tests {
         );
         let _ = std::fs::remove_file(fb_path);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct PidGuard(Vec<i32>);
+    impl Drop for PidGuard {
+        fn drop(&mut self) {
+            for &pid in &self.0 {
+                if pid > 1 {
+                    let _ = sys::kill(-pid, sys::SIGKILL);
+                    let _ = sys::kill(pid, sys::SIGKILL);
+                }
+            }
+            for &pid in &self.0 {
+                if pid > 1 {
+                    let mut st: i32 = 0;
+                    unsafe {
+                        libc::waitpid(pid, &mut st, libc::WNOHANG);
+                    }
+                }
+            }
+            let _ = sys::reap_children_nonblock();
+        }
+    }
+
+    fn has_built_psgen_bin() -> bool {
+        use std::io::Read;
+        let Ok(cur) = std::env::current_exe() else {
+            return false;
+        };
+        let Some(bin) = cur
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("psgen"))
+        else {
+            return false;
+        };
+        if !sys::access(bin.as_os_str().as_bytes(), libc::X_OK) {
+            return false;
+        }
+        // Cross-arch release smoke jobs stage a foreign-arch static binary in
+        // target/release/psgen and run it under qemu-user, where /proc/<pid>/exe
+        // belongs to QEMU and seccomp/ptrace/dumpable are not emulated.
+        let mut h_cur = [0u8; 20];
+        let mut h_bin = [0u8; 20];
+        let ok_cur = std::fs::File::open(&cur)
+            .and_then(|mut f| f.read_exact(&mut h_cur))
+            .is_ok();
+        let ok_bin = std::fs::File::open(&bin)
+            .and_then(|mut f| f.read_exact(&mut h_bin))
+            .is_ok();
+        ok_cur && ok_bin && h_cur[18..20] == h_bin[18..20]
+    }
+
+    fn scan_proc_mem_for_token(pid: i32, needle: &[u8]) -> (bool, bool) {
+        use std::os::unix::fs::FileExt;
+        let maps = match std::fs::read_to_string(format!("/proc/{pid}/maps")) {
+            Ok(m) => m,
+            Err(_) => return (false, false),
+        };
+        let mem = match std::fs::File::open(format!("/proc/{pid}/mem")) {
+            Ok(f) => f,
+            Err(_) => return (false, false),
+        };
+        let mut in_anon = false;
+        let mut in_stack = false;
+        for line in maps.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 2 {
+                continue;
+            }
+            let perms = parts[1];
+            if !perms.starts_with("rw") {
+                continue;
+            }
+            let path = if parts.len() >= 6 { parts[5] } else { "" };
+            let is_stack = path == "[stack]";
+            let is_anon = path.is_empty() || path == "[heap]" || path.starts_with("[anon:");
+            if !is_stack && !is_anon {
+                continue;
+            }
+            let Some((s_hex, e_hex)) = parts[0].split_once('-') else {
+                continue;
+            };
+            let (Ok(start), Ok(end)) = (
+                u64::from_str_radix(s_hex, 16),
+                u64::from_str_radix(e_hex, 16),
+            ) else {
+                continue;
+            };
+            let len = end.saturating_sub(start).min(2 * 1024 * 1024) as usize;
+            if len == 0 {
+                continue;
+            }
+            let mut buf = vec![0u8; len];
+            if let Ok(n) = mem.read_at(&mut buf, start) {
+                if buf[..n].windows(needle.len()).any(|w| w == needle) {
+                    if is_stack {
+                        in_stack = true;
+                    } else {
+                        in_anon = true;
+                    }
+                }
+            }
+        }
+        (in_anon, in_stack)
+    }
+
+    #[test]
+    fn profile_to_decoy_tree_excludes_main_thread_and_clamps_caps() {
+        let mut p = crate::profile::synthetic_default_profile("ci-sup", true);
+        p.identity.pid = 500;
+        p.identity.exe = "/memfd:ci-runner (deleted)".to_string();
+        p.identity.exe_memfd = Some("/memfd:ci-runner".to_string());
+        p.dumpable = Some(false);
+        p.status.no_new_privs = 1;
+        p.status.seccomp = 2;
+        p.status.seccomp_filters = 2;
+        p.syscall.wchan = "ep_poll".to_string();
+        p.task = vec![
+            crate::profile::ProfileTask {
+                tid: 500,
+                comm: "ci-sup".to_string(),
+                state: "S".to_string(),
+            },
+            crate::profile::ProfileTask {
+                tid: 501,
+                comm: "ci-w1".to_string(),
+                state: "S".to_string(),
+            },
+            crate::profile::ProfileTask {
+                tid: 502,
+                comm: "ci-w2".to_string(),
+                state: "S".to_string(),
+            },
+        ];
+        if let Some(child) = p.children.first_mut() {
+            child.status.tracer_pid = 500;
+        }
+        let huge_tok = vec![b'X'; 8192];
+        let spec = profile_to_decoy_tree(&p, 6, Some(&huge_tok), 35);
+        assert_eq!(
+            spec.thread_comms,
+            vec![b"ci-w1".to_vec(), b"ci-w2".to_vec()]
+        );
+        assert!(spec.exe_memfd);
+        assert_eq!(spec.memfd_label, b"ci-runner");
+        assert_eq!(spec.wchan_mode, 1);
+        assert!(spec.non_dumpable);
+        assert!(spec.no_new_privs);
+        assert_eq!(spec.seccomp_filters, 2);
+        assert!(spec.ptrace_children);
+        assert_eq!(spec.jitter_ms, 35);
+        assert!(spec.decoy_token.len() <= 4096);
+        assert_eq!(spec.children.len(), 1);
+        assert_eq!(parse_wchan_mode("epoll"), Some(1));
+        assert_eq!(parse_wchan_mode("nanosleep"), Some(3));
+        assert_eq!(parse_wchan_mode("futex"), Some(4));
+        assert_eq!(parse_wchan_mode("read"), Some(5));
+        assert_eq!(parse_wchan_mode("invalid"), None);
+    }
+
+    #[test]
+    fn live_decoy_clean_env_memfd_seccomp_threads_wchan_token_and_stop() {
+        if !has_built_psgen_bin() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!(".psgen-decoy-live-{}", sys::getpid()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("decoys.pid");
+        let pf_bytes = pidfile.as_os_str().as_bytes().to_vec();
+
+        let token = b"TOK_LIVE_DECOY_0123456789abcdef!";
+        let child_spec = DecoyNodeSpec {
+            comm: b"ci-pay".to_vec(),
+            argv: vec![b"ci-pay".to_vec(), b"--run".to_vec()],
+            exe_memfd: true,
+            memfd_label: b"ci-payload".to_vec(),
+            cwd: b"/tmp".to_vec(),
+            environ: vec![b"ROLE=payload".to_vec()],
+            wchan_mode: 4, // futex
+            no_new_privs: true,
+            seccomp_filters: 1,
+            decoy_token: b"TOK_CHILD_DECOY_fedcba9876543210".to_vec(),
+            ..DecoyNodeSpec::default()
+        };
+        let root_spec = DecoyNodeSpec {
+            comm: b"ci-sup".to_vec(),
+            argv: vec![b"ci-sup".to_vec()],
+            cmdline_raw_nuls: Some(3),
+            exe_memfd: true,
+            memfd_label: b"ci-runner".to_vec(),
+            cwd: b"/tmp".to_vec(),
+            environ: vec![b"APP_ENV=prod".to_vec(), b"WORKER_ID=7".to_vec()],
+            thread_comms: vec![b"ci-w1".to_vec(), b"ci-w2".to_vec()],
+            fd_specs: vec![(6, b"pipe".to_vec()), (7, b"eventfd".to_vec())],
+            wchan_mode: 3, // nanosleep
+            no_new_privs: true,
+            seccomp_filters: 2,
+            non_dumpable: false,
+            decoy_token: token.to_vec(),
+            children: vec![child_spec],
+            ..DecoyNodeSpec::default()
+        };
+
+        let opts = DecoySpawnOpts {
+            duration: 30,
+            pidfile: Some(pf_bytes.clone()),
+            clean_env: true,
+            jitter_ms: 15,
+            churn: 3,
+            seed: 42,
+            quiet: true,
+            wait: false,
+            bind_exe: false,
+        };
+        let pids = spawn_decoy_trees(&[root_spec], &opts).expect("spawn decoy tree");
+        let _guard = PidGuard(pids.clone());
+        assert_eq!(pids.len(), 2, "expected supervisor + child pids: {pids:?}");
+
+        let (root_pid, child_pid) = if live::read_comm(pids[0]).as_deref() == Some(b"ci-sup") {
+            (pids[0], pids[1])
+        } else {
+            (pids[1], pids[0])
+        };
+
+        // 1. comm & NUL-padded cmdline
+        assert_eq!(live::read_comm(root_pid).as_deref(), Some(&b"ci-sup"[..]));
+        let cmdline = std::fs::read(format!("/proc/{root_pid}/cmdline")).unwrap();
+        assert_eq!(cmdline, b"ci-sup\0\0\0");
+
+        // 2. F_CLEAN_ENV: zero PSGEN_NONCE, cloned environ present
+        let env_raw = std::fs::read(format!("/proc/{root_pid}/environ")).unwrap();
+        let env_str = String::from_utf8_lossy(&env_raw);
+        assert!(!env_str.contains("PSGEN_NONCE"), "leaked nonce: {env_str}");
+        assert!(env_str.contains("APP_ENV=prod"), "missing env: {env_str}");
+        assert!(env_str.contains("WORKER_ID=7"), "missing env: {env_str}");
+
+        // 3. F_EXE_MEMFD
+        let exe_link = std::fs::read_link(format!("/proc/{root_pid}/exe")).unwrap();
+        let exe_s = exe_link.to_string_lossy();
+        assert!(
+            exe_s.starts_with("/memfd:ci-runner"),
+            "unexpected exe: {exe_s}"
+        );
+
+        // 4. cwd
+        let cwd_link = std::fs::read_link(format!("/proc/{root_pid}/cwd")).unwrap();
+        assert_eq!(cwd_link.to_string_lossy(), "/tmp");
+
+        // 5. Seccomp_filters, NoNewPrivs, Threads == 3
+        let status = std::fs::read_to_string(format!("/proc/{root_pid}/status")).unwrap();
+        assert!(status.contains("Threads:\t3\n"), "{status}");
+        assert!(status.contains("NoNewPrivs:\t1\n"), "{status}");
+        assert!(status.contains("Seccomp:\t2\n"), "{status}");
+        assert!(status.contains("Seccomp_filters:\t2\n"), "{status}");
+
+        // 6. Exact multi-thread comms
+        let mut task_comms: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(format!("/proc/{root_pid}/task")).unwrap() {
+            let entry = entry.unwrap();
+            let c = std::fs::read_to_string(entry.path().join("comm")).unwrap();
+            task_comms.push(c.trim().to_string());
+        }
+        task_comms.sort();
+        assert_eq!(task_comms, vec!["ci-sup", "ci-w1", "ci-w2"]);
+
+        // 7. wchan (nanosleep)
+        if let Ok(wchan) = std::fs::read_to_string(format!("/proc/{root_pid}/wchan")) {
+            let w = wchan.trim();
+            if !w.is_empty() && w != "0" {
+                assert!(
+                    w.contains("nanosleep") || w.contains("hrtimer") || w.contains("do_nanosleep"),
+                    "unexpected wchan: {w}"
+                );
+            }
+        }
+
+        // 8. Decoy token present in both anon rw-p AND [stack]
+        let (in_anon, in_stack) = scan_proc_mem_for_token(root_pid, token);
+        assert!(in_anon, "decoy token not found in anonymous rw-p memory");
+        assert!(in_stack, "decoy token not found in [stack]");
+
+        // 9. Child ppid and memfd exe
+        let child_stat = live::read_stat(child_pid).expect("child stat");
+        assert_eq!(child_stat.ppid as i32, root_pid);
+        let child_exe = std::fs::read_link(format!("/proc/{child_pid}/exe")).unwrap();
+        assert!(
+            child_exe.to_string_lossy().starts_with("/memfd:ci-payload"),
+            "unexpected child exe: {}",
+            child_exe.display()
+        );
+
+        // 10. stop via 3-field pidfile and verify zero zombies
+        assert_eq!(stop(&pf_bytes, false, false, true), 0);
+        for _ in 0..50 {
+            let _ = sys::reap_children_nonblock();
+            if pids.iter().all(|&pid| live::read_stat(pid).is_none()) {
+                break;
+            }
+            sys::nanosleep(0, 10_000_000);
+        }
+        for &pid in &pids {
+            assert!(
+                live::read_stat(pid).is_none(),
+                "pid {pid} still exists or is zombie after stop"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_non_dumpable_eacces_and_stop_compatibility() {
+        if !has_built_psgen_bin() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!(".psgen-nondump-{}", sys::getpid()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("nondump.pid");
+        let pf_bytes = pidfile.as_os_str().as_bytes().to_vec();
+
+        let spec = DecoyNodeSpec {
+            comm: b"stealth-d".to_vec(),
+            argv: vec![b"stealth-d".to_vec()],
+            exe_memfd: true,
+            memfd_label: b"stealth-bin".to_vec(),
+            non_dumpable: true,
+            no_new_privs: true,
+            seccomp_filters: 2,
+            wchan_mode: 1, // epoll
+            ..DecoyNodeSpec::default()
+        };
+        let opts = DecoySpawnOpts {
+            duration: 30,
+            pidfile: Some(pf_bytes.clone()),
+            clean_env: true,
+            ..DecoySpawnOpts::default()
+        };
+        let pids = spawn_decoy_trees(&[spec], &opts).expect("spawn non-dumpable decoy");
+        let _guard = PidGuard(pids.clone());
+        assert_eq!(pids.len(), 1);
+        let pid = pids[0];
+
+        if sys::geteuid() != 0 {
+            let mem_err = std::fs::File::open(format!("/proc/{pid}/mem")).unwrap_err();
+            assert_eq!(
+                mem_err.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "expected EACCES on /proc/{pid}/mem: {mem_err}"
+            );
+            let env_err = std::fs::read(format!("/proc/{pid}/environ")).unwrap_err();
+            assert_eq!(
+                env_err.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "expected EACCES on /proc/{pid}/environ: {env_err}"
+            );
+        }
+
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+        assert!(status.contains("Seccomp:\t2\n"), "{status}");
+        assert!(status.contains("Seccomp_filters:\t2\n"), "{status}");
+
+        // 3-field pidfile stop must succeed even for non-dumpable stubs
+        assert_eq!(stop(&pf_bytes, false, false, true), 0);
+        for _ in 0..50 {
+            let _ = sys::reap_children_nonblock();
+            if live::read_stat(pid).is_none() {
+                break;
+            }
+            sys::nanosleep(0, 10_000_000);
+        }
+        assert!(live::read_stat(pid).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_interleaved_target_and_masker_decoys() {
+        if !has_built_psgen_bin() {
+            return;
+        }
+        let make_spec = |name: &[u8]| DecoyNodeSpec {
+            comm: name.to_vec(),
+            argv: vec![name.to_vec()],
+            wchan_mode: 0,
+            ..DecoyNodeSpec::default()
+        };
+        let opts = DecoySpawnOpts {
+            duration: 20,
+            clean_env: true,
+            jitter_ms: 10,
+            churn: 2,
+            seed: 99,
+            ..DecoySpawnOpts::default()
+        };
+        let (pre, tgt, suf) = spawn_interleaved_target(
+            &[make_spec(b"pre-d")],
+            "exec /bin/sleep 20",
+            &[make_spec(b"suf-d")],
+            &opts,
+        )
+        .expect("spawn interleaved target");
+        let mut all = Vec::new();
+        all.extend_from_slice(&pre);
+        all.push(tgt);
+        all.extend_from_slice(&suf);
+        let _guard = PidGuard(all);
+        assert_eq!(pre.len(), 1);
+        assert!(tgt > 1);
+        assert_eq!(suf.len(), 1);
+
+        let masker_pids =
+            spawn_masker_decoys("exec /bin/sleep {DURATION}", 2, 20, 5, 77, Some("TOK-"))
+                .expect("spawn masker decoys");
+        let _mguard = PidGuard(masker_pids.clone());
+        assert_eq!(masker_pids.len(), 2);
+        // Wait briefly for /bin/sh -> exec /bin/sleep to settle
+        sys::nanosleep(0, 50_000_000);
+        let env = std::fs::read(format!("/proc/{}/environ", masker_pids[0])).unwrap();
+        let env_s = String::from_utf8_lossy(&env);
+        assert!(env_s.contains("PSGEN_DECOY_TOKEN=TOK-"), "{env_s}");
+        assert!(!env_s.contains("PSGEN_NONCE="), "{env_s}");
+    }
+
+    fn parse_status_kb_field(status: &str, key: &str) -> u64 {
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix(key) {
+                if let Some(tok) = rest.split_whitespace().next() {
+                    if let Ok(v) = tok.parse::<u64>() {
+                        return v;
+                    }
+                }
+            }
+        }
+        0
+    }
+
+    #[test]
+    fn maybe_prepend_exec_handles_simple_env_and_compound() {
+        assert_eq!(maybe_prepend_exec("/bin/sleep 10"), "exec /bin/sleep 10");
+        assert_eq!(
+            maybe_prepend_exec("exec /bin/sleep 10"),
+            "exec /bin/sleep 10"
+        );
+        assert_eq!(
+            maybe_prepend_exec("FOO=1 BAR=baz /bin/sleep 10"),
+            "FOO=1 BAR=baz exec /bin/sleep 10"
+        );
+        assert_eq!(
+            maybe_prepend_exec("/bin/true && /bin/sleep 10"),
+            "/bin/true && /bin/sleep 10"
+        );
+        assert_eq!(
+            maybe_prepend_exec("echo hi; /bin/sleep 10"),
+            "echo hi; /bin/sleep 10"
+        );
+    }
+
+    #[test]
+    fn live_synchronized_ptrace_seize_and_non_dumpable() {
+        if !has_built_psgen_bin() {
+            return;
+        }
+        let child_spec = DecoyNodeSpec {
+            comm: b"traced-c".to_vec(),
+            argv: vec![b"traced-c".to_vec()],
+            exe_memfd: true,
+            memfd_label: b"traced-c".to_vec(),
+            non_dumpable: true,
+            wchan_mode: 1,
+            ..DecoyNodeSpec::default()
+        };
+        let root_spec = DecoyNodeSpec {
+            comm: b"tracer-p".to_vec(),
+            argv: vec![b"tracer-p".to_vec()],
+            exe_memfd: true,
+            memfd_label: b"tracer-p".to_vec(),
+            non_dumpable: true,
+            ptrace_children: true,
+            wchan_mode: 1,
+            children: vec![child_spec],
+            ..DecoyNodeSpec::default()
+        };
+        let opts = DecoySpawnOpts {
+            duration: 30,
+            clean_env: true,
+            ..DecoySpawnOpts::default()
+        };
+        let pids = spawn_decoy_trees(&[root_spec], &opts).expect("spawn traced non-dumpable tree");
+        let _guard = PidGuard(pids.clone());
+        assert_eq!(pids.len(), 2, "expected parent + child pids: {pids:?}");
+
+        let (root_pid, child_pid) = if live::read_comm(pids[0]).as_deref() == Some(b"tracer-p") {
+            (pids[0], pids[1])
+        } else {
+            (pids[1], pids[0])
+        };
+
+        let child_status = std::fs::read_to_string(format!("/proc/{child_pid}/status")).unwrap();
+        let tracer_pid = parse_status_kb_field(&child_status, "TracerPid:") as i32;
+        assert_eq!(
+            tracer_pid, root_pid,
+            "expected child TracerPid == root_pid ({root_pid}), got {tracer_pid}\n{child_status}"
+        );
+        if sys::geteuid() != 0 {
+            let c_env = std::fs::read(format!("/proc/{child_pid}/environ")).unwrap_err();
+            assert_eq!(
+                c_env.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "expected EACCES on non-dumpable seized child environ: {c_env}"
+            );
+            let p_env = std::fs::read(format!("/proc/{root_pid}/environ")).unwrap_err();
+            assert_eq!(
+                p_env.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "expected EACCES on non-dumpable parent environ: {p_env}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_vm_lck_rss_shmem_and_delta_memory_parity() {
+        if !has_built_psgen_bin() {
+            return;
+        }
+        let spec = DecoyNodeSpec {
+            comm: b"mem-par".to_vec(),
+            argv: vec![b"mem-par".to_vec()],
+            rss_kb: 2048,
+            vsz_kb: 16384,
+            vm_lck_kb: 16,
+            rss_shmem_kb: 64,
+            wchan_mode: 0,
+            ..DecoyNodeSpec::default()
+        };
+        let opts = DecoySpawnOpts {
+            duration: 30,
+            clean_env: true,
+            ..DecoySpawnOpts::default()
+        };
+        let pids = spawn_decoy_trees(&[spec], &opts).expect("spawn mem parity decoy");
+        let _guard = PidGuard(pids.clone());
+        assert_eq!(pids.len(), 1);
+        let pid = pids[0];
+
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+        let vm_lck = parse_status_kb_field(&status, "VmLck:");
+        let rss_shmem = parse_status_kb_field(&status, "RssShmem:");
+        let vm_rss = parse_status_kb_field(&status, "VmRSS:");
+        let vm_size = parse_status_kb_field(&status, "VmSize:");
+
+        assert!(
+            rss_shmem >= 64,
+            "expected RssShmem >= 64 kB, got {rss_shmem}\n{status}"
+        );
+        assert!(
+            vm_rss >= 1900,
+            "expected VmRSS >= 1900 kB, got {vm_rss}\n{status}"
+        );
+        assert!(
+            vm_size >= 16000,
+            "expected VmSize >= 16000 kB, got {vm_size}\n{status}"
+        );
+
+        let mut rl = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut rl) } == 0
+            && (rl.rlim_cur == libc::RLIM_INFINITY || rl.rlim_cur >= 16 * 1024)
+        {
+            assert!(
+                vm_lck >= 16,
+                "expected VmLck >= 16 kB under RLIMIT_MEMLOCK={}, got {vm_lck}\n{status}",
+                rl.rlim_cur
+            );
+        }
+
+        let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap();
+        assert!(
+            !maps.contains("memfd:cache"),
+            "clean_env decoy leaked memfd:cache into maps:\n{maps}"
+        );
+    }
+
+    #[test]
+    fn live_sequential_per_tree_adjacent_pids_and_target_ppid() {
+        if !has_built_psgen_bin() {
+            return;
+        }
+        let make_tree = |p_name: &[u8], c_name: &[u8]| DecoyNodeSpec {
+            comm: p_name.to_vec(),
+            argv: vec![p_name.to_vec()],
+            children: vec![DecoyNodeSpec {
+                comm: c_name.to_vec(),
+                argv: vec![c_name.to_vec()],
+                ..DecoyNodeSpec::default()
+            }],
+            ..DecoyNodeSpec::default()
+        };
+        let trees = vec![
+            make_tree(b"seq-p0", b"seq-c0"),
+            make_tree(b"seq-p1", b"seq-c1"),
+            make_tree(b"seq-p2", b"seq-c2"),
+        ];
+        let opts = DecoySpawnOpts {
+            duration: 30,
+            clean_env: true,
+            ..DecoySpawnOpts::default()
+        };
+        let pids = spawn_decoy_trees(&trees, &opts).expect("spawn sequential trees");
+        let _guard = PidGuard(pids.clone());
+        assert_eq!(pids.len(), 6, "expected 3 parent+child pairs: {pids:?}");
+
+        let mut pairs: Vec<(i32, i32)> = Vec::new();
+        for &pid in &pids {
+            let st = live::read_stat(pid).expect("stat");
+            let ppid = st.ppid as i32;
+            if pids.contains(&ppid) {
+                pairs.push((ppid, pid));
+            }
+        }
+        assert_eq!(pairs.len(), 3, "expected 3 parent->child pairs: {pairs:?}");
+        pairs.sort_by_key(|&(p, _)| p);
+        for i in 0..pairs.len() {
+            let (ppid, cpid) = pairs[i];
+            assert!(
+                cpid > ppid,
+                "expected child PID > parent PID: ({ppid}, {cpid})"
+            );
+            if i + 1 < pairs.len() {
+                let (next_ppid, _) = pairs[i + 1];
+                assert!(
+                    cpid < next_ppid,
+                    "expected sequential tree PIDs (child {cpid} < next root {next_ppid}): {pairs:?}"
+                );
+            }
+        }
+
+        // Also verify interleaved target_cmd without explicit "exec " replaces /bin/sh
+        // so its PPid matches our PID (same PPid as decoy roots).
+        let (pre, tgt, suf) = spawn_interleaved_target(
+            &[make_tree(b"pre-p", b"pre-c")],
+            "/bin/sleep 20",
+            &[make_tree(b"suf-p", b"suf-c")],
+            &opts,
+        )
+        .expect("spawn interleaved target without exec");
+        let mut all = Vec::new();
+        all.extend_from_slice(&pre);
+        all.push(tgt);
+        all.extend_from_slice(&suf);
+        let _guard2 = PidGuard(all);
+        let tgt_st = live::read_stat(tgt).expect("target stat");
+        assert_eq!(
+            tgt_st.ppid as i32,
+            sys::getpid(),
+            "target PPid must match psgen PID"
+        );
+        assert_eq!(
+            live::read_comm(tgt).as_deref(),
+            Some(&b"sleep"[..]),
+            "expected /bin/sh to exec sleep directly"
+        );
     }
 }

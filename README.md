@@ -89,7 +89,7 @@ Install `psgen` from GitHub release assets until a new final release publishes t
 `psgen table` prints a synthetic `ps aux` table.
 `psgen table --live` prints the live process table in `ps aux` format.
 `psgen inject` starts synthetic processes in the live process table.
-The remaining subcommands are `stop`, `doctor`, `log`, `load`, `corpus`, `check`, `unit`, `help`, and `version`.
+The remaining subcommands are `stop`, `doctor`, `log`, `load`, `corpus`, `check`, `unit`, `profile`, `run`, `score`, `replay`, `verify`, `selftest`, `help`, and `version`.
 
 ```sh
 psgen list -n 40 -s 7
@@ -510,6 +510,55 @@ On `EPIPE`, `load` exits 0 silently; on any other stdout write error, `load` pri
   `load` exits 1 if current cgroup usage is unreadable.
   Without `--force`, `load` exits 2 if the request exceeds `MemAvailable` or remaining cgroup headroom (including zero headroom).
 - `--disk-util MiB`: measures usable space in `TMPDIR` (90% budget with 10% reserved) before checking `RLIMIT_FSIZE`, so a missing `TMPDIR` reports the real cause first.
+
+## Profile-driven decoys and blind evaluation harness
+
+`psgen` can capture a live target's observable `/proc` shape (`schema: 1`, never storing real secrets), spawn matched low-overhead live decoy populations, and run reproducible two-phase blind evaluations (Phase A process table + Phase B deep `/proc`) with controls (`C-01`..`C-07`), single-surface hard negatives (`HN-01`..`HN-10`), SHA-256 manifests, and planted-defect self-tests.
+
+### profile
+
+Capture a live process or tree into a schema v1 JSON profile, or validate an existing profile:
+
+```sh
+psgen profile --pid 4210 --tree --label ci-runner --masker pmask \
+  --redact-token FAKE_SECRET --out profile.json
+psgen profile --validate profile.json
+```
+
+### inject fidelity flags
+
+Bare `psgen inject` preserves its existing corpus behavior and `PSGEN_NONCE` / v3 stub config contract.
+Opt-in flags enable profile-matched high-fidelity decoy populations:
+
+- `--from-profile FILE`: build live decoy trees from a schema v1 `profile.json` (`--decoy-level 1..6`, default `5`).
+- `--clean-env`: authenticate config fd 3 via sealed memfd link name (`/memfd:pg:<nonce>`) with zero `PSGEN_NONCE` in `/proc/<pid>/environ`, and clone target `environ`, `cwd`, `fds`, `task/*` thread names, `VmLck`, `RssShmem`, and delta `VmRSS`/`VmSize` without `memfd:cache`.
+- `--exe-memfd`: re-execute stubs from an anonymous memfd (`/memfd:<label> (deleted)`).
+- `--decoy-token PREFIX`: place deterministic shape-matched decoy tokens in anonymous `rw-p` memory and `[stack]` (Level 5+).
+- `--dumpable 0|1`, `--seccomp 0..8`, `--wchan pause|epoll|poll|nanosleep|futex|read`: override hardening and wait-channel surfaces.
+- `--jitter-ms N`, `--churn N`: spread spawn start times with seeded jitter and reap short-lived background churn with zero zombies (`PR_SET_CHILD_SUBREAPER`).
+- `--masker-cmd CMD`: spawn decoys by running an external masker command directly.
+
+### run, score, replay, verify, and selftest
+
+```sh
+# Build a reproducible bundle with a physically isolated evaluator view (no answer.json in blind-dir)
+psgen run --profile profile.json --out run-1234 --blind-dir blind-1234 \
+  --decoys 50 --seed 1234 --mode both --level 6 --control C-06
+
+# Live interleaved run (spawns target among matched live decoys and snapshots /proc)
+psgen run --live --profile profile.json --target-cmd "pmask --stealth --label ci-runner -- /bin/sleep 60" \
+  --out run-live --blind-dir blind-live --decoys 20 --seed 4004 --mode both --level 6
+
+# Verify manifest hashes, schema validity, target presence, and zero secret/host-path leaks
+psgen verify run-1234 --pick pick.json --redact-token FAKE_SECRET
+
+# Score or deterministically replay offline without touching /proc
+psgen score run-1234 --pick pick.json --out score.json
+psgen replay run-1234 --pick pick.json
+
+# Run all 6 planted-defect passing+refusal guards and the 36-run 9/10 vs 7/10 discrimination matrix
+psgen selftest --out selftest-out
+```
 
 ## Tests
 

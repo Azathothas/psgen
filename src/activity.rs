@@ -38,49 +38,23 @@ pub const MODULES: &[&str] = &[
     "julia",
 ];
 
-const PATHS: &[&str] = &[
-    "/",
-    "/api/v1/users",
-    "/api/v1/orders",
-    "/api/v1/search?q=psgen",
-    "/static/js/app.js",
-    "/static/css/site.css",
-    "/api/v1/health",
-    "/api/v1/metrics",
-    "/.well-known/security.txt",
-    "/favicon.ico",
-    "/v2/items/8f2c1a",
-    "/login",
-];
+const PATHS_S: &str = "/\n/api/v1/users\n/api/v1/orders\n/api/v1/search?q=psgen\n\
+/static/js/app.js\n/static/css/site.css\n/api/v1/health\n/api/v1/metrics\n\
+/.well-known/security.txt\n/favicon.ico\n/v2/items/8f2c1a\n/login";
 
-const UAS: &[&str] = &[
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    "curl/8.7.1",
-    "Go-http-client/1.1",
-    "python-requests/2.32.0",
-    "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-];
+const UAS_S: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36\n\
+curl/8.7.1\n\
+Go-http-client/1.1\n\
+python-requests/2.32.0\n\
+Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)\n\
+Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15";
 
-const CRATES: &[&str] = &[
-    "serde",
-    "tokio",
-    "libc",
-    "syn",
-    "quote",
-    "clap",
-    "anyhow",
-    "regex",
-    "hyper",
-    "tracing",
-    "bytes",
-    "indexmap",
-    "thiserror",
-    "parking_lot",
-    "hashbrown",
-];
+const CRATES_S: &str = "serde\ntokio\nlibc\nsyn\nquote\nclap\nanyhow\nregex\nhyper\ntracing\nbytes\nindexmap\nthiserror\nparking_lot\nhashbrown";
+const HOSTS_S: &str = "web1\nweb2\ndb1\ncache1\nworker1\nworker2";
 
-const HOSTS: &[&str] = &["web1", "web2", "db1", "cache1", "worker1", "worker2"];
+fn pick_line(list: &'static str, n: u64, rng: &mut Rng) -> &'static str {
+    list.lines().nth(rng.below(n) as usize).unwrap_or("")
+}
 
 fn hex(rng: &mut Rng, n: usize) -> Vec<u8> {
     let mut h = vec![0u8; n];
@@ -92,16 +66,14 @@ fn web_record(rng: &mut Rng) -> WebRecord {
     WebRecord {
         ip: loggen::rand_ip(rng),
         method: if rng.below(12) == 0 { "POST" } else { "GET" },
-        path: PATHS[rng.below(PATHS.len() as u64) as usize]
-            .as_bytes()
-            .to_vec(),
+        path: pick_line(PATHS_S, 12, rng).as_bytes().to_vec(),
         status: loggen::pick_status(rng),
         bytes: if rng.below(5) == 0 {
             rng.range(0, 400)
         } else {
             rng.range(180, 94_000)
         },
-        ua: UAS[rng.below(UAS.len() as u64) as usize],
+        ua: pick_line(UAS_S, 6, rng),
         ms: rng.range(1, 420),
     }
 }
@@ -182,13 +154,13 @@ fn cargo(rng: &mut Rng) -> Vec<u8> {
     let mut b = Buf::new();
     for _ in 0..n {
         b.push_str("   Compiling ");
-        b.push_str(CRATES[rng.below(CRATES.len() as u64) as usize]);
+        b.push_str(pick_line(CRATES_S, 15, rng));
         b.push_str(" v0.");
         b.push_u64(rng.range(1, 19));
         b.push(b'.');
         b.push_u64(rng.range(0, 40));
         b.push_str(" (/build/registry/src/index.crates.io-6f17d22bba15001f/");
-        b.push_str(CRATES[rng.below(CRATES.len() as u64) as usize]);
+        b.push_str(pick_line(CRATES_S, 15, rng));
         b.push_str("-");
         b.push_bytes(&hex(rng, 8));
         b.push_str(")\n");
@@ -202,30 +174,18 @@ fn cargo(rng: &mut Rng) -> Vec<u8> {
 }
 
 fn cc(rng: &mut Rng) -> Vec<u8> {
-    let files = [
-        "drivers/net/e1000.c",
-        "net/ipv4/tcp_input.c",
-        "fs/ext4/inode.c",
-        "kernel/sched/fair.c",
-        "arch/x86/mm/pgtable.c",
-    ];
+    const FILES: &str = "drivers/net/e1000.c\nnet/ipv4/tcp_input.c\nfs/ext4/inode.c\nkernel/sched/fair.c\narch/x86/mm/pgtable.c";
     let mut b = Buf::new();
     b.push_str("gcc -Wp,-MMD,obj/");
-    b.push_str(files[rng.below(files.len() as u64) as usize]);
+    b.push_str(pick_line(FILES, 5, rng));
     b.push_str(".d -O2 -Wall -Wextra -fno-strict-aliasing -c -o obj/");
-    b.push_str(files[rng.below(files.len() as u64) as usize]);
+    b.push_str(pick_line(FILES, 5, rng));
     b.push_str("\n");
     b.as_bytes().to_vec()
 }
 
 fn download(rng: &mut Rng) -> Vec<u8> {
-    let names = [
-        "pkgforge",
-        "toolchain",
-        "nightly",
-        "vendored-src",
-        "data-dump",
-    ];
+    const NAMES: &str = "pkgforge\ntoolchain\nnightly\nvendored-src\ndata-dump";
     let mut b = Buf::new();
     b.push_str("  % Total    % Received % Xferd  Average Speed\n");
     b.push_str("100 ");
@@ -236,36 +196,25 @@ fn download(rng: &mut Rng) -> Vec<u8> {
     b.push_u64(rng.range(100, 9000));
     b.push_str("k      0      0 --:--:-- --:--:-- --:--:-- ");
     b.push_u64(rng.range(100, 9000));
-    b.push_str("k\n");
-    b.push_str("Downloading ");
-    b.push_str(names[rng.below(names.len() as u64) as usize]);
-    b.push_str("-");
-    b.push_str("2.1.");
+    b.push_str("k\nDownloading ");
+    b.push_str(pick_line(NAMES, 5, rng));
+    b.push_str("-2.1.");
     b.push_u64(rng.range(0, 9));
     b.push_str(".tar.gz\n");
     b.as_bytes().to_vec()
 }
 
 fn docker_build(rng: &mut Rng) -> Vec<u8> {
-    let steps = [
-        ("FROM debian:13-slim", ""),
-        ("COPY . /src", ""),
-        ("RUN cargo build --release", ""),
-        ("RUN useradd -r app", ""),
-        ("ENTRYPOINT [\"/src/target/release/app\"]", ""),
-    ];
+    const STEPS: &str = "FROM debian:13-slim\nCOPY . /src\nRUN cargo build --release\nRUN useradd -r app\nENTRYPOINT [\"/src/target/release/app\"]";
     let mut b = Buf::new();
-    for (i, (s, _)) in steps.iter().enumerate() {
+    for (i, s) in STEPS.lines().enumerate() {
         b.push_str("Step ");
         b.push_u64(i as u64 + 1);
-        b.push_str("/");
-        b.push_u64(steps.len() as u64);
-        b.push_str(" : ");
+        b.push_str("/5 : ");
         b.push_str(s);
         b.push_str("\n ---> ");
         b.push_bytes(&hex(rng, 12));
-        b.push(b'\n');
-        b.push_str(" ---> Running in ");
+        b.push_str("\n ---> Running in ");
         b.push_bytes(&hex(rng, 12));
         b.push(b'\n');
     }
@@ -276,8 +225,8 @@ fn docker_build(rng: &mut Rng) -> Vec<u8> {
 }
 
 fn docker_rmi(rng: &mut Rng) -> Vec<u8> {
-    let repo = ["grafana/grafana", "node", "python", "alpine", "traefik"][rng.below(5) as usize];
-    let tag = ["0.12.18-alpha", "22-bookworm", "3.13-slim", "3.20", "v3.1"][rng.below(5) as usize];
+    let repo = pick_line("grafana/grafana\nnode\npython\nalpine\ntraefik", 5, rng);
+    let tag = pick_line("0.12.18-alpha\n22-bookworm\n3.13-slim\n3.20\nv3.1", 5, rng);
     let mut b = Buf::new();
     b.push_str("Untagged: ");
     b.push_str(repo);
@@ -311,7 +260,7 @@ fn terraform(rng: &mut Rng) -> Vec<u8> {
 }
 
 fn ansible(rng: &mut Rng) -> Vec<u8> {
-    let host = HOSTS[rng.below(HOSTS.len() as u64) as usize];
+    let host = pick_line(HOSTS_S, 6, rng);
     let mut b = Buf::new();
     b.push_str("PLAY [webservers] *****************************************************\n");
     b.push_str("TASK [Gathering Facts] *************************************************\n");
@@ -330,18 +279,11 @@ fn ansible(rng: &mut Rng) -> Vec<u8> {
 }
 
 fn kernel_compile(rng: &mut Rng) -> Vec<u8> {
-    let files = [
-        "net/wireless/mlme/nway.o",
-        "net/wireless/mlme/assoc.o",
-        "arch/x86/entry/vsyscall/vsyscall_64.o",
-        "fs/ext4/inode.o",
-        "mm/page_alloc.o",
-        "kernel/sched/core.o",
-    ];
+    const FILES: &str = "net/wireless/mlme/nway.o\nnet/wireless/mlme/assoc.o\narch/x86/entry/vsyscall/vsyscall_64.o\nfs/ext4/inode.o\nmm/page_alloc.o\nkernel/sched/core.o";
     let mut b = Buf::new();
     for _ in 0..rng.range(2, 6) {
         b.push_str("  CC      ");
-        b.push_str(files[rng.below(files.len() as u64) as usize]);
+        b.push_str(pick_line(FILES, 6, rng));
         b.push(b'\n');
     }
     b.push_str("  LD      net/wireless/mlme/mlme.o\n  AR      net/wireless/built-in.a\n");
@@ -406,114 +348,85 @@ fn julia(rng: &mut Rng) -> Vec<u8> {
     b.as_bytes().to_vec()
 }
 
+const MODULE_SPEC: &str = "\
+weblog:web:access,apache,nginx,web,flog\n\
+bootlog:kernel:boot,dmesg\n\
+cargo:cargo:rustc\n\
+cc:make:gcc,make\n\
+download:curl:wget,curl\n\
+docker_build:dockerd:docker,dockerbuild\n\
+docker_rmi:dockerd:docker_rm,dockerrmi\n\
+terraform:terraform:tf\n\
+ansible:ansible:playbook\n\
+kernel_compile:make:kernel\n\
+mkinitcpio:make:\n\
+uv:uv:pip\n\
+composer:composer:php\n\
+julia:julia:";
+
+fn find_module(module: &[u8]) -> Option<(usize, &'static str, &'static str)> {
+    let ms = core::str::from_utf8(module).ok()?;
+    for (idx, line) in MODULE_SPEC.lines().enumerate() {
+        let mut p = line.split(':');
+        let (Some(name), Some(svc), Some(aliases)) = (p.next(), p.next(), p.next()) else {
+            continue;
+        };
+        if name == ms || (!aliases.is_empty() && aliases.split(',').any(|a| a == ms)) {
+            return Some((idx, svc, aliases));
+        }
+    }
+    None
+}
+
 fn page(rng: &mut Rng, fmt: Format, module: &[u8], now: u64) -> Option<Vec<u8>> {
-    let out = match module {
-        b"weblog" | b"access" | b"apache" | b"nginx" | b"web" | b"flog" => weblog(rng, fmt, now),
-        b"bootlog" | b"boot" | b"dmesg" => bootlog(rng, now),
-        b"cargo" | b"rustc" => cargo(rng),
-        b"cc" | b"gcc" | b"make" => cc(rng),
-        b"download" | b"wget" | b"curl" => download(rng),
-        b"docker_build" | b"docker" | b"dockerbuild" => docker_build(rng),
-        b"docker_rmi" | b"docker_rm" | b"dockerrmi" => docker_rmi(rng),
-        b"terraform" | b"tf" => terraform(rng),
-        b"ansible" | b"playbook" => ansible(rng),
-        b"kernel_compile" | b"kernel" => kernel_compile(rng),
-        b"mkinitcpio" => mkinitcpio(rng),
-        b"uv" | b"pip" => uv(rng),
-        b"composer" | b"php" => composer(rng),
-        b"julia" => julia(rng),
-        _ => return None,
-    };
-    Some(out)
+    let (idx, _, _) = find_module(module)?;
+    Some(match idx {
+        0 => weblog(rng, fmt, now),
+        1 => bootlog(rng, now),
+        2 => cargo(rng),
+        3 => cc(rng),
+        4 => download(rng),
+        5 => docker_build(rng),
+        6 => docker_rmi(rng),
+        7 => terraform(rng),
+        8 => ansible(rng),
+        9 => kernel_compile(rng),
+        10 => mkinitcpio(rng),
+        11 => uv(rng),
+        12 => composer(rng),
+        _ => julia(rng),
+    })
 }
 
 fn module_service(module: &[u8]) -> &'static str {
-    match module {
-        b"weblog" | b"access" | b"apache" | b"nginx" | b"web" | b"flog" => "web",
-        b"bootlog" | b"boot" | b"dmesg" => "kernel",
-        b"cargo" | b"rustc" => "cargo",
-        b"cc" | b"gcc" | b"make" | b"kernel_compile" | b"kernel" | b"mkinitcpio" => "make",
-        b"download" | b"wget" | b"curl" => "curl",
-        b"docker_build" | b"docker" | b"dockerbuild" | b"docker_rmi" | b"docker_rm"
-        | b"dockerrmi" => "dockerd",
-        b"terraform" | b"tf" => "terraform",
-        b"ansible" | b"playbook" => "ansible",
-        b"uv" | b"pip" => "uv",
-        b"composer" | b"php" => "composer",
-        b"julia" => "julia",
-        _ => "psgen",
-    }
+    find_module(module)
+        .map(|(_, svc, _)| svc)
+        .unwrap_or("psgen")
 }
 
 fn is_weblog(module: &[u8]) -> bool {
-    matches!(
-        module,
-        b"weblog" | b"access" | b"apache" | b"nginx" | b"web" | b"flog"
-    )
+    matches!(find_module(module), Some((0, _, _)))
 }
 
 fn module_known(module: &[u8]) -> bool {
-    matches!(
-        module,
-        b"weblog"
-            | b"access"
-            | b"apache"
-            | b"nginx"
-            | b"web"
-            | b"flog"
-            | b"bootlog"
-            | b"boot"
-            | b"dmesg"
-            | b"cargo"
-            | b"rustc"
-            | b"cc"
-            | b"gcc"
-            | b"make"
-            | b"download"
-            | b"wget"
-            | b"curl"
-            | b"docker_build"
-            | b"docker"
-            | b"dockerbuild"
-            | b"docker_rmi"
-            | b"docker_rm"
-            | b"dockerrmi"
-            | b"terraform"
-            | b"tf"
-            | b"ansible"
-            | b"playbook"
-            | b"kernel_compile"
-            | b"kernel"
-            | b"mkinitcpio"
-            | b"uv"
-            | b"pip"
-            | b"composer"
-            | b"php"
-            | b"julia"
-    )
+    find_module(module).is_some()
 }
 
 /// The aliases `module_known()` accepts for a canonical module name.
 fn aliases_for(module: &[u8]) -> Vec<&'static str> {
-    let table: &[(&[u8], &[&str])] = &[
-        (b"weblog", &["access", "apache", "nginx", "web", "flog"]),
-        (b"bootlog", &["boot", "dmesg"]),
-        (b"cargo", &["rustc"]),
-        (b"cc", &["gcc", "make"]),
-        (b"download", &["wget", "curl"]),
-        (b"docker_build", &["docker", "dockerbuild"]),
-        (b"docker_rmi", &["docker_rm", "dockerrmi"]),
-        (b"terraform", &["tf"]),
-        (b"ansible", &["playbook"]),
-        (b"kernel_compile", &["kernel"]),
-        (b"mkinitcpio", &[]),
-        (b"uv", &["pip"]),
-        (b"composer", &["php"]),
-        (b"julia", &[]),
-    ];
-    for (name, aliases) in table {
-        if *name == module {
-            return aliases.to_vec();
+    let Ok(ms) = core::str::from_utf8(module) else {
+        return Vec::new();
+    };
+    for line in MODULE_SPEC.lines() {
+        let mut p = line.split(':');
+        if let (Some(name), Some(_), Some(aliases)) = (p.next(), p.next(), p.next()) {
+            if name == ms {
+                return if aliases.is_empty() {
+                    Vec::new()
+                } else {
+                    aliases.split(',').collect()
+                };
+            }
         }
     }
     Vec::new()
@@ -983,7 +896,8 @@ fn make_load_file(dir: &std::path::Path) -> Option<std::fs::File> {
         // names the file, and a `getrandom` denial must not read as a disk
         // error.
         crate::inject::fill_entropy(&mut r);
-        let path = dir.join(format!(".psgen-load-{:016x}", u64::from_le_bytes(r)));
+        let hex = crate::sha256::hex_encode(&u64::from_le_bytes(r).to_be_bytes());
+        let path = dir.join(crate::json::cat2(".psgen-load-", &hex));
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)

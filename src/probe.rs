@@ -131,7 +131,7 @@ fn check_pty() -> Check {
             sys::close(master);
             return Err(e);
         }
-        let slave_path = format!("/dev/pts/{}", ptn);
+        let slave_path = crate::json::cat2("/dev/pts/", &crate::json::u64_str(ptn as u64));
         let slave = sys::open(
             slave_path.as_bytes(),
             sys::O_RDWR | sys::O_NOCTTY | sys::O_CLOEXEC,
@@ -296,8 +296,9 @@ fn check_bind_mount() -> Check {
             return Err(errno());
         }
         temp_dir_ready(&dir).map_err(|e| -e.max(1))?;
-        let a = dir.join(format!(".psgen-probe-a-{}", sys::getpid()));
-        let b = dir.join(format!(".psgen-probe-b-{}", sys::getpid()));
+        let pid_s = crate::json::i64_str(sys::getpid() as i64);
+        let a = dir.join(crate::json::cat2(".psgen-probe-a-", &pid_s));
+        let b = dir.join(crate::json::cat2(".psgen-probe-b-", &pid_s));
         let ab = a.as_os_str().as_bytes().to_vec();
         let bb = b.as_os_str().as_bytes().to_vec();
         let fa = sys::open(&ab, sys::O_CREAT | sys::O_WRONLY, 0o600);
@@ -343,12 +344,12 @@ fn bind_detail(ok: bool, not_attempted: bool, e: i32, dir: &Path) -> Vec<u8> {
     } else if not_attempted {
         b"the probe could not fork, so the bind was not attempted".to_vec()
     } else if e < 0 {
-        format!(
-            "temporary directory {} is missing, not a directory or not writable (errno {}); the bind was not attempted",
-            dir.display(),
-            e.abs()
-        )
-        .into_bytes()
+        let mut s = String::from("temporary directory ");
+        s.push_str(&dir.to_string_lossy());
+        s.push_str(" is missing, not a directory or not writable (errno ");
+        crate::json::push_i64(&mut s, e.abs() as i64);
+        s.push_str("); the bind was not attempted");
+        s.into_bytes()
     } else {
         b"bind inside a namespace failed".to_vec()
     }
@@ -602,12 +603,28 @@ pub const PIDFILE_PENDING_BYTES: usize = 256;
 pub fn pidfile_temp_name(path: &[u8], level: usize, nonce: u64) -> Vec<u8> {
     let mut cand = path.to_vec();
     cand.push(b'.');
+    let pid_s = crate::json::i64_str(sys::getpid() as i64);
     match level {
-        0 => cand.extend_from_slice(format!("tmp.{}.{:016x}", sys::getpid(), nonce).as_bytes()),
-        1 => cand
-            .extend_from_slice(format!("t{}{:06x}", sys::getpid(), nonce & 0xff_ffff).as_bytes()),
-        2 => cand.extend_from_slice(format!("tmp.{}", sys::getpid()).as_bytes()),
-        _ => cand.extend_from_slice(format!("t{}", sys::getpid()).as_bytes()),
+        0 => {
+            cand.extend_from_slice(b"tmp.");
+            cand.extend_from_slice(pid_s.as_bytes());
+            cand.push(b'.');
+            cand.extend_from_slice(crate::sha256::hex_encode(&nonce.to_be_bytes()).as_bytes());
+        }
+        1 => {
+            cand.push(b't');
+            cand.extend_from_slice(pid_s.as_bytes());
+            let hex = crate::sha256::hex_encode(&nonce.to_be_bytes());
+            cand.extend_from_slice(&hex.as_bytes()[10..16]);
+        }
+        2 => {
+            cand.extend_from_slice(b"tmp.");
+            cand.extend_from_slice(pid_s.as_bytes());
+        }
+        _ => {
+            cand.push(b't');
+            cand.extend_from_slice(pid_s.as_bytes());
+        }
     }
     cand
 }

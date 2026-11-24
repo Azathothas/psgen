@@ -1,6 +1,24 @@
 # Changelog
 
-## Unreleased
+## 0.1.0
+
+### Added
+
+- Added `psgen profile` (`--pid`, `--tree`, `--validate`, `--redact-token`, `--redact-env`) to capture and validate schema v1 observable process profiles from live processes or trees without ever writing real secrets.
+- Added high-fidelity decoy injection options to `psgen inject`: `--from-profile`, `--decoy-level 1..6`, `--clean-env` (sealed memfd link-name run-tag authentication with zero `PSGEN_NONCE` in `/proc/<pid>/environ`), `--exe-memfd` (`/memfd:<label> (deleted)` via `memfd_create` + `execveat`), `--decoy-token`, `--dumpable 0|1`, `--seccomp 0..8`, `--wchan` (`pause|epoll|poll|nanosleep|futex|read`), `--jitter-ms`, `--churn`, and `--masker-cmd`.
+- Added synchronized live stealth parity for profile-driven decoys: sequential per-tree spawning with adjacent parent-child PIDs, interleaved target spawning (`PPid` and `starttime` parity), synchronized `PTRACE_SEIZE` before `PR_SET_DUMPABLE(0)` (matching both `TracerPid` and same-UID `EACCES`), `VmLck` (`mlock`), `RssShmem`, delta `VmRSS`/`VmSize` without `memfd:cache` fingerprints, per-thread `comm` cloning, `fd` cloning, and `PR_SET_CHILD_SUBREAPER` zombie reaping.
+- Added the reproducible blind evaluation harness subcommands:
+  - `psgen run` (`--profile`, `--out`, `--blind-dir`, `--decoys`, `--seed`, `--mode table|deep|both`, `--level 1..6`, `--control C-01..C-07`, `--hard-negatives HN-01..HN-10`, `--live`, `--target-pid`, `--target-cmd`, `--masker-cmd`) generating hash-verified, relocatable bundles with physically isolated `--blind-dir` evaluator views (never containing `answer.json`).
+  - `psgen score` and `psgen replay` computing target survival, decoy pick rate, false-positive/false-negative rates, ambiguity rate, Wilson 95% confidence intervals, per-surface confusion matrix, reason distribution, and hard-negative survival with mandatory pre-scoring target-presence verification.
+  - `psgen verify` checking `MANIFEST.sha256`, schema v1 validity, secret and host-path redaction across all bundle artifacts, and target-presence consistency.
+  - `psgen selftest` running 6 planted-defect passing + refusal guards and a 36-run 9/10 vs 7/10 discrimination matrix.
+
+### Changed
+
+- Kept `libc = "0.2"` as the sole crate dependency and slimmed binary size across all modules so all seven static musl targets remain under 1 MiB.
+- Preserved all 12 existing subcommands, flags, and legacy `psgen inject` (`PSGEN_NONCE` / v3 config) behavior unchanged.
+
+## 0.0.3
 
 ### Security
 

@@ -13,75 +13,14 @@ use std::vec::Vec;
 
 /// Terms that must never appear in generated output. Word boundaries are
 /// enforced, so `cryptography` does not match `crypto`.
-static DENY: &[&[u8]] = &[
-    b"botnet",
-    b"bruteforce",
-    b"brute-force",
-    b"cryptomin",
-    b"cryptomining",
-    b"cryptominer",
-    b"crypto",
-    b"mining",
-    b"stratum",
-    b"xmrig",
-    b"hashcat",
-    b"hydra",
-    b"nmap",
-    b"masscan",
-    b"metasploit",
-    b"msfconsole",
-    b"cobalt",
-    b"beacon",
-    b"payload",
-    b"exploit",
-    b"backdoor",
-    b"keylog",
-    b"mimikatz",
-    b"lazagne",
-    b"sqlmap",
-    b"nikto",
-    b"wpscan",
-    b"gobuster",
-    b"ffuf",
-    b"dirb",
-    b"nuclei",
-    b"reverse shell",
-    b"/dev/tcp",
-    b"nc -e",
-    b"ncat -e",
-    b"socat exec",
-    b"chisel",
-    b"ligolo",
-    b"ngrok",
-    b"ransomware",
-    b"rootkit",
-    b"rkhunter",
-    b"memdump",
-    b"volatility",
-    b"lsass",
-    b"procdump",
-    b"sekurlsa",
-    b"kerberoast",
-    b"bloodhound",
-    b"impacket",
-    b"responder",
-    b"ettercap",
-    b"arpspoof",
-    b"aircrack",
-    b"reaver",
-    b"wifite",
-    b"kismet",
-    b"bettercap",
-    b"empire",
-    b"sliver",
-    b"havoc",
-    b"covenant",
-    b"mythic",
-    b"ganache",
-    b"simcity",
-    b"tor",
-    b"i2p",
-];
+const DENY: &str = "\
+botnet\nbruteforce\nbrute-force\ncryptomin\ncryptomining\ncryptominer\ncrypto\nmining\n\
+stratum\nxmrig\nhashcat\nhydra\nnmap\nmasscan\nmetasploit\nmsfconsole\ncobalt\nbeacon\n\
+payload\nexploit\nbackdoor\nkeylog\nmimikatz\nlazagne\nsqlmap\nnikto\nwpscan\ngobuster\n\
+ffuf\ndirb\nnuclei\nreverse shell\n/dev/tcp\nnc -e\nncat -e\nsocat exec\nchisel\nligolo\n\
+ngrok\nransomware\nrootkit\nrkhunter\nmemdump\nvolatility\nlsass\nprocdump\nsekurlsa\n\
+kerberoast\nbloodhound\nimpacket\nresponder\nettercap\narpspoof\naircrack\nreaver\nwifite\n\
+kismet\nbettercap\nempire\nsliver\nhavoc\ncovenant\nmythic\nganache\nsimcity\ntor\ni2p";
 
 fn is_word_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
@@ -268,8 +207,8 @@ pub fn run(rng: &mut Rng, opts: &Opts, binaries: bool, require_binaries: bool) -
             report.push_bytes(cmd);
             report.push(b'\n');
         }
-        for term in DENY {
-            if contains_word(cmd, term) {
+        for term in DENY.lines() {
+            if contains_word(cmd, term.as_bytes()) {
                 deny_hits += 1;
                 report.push_str("deny: ");
                 report.push_bytes(cmd);

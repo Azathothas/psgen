@@ -83,7 +83,7 @@ pub fn current() -> User {
     // stub keeps the caller's uid, so the synthetic table has to agree with
     // the `ps` output the same rows produce.
     User {
-        name: uid.to_string().into_bytes(),
+        name: crate::json::u64_str(uid as u64).into_bytes(),
         uid,
         gid: sys::getgid(),
     }
@@ -165,65 +165,28 @@ pub fn ensure(name: &[u8], create: bool) -> (Option<(u32, u32)>, bool, Option<St
     // an earlier one cannot work here, so their text describes a different
     // failure (often an option a shim does not know), and the caller is shown
     // the first message the real `useradd` produced.
-    let attempts: [&[&str]; 4] = [
-        &[
-            "--system",
-            "--badname",
-            "--no-create-home",
-            "--home-dir",
-            "/nonexistent",
-            "--shell",
-            "/usr/sbin/nologin",
-            "--user-group",
-        ],
-        &[
-            "--system",
-            "--no-create-home",
-            "--home-dir",
-            "/nonexistent",
-            "--shell",
-            "/usr/sbin/nologin",
-            "--user-group",
-        ],
-        // A host can have the group without the user, for example after a
-        // package was removed but its group survived. --user-group fails
-        // there, so use the existing group by name.
-        &[
-            "--system",
-            "--badname",
-            "--no-create-home",
-            "--home-dir",
-            "/nonexistent",
-            "--shell",
-            "/usr/sbin/nologin",
-            "--gid",
-            name_str,
-        ],
-        // busybox's useradd shim wants -G for the group and no --badname.
-        &[
-            "-S",
-            "-H",
-            "-h",
-            "/nonexistent",
-            "-s",
-            "/usr/sbin/nologin",
-            "-G",
-            name_str,
-        ],
+    let attempts = [
+        "--system --badname --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin --user-group",
+        "--system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin --user-group",
+        "--system --badname --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin --gid",
+        "-S -H -h /nonexistent -s /usr/sbin/nologin -G",
     ];
     let mut first_error = String::new();
-    for opts in attempts.iter() {
-        let mut cmd = std::process::Command::new(useradd_bin);
-        cmd.env_clear()
-            .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
-            .env("LC_ALL", "C");
-        for o in opts.iter() {
-            cmd.arg(o);
+    let env: &[&[u8]] = &[b"PATH=/usr/sbin:/usr/bin:/sbin:/bin", b"LC_ALL=C"];
+    for (ai, opts) in attempts.iter().enumerate() {
+        let mut argv: Vec<&[u8]> = Vec::with_capacity(14);
+        argv.push(useradd_bin.as_bytes());
+        for o in opts.split(' ') {
+            argv.push(o.as_bytes());
         }
-        cmd.arg("--").arg(name_str);
-        match cmd.output() {
-            Ok(out) => {
-                if out.status.success() {
+        if ai >= 2 {
+            argv.push(name_str.as_bytes());
+        }
+        argv.push(b"--");
+        argv.push(name_str.as_bytes());
+        match sys::run_cmd(useradd_bin.as_bytes(), &argv, Some(env), true) {
+            Ok((code, stderr)) => {
+                if code == 0 {
                     if let Some((uid, gid)) = lookup_name(name) {
                         return (Some((uid, gid)), true, None);
                     }
@@ -239,14 +202,14 @@ pub fn ensure(name: &[u8], create: bool) -> (Option<(u32, u32)>, bool, Option<St
                         ),
                     );
                 }
-                let e = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                let e = String::from_utf8_lossy(&stderr).trim().to_string();
                 if first_error.is_empty() && !e.is_empty() {
                     first_error = e;
                 }
             }
             Err(e) => {
                 if first_error.is_empty() {
-                    first_error = e.to_string();
+                    first_error = std::io::Error::from_raw_os_error(e).to_string();
                 }
             }
         }

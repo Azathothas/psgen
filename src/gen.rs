@@ -1,10 +1,12 @@
 //! Process generation: template expansion, realistic jitter, table rows.
 
 use crate::corpus::{self, Tmpl};
+use crate::json;
 use crate::rng::Rng;
 use crate::str::{self, Buf};
 use crate::sys;
 use crate::util;
+#[cfg(test)]
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
@@ -104,18 +106,23 @@ impl Fit {
         // `pid_capacity` is `pid_max - 2`, so `pid_max == 3` still leaves one
         // row beside PID 1 (PID 2) and the parenthetical must say so.
         let pids = match (has_init, self.pid_max > 2) {
-            (true, true) => format!("PID 1 and 2..{}", self.pid_max - 1),
+            (true, true) => json::cat2("PID 1 and 2..", &json::u64_str(self.pid_max - 1)),
             (true, false) => "PID 1 alone".to_string(),
-            (false, true) => format!("PID 2..{}", self.pid_max - 1),
+            (false, true) => json::cat2("PID 2..", &json::u64_str(self.pid_max - 1)),
             (false, false) => "no PID beside PID 1".to_string(),
         };
-        Some(format!(
-            "pid_max is {}, so a snapshot can hold {} {} ({})",
-            self.pid_max,
-            room,
-            if room == 1 { "process" } else { "processes" },
-            pids
-        ))
+        let mut s = String::from("pid_max is ");
+        json::push_u64(&mut s, self.pid_max);
+        s.push_str(", so a snapshot can hold ");
+        json::push_u64(&mut s, room as u64);
+        s.push_str(if room == 1 {
+            " process ("
+        } else {
+            " processes ("
+        });
+        s.push_str(&pids);
+        s.push(')');
+        Some(s)
     }
 }
 
@@ -263,13 +270,29 @@ fn pigeonhole(weights: &[u16; 10], opts: &Opts, want: usize) -> usize {
     want.div_ceil(k).max(1)
 }
 
+type CmdCounts = Vec<(Vec<u8>, usize)>;
+type UserCache = Vec<(Vec<u8>, (u32, u32))>;
+
+fn cmd_inc(emitted: &mut CmdCounts, cmd: Vec<u8>) {
+    match emitted.binary_search_by(|(k, _)| k.as_slice().cmp(cmd.as_slice())) {
+        Ok(pos) => emitted[pos].1 += 1,
+        Err(pos) => emitted.insert(pos, (cmd, 1)),
+    }
+}
+
 /// `--repeat-max` bounds how often one *command line* may appear, not how often
 /// one template may be drawn: two templates can expand to the same command, and
 /// a caller who asked for no repeats means no repeats.
-fn command_allows(emitted: &BTreeMap<Vec<u8>, usize>, cmd: &[u8], bound: Option<usize>) -> bool {
+fn command_allows(emitted: &CmdCounts, cmd: &[u8], bound: Option<usize>) -> bool {
     match bound {
         Some(0) | None => true,
-        Some(n) => emitted.get(cmd).copied().unwrap_or(0) < n,
+        Some(n) => {
+            emitted
+                .binary_search_by(|(k, _)| k.as_slice().cmp(cmd))
+                .map(|pos| emitted[pos].1)
+                .unwrap_or(0)
+                < n
+        }
     }
 }
 
@@ -294,14 +317,13 @@ pub fn repeatable(t: &Tmpl) -> bool {
 /// `{user}` and `{uid}` are fixed for a whole run, so a template whose only
 /// placeholder is one of those produces the same command line on every draw:
 /// it may appear once, and it cannot pad a large count.
-const VARIABLE_PLACEHOLDERS: &[&str] = &[
-    "{hex6}", "{hex8}", "{hex12}", "{hex64}", "{n}", "{n2}", "{pid}", "{port}", "{cport}", "{ip}",
-];
+const VARIABLE_PLACEHOLDERS: &str =
+    "{hex6},{hex8},{hex12},{hex64},{n},{n2},{pid},{port},{cport},{ip}";
 
 /// Whether re-expanding this template can yield a different command line,
 /// which is what makes it usable as padding for a large count.
 pub fn has_variants(t: &Tmpl) -> bool {
-    VARIABLE_PLACEHOLDERS.iter().any(|p| t.cmd.contains(p))
+    VARIABLE_PLACEHOLDERS.split(',').any(|p| t.cmd.contains(p))
 }
 
 /// `has_variants` for a list, where `{uid}` is not fixed for the run: `list`
@@ -589,28 +611,27 @@ fn jitter(rng: &mut Rng, base: u32, pct: u64) -> u32 {
     v.max(1024) as u32
 }
 
-fn resolve_user_cached(
-    t: &Tmpl,
-    opts: &Opts,
-    cache: &mut BTreeMap<Vec<u8>, (u32, u32)>,
-) -> (Vec<u8>, u32, u32) {
-    let lookup = |name: &[u8], cache: &mut BTreeMap<Vec<u8>, (u32, u32)>| -> (u32, u32) {
-        if let Some(v) = cache.get(name) {
+fn resolve_user_cached(t: &Tmpl, opts: &Opts, cache: &mut UserCache) -> (Vec<u8>, u32, u32) {
+    let lookup = |name: &[u8], cache: &mut UserCache| -> (u32, u32) {
+        if let Some((_, v)) = cache.iter().find(|(k, _)| k.as_slice() == name) {
             return *v;
         }
         let v = util::lookup_user(name).unwrap_or_else(|| {
-            if let Some(sv) = cache.get(&opts.self_user) {
+            if let Some((_, sv)) = cache
+                .iter()
+                .find(|(k, _)| k.as_slice() == opts.self_user.as_slice())
+            {
                 *sv
             } else {
                 let sv = util::lookup_user(&opts.self_user).unwrap_or_else(|| {
                     let me = util::current_user();
                     (me.uid, me.gid)
                 });
-                cache.insert(opts.self_user.clone(), sv);
+                cache.push((opts.self_user.clone(), sv));
                 sv
             }
         });
-        cache.insert(name.to_vec(), v);
+        cache.push((name.to_vec(), v));
         v
     };
     if t.user == corpus::SELF_USER {
@@ -655,7 +676,7 @@ fn make_proc(
     rng: &mut Rng,
     opts: &Opts,
     snap: &Snap,
-    cache: &mut BTreeMap<Vec<u8>, (u32, u32)>,
+    cache: &mut UserCache,
 ) -> Proc {
     let uptime = snap.uptime;
     let (user, uid, gid) = resolve_user_cached(t, opts, cache);
@@ -787,9 +808,7 @@ pub fn all_commands(rng: &mut Rng, opts: &Opts) -> Vec<Vec<u8>> {
 /// often is weighted by the profile.
 pub fn gen_list(rng: &mut Rng, opts: &Opts) -> Vec<Vec<u8>> {
     let mut out: Vec<Vec<u8>> = Vec::new();
-    // A BTreeSet keeps the duplicate check O(log n) per line: the linear scan
-    // over every line already kept made `list -n 2000` quadratic.
-    let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
+    let mut seen: Vec<Vec<u8>> = Vec::new();
     let uniq = opts.uniq;
     if opts.count == 0 {
         for t in corpus::CORPUS.iter() {
@@ -805,8 +824,11 @@ pub fn gen_list(rng: &mut Rng, opts: &Opts) -> Vec<Vec<u8>> {
 
     let weights = corpus::profile_weights(&opts.profile);
     let target = opts.count.min(2000);
-    let push = |cmd: Vec<u8>, out: &mut Vec<Vec<u8>>, seen: &mut BTreeSet<Vec<u8>>| {
-        if !uniq || seen.insert(cmd.clone()) {
+    let push = |cmd: Vec<u8>, out: &mut Vec<Vec<u8>>, seen: &mut Vec<Vec<u8>>| {
+        if !uniq {
+            out.push(cmd);
+        } else if let Err(pos) = seen.binary_search(&cmd) {
+            seen.insert(pos, cmd.clone());
             out.push(cmd);
         }
     };
@@ -952,7 +974,8 @@ struct Pids {
     next: i64,
     /// Highest PID this allocator may return; 0 means unlimited.
     max: i64,
-    used: BTreeSet<i32>,
+    used_bits: Vec<u64>,
+    used_extra: Vec<i32>,
     /// Free PIDs left, when the space is bounded.
     free: Option<usize>,
 }
@@ -971,8 +994,29 @@ impl Pids {
         Pids {
             next: base,
             max,
-            used: BTreeSet::new(),
+            used_bits: vec![0u64; 1024],
+            used_extra: Vec::new(),
             free,
+        }
+    }
+
+    fn insert_used(&mut self, pid: i32) -> bool {
+        if (0..65_536).contains(&pid) {
+            let p = pid as usize;
+            let mask = 1u64 << (p & 63);
+            if (self.used_bits[p >> 6] & mask) != 0 {
+                return false;
+            }
+            self.used_bits[p >> 6] |= mask;
+            true
+        } else {
+            match self.used_extra.binary_search(&pid) {
+                Ok(_) => false,
+                Err(pos) => {
+                    self.used_extra.insert(pos, pid);
+                    true
+                }
+            }
         }
     }
 
@@ -1007,7 +1051,7 @@ impl Pids {
                 self.next = 2;
             }
             let pid = self.next as i32;
-            if self.used.insert(pid) {
+            if self.insert_used(pid) {
                 if let Some(f) = &mut self.free {
                     *f = f.saturating_sub(1);
                 }
@@ -1049,8 +1093,8 @@ fn population_counting(
     let weights = corpus::profile_weights(&opts.profile);
     let mut rows: Vec<Proc> = Vec::with_capacity(want);
     let mut counts = vec![0usize; corpus::CORPUS.len()];
-    let mut emitted: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
-    let mut cache: BTreeMap<Vec<u8>, (u32, u32)> = BTreeMap::new();
+    let mut emitted: CmdCounts = Vec::new();
+    let mut cache: UserCache = Vec::new();
 
     // PID 1 is init whenever the system family is in scope. `inject` never
     // draws it: PID 1 is the kernel's.
@@ -1062,7 +1106,7 @@ fn population_counting(
     {
         if let Some(idx) = init_idx {
             let p = make_proc(&corpus::CORPUS[idx], idx, rng, opts, &snap, &mut cache);
-            *emitted.entry(p.cmd.clone()).or_insert(0) += 1;
+            cmd_inc(&mut emitted, p.cmd.clone());
             counts[idx] += 1;
             rows.push(p);
         }
@@ -1097,7 +1141,7 @@ fn population_counting(
                 let pp = make_proc(&corpus::CORPUS[pidx], pidx, rng, opts, &snap, &mut cache);
                 built += 1;
                 if command_allows(&emitted, &pp.cmd, opts.repeat_max) {
-                    *emitted.entry(pp.cmd.clone()).or_insert(0) += 1;
+                    cmd_inc(&mut emitted, pp.cmd.clone());
                     counts[pidx] += 1;
                     rows.push(pp);
                     used.push(pidx);
@@ -1123,7 +1167,7 @@ fn population_counting(
             if !command_allows(&emitted, &p.cmd, opts.repeat_max) {
                 continue;
             }
-            *emitted.entry(p.cmd.clone()).or_insert(0) += 1;
+            cmd_inc(&mut emitted, p.cmd.clone());
             counts[idx] += 1;
             p.parent = parent_row;
             push_row(&mut rows, p);
@@ -1226,9 +1270,9 @@ fn emit_fill_row(
     out: &mut Vec<Proc>,
     want: usize,
     counts: &mut [usize],
-    emitted: &mut BTreeMap<Vec<u8>, usize>,
+    emitted: &mut CmdCounts,
     snap: &Snap,
-    user_cache: &mut BTreeMap<Vec<u8>, (u32, u32)>,
+    user_cache: &mut UserCache,
     built: &mut usize,
 ) -> bool {
     if out.len() >= want {
@@ -1250,7 +1294,7 @@ fn emit_fill_row(
                 *built += 1;
                 pp.parent = None;
                 if command_allows(emitted, &pp.cmd, command_bound) {
-                    *emitted.entry(pp.cmd.clone()).or_insert(0) += 1;
+                    cmd_inc(emitted, pp.cmd.clone());
                     counts[pidx] += 1;
                     out.push(pp);
                     parent_row = Some(out.len() - 1);
@@ -1269,7 +1313,7 @@ fn emit_fill_row(
         if !command_allows(emitted, &p.cmd, command_bound) {
             continue;
         }
-        *emitted.entry(p.cmd.clone()).or_insert(0) += 1;
+        cmd_inc(emitted, p.cmd.clone());
         counts[idx] += 1;
         p.parent = parent_row;
         if let Some(pi) = parent_row {
@@ -1295,7 +1339,7 @@ fn fill(
     want: usize,
     counts: &mut [usize],
     snap: &Snap,
-    user_cache: &mut BTreeMap<Vec<u8>, (u32, u32)>,
+    user_cache: &mut UserCache,
 ) -> usize {
     let mut built = 0usize;
     if out.len() >= want {
@@ -1392,7 +1436,7 @@ fn fill(
         .enumerate()
         .map(|(i, w)| (w * need as u64 % total, i))
         .collect();
-    frac.sort_unstable_by(|a, b| b.cmp(a));
+    json::shell_sort_by(&mut frac, |a, b| a < b);
     for &(_, pos) in &frac {
         if rest == 0 {
             break;
@@ -1402,9 +1446,9 @@ fn fill(
             rest -= 1;
         }
     }
-    let mut emitted: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
+    let mut emitted: CmdCounts = Vec::new();
     for p in out.iter() {
-        *emitted.entry(p.cmd.clone()).or_insert(0) += 1;
+        cmd_inc(&mut emitted, p.cmd.clone());
     }
     // Snapshot each candidate's pre-fill count so that if `emit_fill_row`
     // spawns a missing parent `pidx` early (`counts[pidx] += 1`), we do not
@@ -1488,7 +1532,7 @@ pub fn gen_table(rng: &mut Rng, opts: &Opts, fit: &Fit) -> Vec<Proc> {
         p.pid = pid;
         out.push(p);
     }
-    out.sort_unstable_by_key(|p| p.pid);
+    json::shell_sort_by(&mut out, |a, b| a.pid > b.pid);
     fit_rows(&mut out, fit);
     out
 }

@@ -23,13 +23,31 @@ const CFG_MAGIC: &[u8; 8] = b"PGCFG023";
 /// Version 3 adds the per-run nonce. A config without one is not honoured:
 /// an inherited fd 3 could otherwise name an arbitrary binary to exec and an
 /// arbitrary directory to create as root.
-const CFG_VERSION: u32 = 3;
+const CFG_VERSION_V3: u32 = 3;
+/// Version 4 extends version 3 with decoy fidelity fields (clean env, memfd
+/// exec, cwd, multi-thread comms, cloned fds, decoy token, seccomp/dumpable,
+/// wchan mode, jitter).
+const CFG_VERSION_V4: u32 = 4;
 const CFG_HEADER: usize = 104;
+const CFG_V4_EXT: usize = 40;
 const CFG_STAGE_OFF: u64 = 40;
 const MAX_FDS: usize = 512;
 
 /// Marks the root of a spawned subtree in `Config::flags`.
 pub const F_ROOT: u32 = 1 << 8;
+/// Verify nonce via `/proc/self/fd/<fd>` memfd name (`pg:<nonce>`) and never
+/// place `PSGEN_NONCE` in `environ`.
+pub const F_CLEAN_ENV: u32 = 1 << 9;
+/// Copy `/proc/self/exe` into a labeled memfd and re-exec via `execveat`.
+pub const F_EXE_MEMFD: u32 = 1 << 10;
+/// Set `PR_SET_DUMPABLE(0)` after setup so same-UID `/proc/<pid>/mem` reads fail.
+pub const F_NON_DUMPABLE: u32 = 1 << 11;
+/// Set `PR_SET_NO_NEW_PRIVS(1)` after setup.
+pub const F_NO_NEW_PRIVS: u32 = 1 << 12;
+/// Best-effort `PTRACE_SEIZE` on direct child stubs after they settle.
+pub const F_PTRACE_CHILDREN: u32 = 1 << 13;
+/// Child waits for parent `PTRACE_SEIZE` (`TracerPid != 0`) before `PR_SET_DUMPABLE(0)`.
+pub const F_WAIT_TRACER: u32 = 1 << 14;
 /// Set by the injector when the stub runs in a user namespace it creates.
 /// The uid switch is skipped there: the namespace already maps ns-uid 0 to
 /// the caller, and the target uid is not mapped.
@@ -66,9 +84,8 @@ pub struct Config {
     pub temp: Vec<u8>,
     pub disk_kb: u32,
     pub self_copy: Vec<u8>,
-    /// Per-run secret, also present in this process's argv[1]. The injector
-    /// generates it; a config handed to the stub by anything else cannot know
-    /// it without also choosing argv.
+    /// Per-run secret, also present in `PSGEN_NONCE` (v3) or the sealed config
+    /// memfd name `pg:<nonce>` (`F_CLEAN_ENV`).
     pub nonce: Vec<u8>,
     pub child_fds: Vec<i32>,
     pub keep_fds: Vec<i32>,
@@ -76,6 +93,17 @@ pub struct Config {
     pub arena_fd: i32,
     pub status_fd: i32,
     pub id: u32,
+    pub cwd: Vec<u8>,
+    pub env_block: Vec<u8>,
+    pub memfd_label: Vec<u8>,
+    pub decoy_token: Vec<u8>,
+    pub thread_comms: Vec<u8>,
+    pub fd_specs: Vec<u8>,
+    pub wchan_mode: u8,
+    pub seccomp_filters: u8,
+    pub jitter_ms: u32,
+    pub vm_lck_kb: u32,
+    pub rss_shmem_kb: u32,
 }
 
 fn u32_at(buf: &[u8], at: usize) -> u32 {
@@ -106,13 +134,39 @@ fn read_bytes(fd: i32, off: u64, len: usize) -> Option<Vec<u8>> {
     Some(v)
 }
 
+struct CfgReader {
+    fd: i32,
+    off: u64,
+}
+
+impl CfgReader {
+    fn read_capped(&mut self, len: usize, cap: usize) -> Option<Vec<u8>> {
+        if len > cap {
+            return None;
+        }
+        let v = read_bytes(self.fd, self.off, len)?;
+        self.off += len as u64;
+        Some(v)
+    }
+
+    fn read_fixed<const N: usize>(&mut self) -> Option<[u8; N]> {
+        let mut buf = [0u8; N];
+        if sys::pread_fd(self.fd, &mut buf, self.off) < N as isize {
+            return None;
+        }
+        self.off += N as u64;
+        Some(buf)
+    }
+}
+
 pub fn read_config(fd: i32) -> Option<Config> {
-    let mut hdr = [0u8; CFG_HEADER];
-    let n = sys::pread_fd(fd, &mut hdr, 0);
-    if n < CFG_HEADER as isize || &hdr[..8] != CFG_MAGIC {
+    let mut r = CfgReader { fd, off: 0 };
+    let hdr = r.read_fixed::<CFG_HEADER>()?;
+    if &hdr[..8] != CFG_MAGIC {
         return None;
     }
-    if u32_at(&hdr, 8) != CFG_VERSION {
+    let ver = u32_at(&hdr, 8);
+    if ver != CFG_VERSION_V3 && ver != CFG_VERSION_V4 {
         return None;
     }
     let flags = u32_at(&hdr, 12);
@@ -137,29 +191,10 @@ pub fn read_config(fd: i32) -> Option<Config> {
     let disk_kb = u32_at(&hdr, 88);
     let self_len = u32_at(&hdr, 92) as usize;
     let nonce_len = u32_at(&hdr, 96) as usize;
-    if nonce_len > 64 {
+    if child_count > MAX_FDS || keep_count > MAX_FDS || !(0..=(1 << 20)).contains(&max_fd) {
         return None;
     }
-    if child_count > MAX_FDS || keep_count > MAX_FDS {
-        return None;
-    }
-    if comm_len > 64 || exe_len > 4096 || cmd_len > 4096 || user_len > 64 || temp_len > 4096 {
-        return None;
-    }
-    if self_len > 4096 {
-        return None;
-    }
-    if !(0..=(1 << 20)).contains(&max_fd) {
-        return None;
-    }
-    let fds_len = (child_count + keep_count) * 4;
-    let mut fds_buf = vec![0u8; fds_len];
-    if fds_len > 0 {
-        let n = sys::pread_fd(fd, &mut fds_buf, CFG_HEADER as u64);
-        if n < fds_len as isize {
-            return None;
-        }
-    }
+    let fds_buf = r.read_capped((child_count + keep_count) * 4, MAX_FDS * 8)?;
     let mut child_fds = Vec::with_capacity(child_count);
     let mut keep_fds = Vec::with_capacity(keep_count);
     for i in 0..child_count {
@@ -168,20 +203,67 @@ pub fn read_config(fd: i32) -> Option<Config> {
     for i in 0..keep_count {
         keep_fds.push(i32_at(&fds_buf, (child_count + i) * 4));
     }
-    let mut off = (CFG_HEADER + fds_len) as u64;
-    let comm = read_bytes(fd, off, comm_len)?;
-    off += comm_len as u64;
-    let exe = read_bytes(fd, off, exe_len)?;
-    off += exe_len as u64;
-    let cmd = read_bytes(fd, off, cmd_len)?;
-    off += cmd_len as u64;
-    let user = read_bytes(fd, off, user_len)?;
-    off += user_len as u64;
-    let temp = read_bytes(fd, off, temp_len)?;
-    off += temp_len as u64;
-    let self_copy = read_bytes(fd, off, self_len)?;
-    off += self_len as u64;
-    let nonce = read_bytes(fd, off, nonce_len)?;
+    let comm = r.read_capped(comm_len, 64)?;
+    let exe = r.read_capped(exe_len, 4096)?;
+    let cmd = r.read_capped(cmd_len, 4096)?;
+    let user = r.read_capped(user_len, 64)?;
+    let temp = r.read_capped(temp_len, 4096)?;
+    let self_copy = r.read_capped(self_len, 4096)?;
+    let nonce = r.read_capped(nonce_len, 64)?;
+
+    let (
+        cwd,
+        env_block,
+        memfd_label,
+        decoy_token,
+        thread_comms,
+        fd_specs,
+        wchan_mode,
+        seccomp_filters,
+        jitter_ms,
+        vm_lck_kb,
+        rss_shmem_kb,
+    ) = if ver == CFG_VERSION_V4 {
+        let ext = r.read_fixed::<CFG_V4_EXT>()?;
+        let packed = u32_at(&ext, 24);
+        let jitter_ms = u32_at(&ext, 28);
+        let vm_lck_kb = u32_at(&ext, 32);
+        let rss_shmem_kb = u32_at(&ext, 36);
+        let cwd = r.read_capped(u32_at(&ext, 0) as usize, 4096)?;
+        let env_block = r.read_capped(u32_at(&ext, 4) as usize, 65536)?;
+        let memfd_label = r.read_capped(u32_at(&ext, 8) as usize, 256)?;
+        let decoy_token = r.read_capped(u32_at(&ext, 12) as usize, 4096)?;
+        let thread_comms = r.read_capped(u32_at(&ext, 16) as usize, 4096)?;
+        let fd_specs = r.read_capped(u32_at(&ext, 20) as usize, 16384)?;
+        (
+            cwd,
+            env_block,
+            memfd_label,
+            decoy_token,
+            thread_comms,
+            fd_specs,
+            (packed & 0xff) as u8,
+            ((packed >> 8) & 0xff) as u8,
+            jitter_ms,
+            vm_lck_kb,
+            rss_shmem_kb,
+        )
+    } else {
+        (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    };
+
     Some(Config {
         flags,
         vsz_kb,
@@ -205,10 +287,50 @@ pub fn read_config(fd: i32) -> Option<Config> {
         arena_fd,
         status_fd,
         id,
+        cwd,
+        env_block,
+        memfd_label,
+        decoy_token,
+        thread_comms,
+        fd_specs,
+        wchan_mode,
+        seccomp_filters,
+        jitter_ms,
+        vm_lck_kb,
+        rss_shmem_kb,
     })
 }
 
 pub fn encode_config(c: &Config) -> Vec<u8> {
+    let v4_flags = F_CLEAN_ENV
+        | F_EXE_MEMFD
+        | F_NON_DUMPABLE
+        | F_NO_NEW_PRIVS
+        | F_PTRACE_CHILDREN
+        | F_WAIT_TRACER;
+    let is_v4 = (c.flags & v4_flags) != 0
+        || !c.cwd.is_empty()
+        || !c.env_block.is_empty()
+        || !c.memfd_label.is_empty()
+        || !c.decoy_token.is_empty()
+        || !c.thread_comms.is_empty()
+        || !c.fd_specs.is_empty()
+        || c.wchan_mode != 0
+        || c.seccomp_filters != 0
+        || c.jitter_ms != 0
+        || c.vm_lck_kb != 0
+        || c.rss_shmem_kb != 0;
+    let extra_cap = if is_v4 {
+        CFG_V4_EXT
+            + c.cwd.len()
+            + c.env_block.len()
+            + c.memfd_label.len()
+            + c.decoy_token.len()
+            + c.thread_comms.len()
+            + c.fd_specs.len()
+    } else {
+        0
+    };
     let mut out = Vec::with_capacity(
         CFG_HEADER
             + (c.child_fds.len() + c.keep_fds.len()) * 4
@@ -218,10 +340,18 @@ pub fn encode_config(c: &Config) -> Vec<u8> {
             + c.user.len()
             + c.temp.len()
             + c.self_copy.len()
-            + c.nonce.len(),
+            + c.nonce.len()
+            + extra_cap,
     );
     out.extend_from_slice(CFG_MAGIC);
-    push_u32(&mut out, CFG_VERSION);
+    push_u32(
+        &mut out,
+        if is_v4 {
+            CFG_VERSION_V4
+        } else {
+            CFG_VERSION_V3
+        },
+    );
     push_u32(&mut out, c.flags);
     push_u32(&mut out, c.vsz_kb);
     push_u32(&mut out, c.rss_kb);
@@ -258,6 +388,27 @@ pub fn encode_config(c: &Config) -> Vec<u8> {
     out.extend_from_slice(&c.temp);
     out.extend_from_slice(&c.self_copy);
     out.extend_from_slice(&c.nonce);
+    if is_v4 {
+        push_u32(&mut out, c.cwd.len() as u32);
+        push_u32(&mut out, c.env_block.len() as u32);
+        push_u32(&mut out, c.memfd_label.len() as u32);
+        push_u32(&mut out, c.decoy_token.len() as u32);
+        push_u32(&mut out, c.thread_comms.len() as u32);
+        push_u32(&mut out, c.fd_specs.len() as u32);
+        push_u32(
+            &mut out,
+            (c.wchan_mode as u32) | ((c.seccomp_filters as u32) << 8),
+        );
+        push_u32(&mut out, c.jitter_ms);
+        push_u32(&mut out, c.vm_lck_kb);
+        push_u32(&mut out, c.rss_shmem_kb);
+        out.extend_from_slice(&c.cwd);
+        out.extend_from_slice(&c.env_block);
+        out.extend_from_slice(&c.memfd_label);
+        out.extend_from_slice(&c.decoy_token);
+        out.extend_from_slice(&c.thread_comms);
+        out.extend_from_slice(&c.fd_specs);
+    }
     out
 }
 
@@ -292,6 +443,25 @@ fn close_unneeded_except(cfg: &Config, own_fd: i32) {
 }
 
 pub fn build_argv(cmd: &[u8]) -> (Vec<u8>, Vec<*const u8>) {
+    if cmd.contains(&0) {
+        let mut buf = cmd.to_vec();
+        if buf.last() != Some(&0) {
+            buf.push(0);
+        }
+        let mut argv: Vec<*const u8> = Vec::new();
+        let mut start = 0usize;
+        for i in 0..buf.len() {
+            if buf[i] == 0 {
+                argv.push(unsafe { buf.as_ptr().add(start) });
+                start = i + 1;
+            }
+        }
+        if argv.is_empty() {
+            argv.push(buf.as_ptr());
+        }
+        argv.push(std::ptr::null());
+        return (buf, argv);
+    }
     let mut buf = cmd.to_vec();
     while buf.last() == Some(&b' ') {
         buf.pop();
@@ -383,6 +553,67 @@ fn env_nonce() -> Vec<u8> {
         }
     }
     Vec::new()
+}
+
+/// Build a clean `envp` without `PSGEN_NONCE`. When `env_block` is non-empty,
+/// it is parsed as NUL-separated `KEY=VAL` entries; otherwise a minimal
+/// `PATH` + `LANG` environment is used.
+pub fn build_envp_clean(env_block: &[u8]) -> (Vec<u8>, Vec<*const u8>) {
+    if env_block.is_empty() {
+        #[allow(clippy::manual_c_str_literals)]
+        let path = b"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\0";
+        #[allow(clippy::manual_c_str_literals)]
+        let lang = b"LANG=C.UTF-8\0";
+        return (
+            Vec::new(),
+            vec![path.as_ptr(), lang.as_ptr(), std::ptr::null()],
+        );
+    }
+    let mut buf = env_block.to_vec();
+    if buf.last() != Some(&0) {
+        buf.push(0);
+    }
+    let mut env: Vec<*const u8> = Vec::new();
+    let mut start = 0usize;
+    for i in 0..buf.len() {
+        if buf[i] == 0 {
+            if i > start {
+                env.push(unsafe { buf.as_ptr().add(start) });
+            }
+            start = i + 1;
+        }
+    }
+    env.push(std::ptr::null());
+    (buf, env)
+}
+
+fn exec_env(cfg: &Config) -> (Vec<u8>, Vec<*const u8>) {
+    if cfg.flags & F_CLEAN_ENV != 0 {
+        build_envp_clean(&cfg.env_block)
+    } else {
+        (Vec::new(), envp())
+    }
+}
+
+/// Verify that open memfd `fd` carries `/memfd:pg:<nonce>` (optionally followed
+/// by ` (deleted)`), matching `nonce` without needing `PSGEN_NONCE` in `environ`.
+pub fn memfd_nonce_matches(fd: i32, nonce: &[u8]) -> bool {
+    if nonce.is_empty() || fd < 0 {
+        return false;
+    }
+    let mut path = Buf::new();
+    path.push_str("/proc/self/fd/");
+    path.push_u64(fd as u64);
+    let link = match sys::read_link(path.as_bytes()) {
+        Some(l) => l,
+        None => return false,
+    };
+    let rest = match link.strip_prefix(b"/memfd:pg:") {
+        Some(r) => r,
+        None => return false,
+    };
+    let tok = rest.strip_suffix(b" (deleted)").unwrap_or(rest);
+    tok == nonce
 }
 
 /// `PSGEN_NONCE=<hex>\0` for this process's own nonce, or empty.
@@ -481,6 +712,14 @@ fn write_status(cfg: &Config, status: i32, dev: u32) {
     sys::close(cfg.status_fd);
 }
 
+fn write_id_map(path: &str, id: u32) -> bool {
+    let mut b = Buf::new();
+    b.push_str("0 ");
+    b.push_u64(id as u64);
+    b.push_str(" 1\n");
+    std::fs::write(path, b.as_bytes()).is_ok()
+}
+
 pub(crate) fn enter_mount_ns() -> bool {
     if sys::geteuid() == 0 {
         if !sys::unshare(sys::CLONE_NEWNS) {
@@ -496,10 +735,7 @@ pub(crate) fn enter_mount_ns() -> bool {
         return false;
     }
     let _ = std::fs::write("/proc/self/setgroups", b"deny");
-    if std::fs::write("/proc/self/uid_map", format!("0 {} 1\n", uid).as_bytes()).is_err() {
-        return false;
-    }
-    if std::fs::write("/proc/self/gid_map", format!("0 {} 1\n", gid).as_bytes()).is_err() {
+    if !write_id_map("/proc/self/uid_map", uid) || !write_id_map("/proc/self/gid_map", gid) {
         return false;
     }
     sys::mount(b"", b"/", b"", sys::MS_REC | sys::MS_PRIVATE, b"")
@@ -802,13 +1038,40 @@ fn config_fd_ok(fd: i32) -> bool {
     matches!(fd_kind(fd), FdKind::SealedAnon)
 }
 
+fn exec_with_cfg(path: &[u8], cfg: &Config) {
+    let (buf, argv) = build_argv(&cfg.cmd);
+    let (env_buf, env) = exec_env(cfg);
+    sys::execve(path, &argv, &env);
+    let _ = (&buf, &env_buf);
+}
+
+fn exec_memfd_self(cfg: &Config) {
+    let label = if cfg.memfd_label.is_empty() {
+        &cfg.comm[..]
+    } else {
+        &cfg.memfd_label[..]
+    };
+    let mfd = sys::memfd_exec_copy(label, b"/proc/self/exe");
+    if mfd >= 0 {
+        let (buf, argv) = build_argv(&cfg.cmd);
+        let (env_buf, env) = exec_env(cfg);
+        sys::fexecve(mfd, &argv, &env);
+        let _ = (&buf, &env_buf);
+        sys::close(mfd);
+    }
+}
+
 pub fn child_entry(fd: i32) -> ! {
     let mut child = match read_config(fd) {
         Some(c) => c,
         None => sys::exit(1),
     };
-    if child.stage != 0 || child.nonce.is_empty() || child.nonce != env_nonce() || !config_fd_ok(fd)
-    {
+    let nonce_ok = if child.flags & F_CLEAN_ENV != 0 {
+        memfd_nonce_matches(fd, &child.nonce)
+    } else {
+        child.nonce == env_nonce()
+    };
+    if child.stage != 0 || child.nonce.is_empty() || !nonce_ok || !config_fd_ok(fd) {
         sys::exit(1);
     }
     child.child_fds.retain(|c| *c != fd && *c != 3);
@@ -819,25 +1082,21 @@ pub fn child_entry(fd: i32) -> ! {
         sys::exit(1);
     }
     fork_children(&child);
-    let copy = if safe_copy(&child.self_copy) {
+    let use_memfd_exe = child.flags & F_EXE_MEMFD != 0;
+    let copy = if !use_memfd_exe && safe_copy(&child.self_copy) {
         child.self_copy.clone()
     } else {
         Vec::new()
     };
-    let exec_path = if !child.exe.is_empty() && setup_exe(&child) {
+    let exec_path = if use_memfd_exe {
+        b"/proc/self/exe".to_vec()
+    } else if !child.exe.is_empty() && setup_exe(&child) {
         child.exe.clone()
     } else if !copy.is_empty() {
         copy.clone()
     } else {
-        // Exec the magic link, not the text readlink returns. When the stub
-        // has already entered a private mount namespace and the binary lives
-        // on another mount, the text path renders relative to that mount and
-        // does not exist outside the namespace. The magic link resolves to
-        // the file the process is already running, whose path stays visible
-        // to the caller.
         b"/proc/self/exe".to_vec()
     };
-    let (buf, argv) = build_argv(&child.cmd);
     if sys::dup2(fd, 3) != 3 {
         write_status(&child, -1, 0);
         sys::exit(1);
@@ -846,14 +1105,13 @@ pub fn child_entry(fd: i32) -> ! {
         sys::close(fd);
     }
     close_above(6);
-    let env = envp();
-    sys::execve(&exec_path, &argv, &env);
-    if !copy.is_empty() && copy != exec_path {
-        let (buf2, argv2) = build_argv(&child.cmd);
-        sys::execve(&copy, &argv2, &env);
-        let _ = &buf2;
+    if use_memfd_exe {
+        exec_memfd_self(&child);
     }
-    let _ = &buf;
+    exec_with_cfg(&exec_path, &child);
+    if !copy.is_empty() && copy != exec_path {
+        exec_with_cfg(&copy, &child);
+    }
     let e = sys::last_error().raw_os_error().unwrap_or(1).abs();
     write_status(&child, -e, 0);
     sys::exit(1);
@@ -880,6 +1138,7 @@ fn pad_rss(cfg: &Config) -> bool {
     if len == 0 {
         return false;
     }
+    let base_kb = util::self_rss_kb();
     let ptr = sys::mmap(
         len,
         sys::PROT_READ | sys::PROT_WRITE,
@@ -891,30 +1150,41 @@ fn pad_rss(cfg: &Config) -> bool {
         sys::close(cfg.arena_fd);
         return false;
     }
-    touch_pages(ptr, len);
+    let page_kb = sys::page_kb().max(1);
+    let initial_kb = (target_kb.saturating_sub(base_kb).div_ceil(page_kb) * page_kb).min(trim_kb);
+    if initial_kb > 0 {
+        touch_pages(ptr, (initial_kb * 1024) as usize);
+    }
     sys::close(cfg.arena_fd);
-    let tol = sys::page_kb().max(1);
+    let tol = page_kb;
+    let mut mapped_kb = initial_kb;
     let mut ok = false;
-    for _ in 0..8 {
+    for _ in 0..16 {
         let cur = util::self_rss_kb();
         if cur.abs_diff(target_kb) <= tol {
             ok = true;
             break;
         }
-        if cur > trim_kb {
-            let drop = cur - trim_kb;
-            if drop > trim_kb {
-                sys::madvise(ptr, len, sys::MADV_DONTNEED);
+        if cur > target_kb {
+            let drop = (cur - target_kb).min(mapped_kb);
+            if drop == 0 {
                 break;
             }
-            let start = unsafe { ptr.add(((trim_kb - drop) * 1024) as usize) };
+            mapped_kb -= drop;
+            let start = unsafe { ptr.add((mapped_kb * 1024) as usize) };
             sys::madvise(start, (drop * 1024) as usize, sys::MADV_DONTNEED);
         } else {
-            touch_pages(ptr, len);
+            let need = (target_kb - cur).min(trim_kb - mapped_kb);
+            if need == 0 {
+                break;
+            }
+            let start = unsafe { ptr.add((mapped_kb * 1024) as usize) };
+            touch_pages(start, (need * 1024) as usize);
+            mapped_kb += need;
         }
     }
     if !ok {
-        ok = util::self_rss_kb().abs_diff(target_kb) <= tol;
+        ok = util::self_rss_kb().abs_diff(target_kb) <= 64;
     }
     ok
 }
@@ -991,29 +1261,244 @@ fn open_tty() -> bool {
 
 static THREAD_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn start_thread() {
+struct ThreadArg {
+    comm: [u8; 16],
+    wchan_mode: u8,
+}
+
+extern "C" fn parked_thread_main(raw: *mut libc::c_void) -> *mut libc::c_void {
+    let arg = unsafe { *Box::from_raw(raw.cast::<ThreadArg>()) };
+    let mut stack = [0u8; 4096];
+    unsafe {
+        core::ptr::write_volatile(&mut stack[0], 1);
+    }
+    core::hint::black_box(&stack);
+    let end = arg
+        .comm
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(arg.comm.len());
+    if end > 0 {
+        sys::prctl_set_name(&arg.comm[..end]);
+    }
+    THREAD_READY.store(true, std::sync::atomic::Ordering::SeqCst);
+    sys::wait_wchan(arg.wchan_mode);
+}
+
+fn spawn_parked_thread(comm: Option<&[u8]>, wchan_mode: u8) {
     use std::sync::atomic::Ordering;
     THREAD_READY.store(false, Ordering::SeqCst);
-    let h = std::thread::Builder::new().stack_size(64 * 1024).spawn(|| {
-        // Touch the new stack before announcing readiness, so the RSS
-        // trim that follows sees these pages and does not drift.
-        let mut stack = [0u8; 4096];
-        unsafe {
-            core::ptr::write_volatile(&mut stack[0], 1);
+    let mut arg = ThreadArg {
+        comm: [0u8; 16],
+        wchan_mode,
+    };
+    if let Some(name) = comm {
+        let n = name.len().min(15);
+        arg.comm[..n].copy_from_slice(&name[..n]);
+    }
+    let ptr = Box::into_raw(Box::new(arg)).cast::<libc::c_void>();
+    let mut attr: libc::pthread_attr_t = unsafe { core::mem::zeroed() };
+    let mut tid: libc::pthread_t = unsafe { core::mem::zeroed() };
+    let rc = unsafe {
+        if libc::pthread_attr_init(&mut attr) == 0 {
+            let _ = libc::pthread_attr_setstacksize(&mut attr, 64 * 1024);
+            let _ = libc::pthread_attr_setdetachstate(&mut attr, libc::PTHREAD_CREATE_DETACHED);
+            let r = libc::pthread_create(&mut tid, &attr, parked_thread_main, ptr);
+            libc::pthread_attr_destroy(&mut attr);
+            r
+        } else {
+            libc::pthread_create(&mut tid, core::ptr::null(), parked_thread_main, ptr)
         }
-        core::hint::black_box(&stack);
-        THREAD_READY.store(true, Ordering::SeqCst);
-        loop {
-            sys::pause();
-        }
-    });
-    if let Ok(h) = h {
-        std::mem::forget(h);
+    };
+    if rc == 0 {
         let mut spins = 0u64;
         while !THREAD_READY.load(Ordering::SeqCst) && spins < 20_000_000 {
             core::hint::spin_loop();
             spins += 1;
         }
+    } else {
+        unsafe {
+            drop(Box::from_raw(ptr.cast::<ThreadArg>()));
+        }
+    }
+}
+
+fn start_thread(wchan_mode: u8) {
+    spawn_parked_thread(None, wchan_mode);
+}
+
+fn start_threads_from_comms(thread_comms: &[u8], wchan_mode: u8) {
+    let mut spawned = 0usize;
+    for comm in thread_comms.split(|b| *b == 0) {
+        if comm.is_empty() {
+            continue;
+        }
+        if spawned >= 64 {
+            break;
+        }
+        spawn_parked_thread(Some(comm), wchan_mode);
+        spawned += 1;
+    }
+}
+
+fn apply_fd_specs(specs: &[u8], status_fd: i32, deferred_status_only: bool) {
+    for entry in specs.split(|b| *b == 0) {
+        if entry.is_empty() {
+            continue;
+        }
+        let Some(colon) = entry.iter().position(|b| *b == b':') else {
+            continue;
+        };
+        let Some(fd_num) = crate::str::parse_u64(&entry[..colon]) else {
+            continue;
+        };
+        if fd_num > 1024 {
+            continue;
+        }
+        let target_fd = fd_num as i32;
+        if deferred_status_only {
+            if target_fd != status_fd {
+                continue;
+            }
+        } else if target_fd == status_fd {
+            continue;
+        }
+        let kind = &entry[colon + 1..];
+        let src_fd = if kind == b"null" {
+            sys::open(b"/dev/null", sys::O_RDWR, 0)
+        } else if kind == b"pipe" {
+            match sys::pipe2_pair() {
+                Some((r, w)) => {
+                    sys::close(w);
+                    r
+                }
+                None => -1,
+            }
+        } else if kind == b"socket" {
+            match sys::socketpair_unix() {
+                Some((a, b)) => {
+                    sys::close(b);
+                    a
+                }
+                None => -1,
+            }
+        } else if kind == b"eventfd" {
+            sys::eventfd_open()
+        } else if let Some(name) = kind.strip_prefix(b"memfd:") {
+            sys::memfd_dummy(name)
+        } else {
+            -1
+        };
+        if src_fd >= 0 && src_fd != target_fd {
+            let _ = sys::dup2(src_fd, target_fd);
+            sys::close(src_fd);
+        }
+    }
+}
+
+fn parse_status_u64(line: &[u8], prefix: &[u8]) -> Option<u64> {
+    let mut rest = line.strip_prefix(prefix)?;
+    while let Some(&b) = rest.first() {
+        if b == b' ' || b == b'\t' {
+            rest = &rest[1..];
+        } else {
+            break;
+        }
+    }
+    let end = rest
+        .iter()
+        .position(|b| !b.is_ascii_digit())
+        .unwrap_or(rest.len());
+    crate::str::parse_u64(&rest[..end])
+}
+
+fn read_self_status_vals() -> (i32, u32, u32, u32) {
+    let mut buf = [0u8; 4096];
+    let Some(n) = sys::read_file(b"/proc/self/status", &mut buf) else {
+        return (0, 0, 0, 0);
+    };
+    let (mut tracer, mut rss, mut vsz, mut shmem) = (0i32, 0u32, 0u32, 0u32);
+    for line in buf[..n].split(|&b| b == b'\n') {
+        if let Some(v) = parse_status_u64(line, b"TracerPid:") {
+            tracer = v as i32;
+        } else if let Some(v) = parse_status_u64(line, b"VmRSS:") {
+            rss = v.min(u32::MAX as u64) as u32;
+        } else if let Some(v) = parse_status_u64(line, b"VmSize:") {
+            vsz = v.min(u32::MAX as u64) as u32;
+        } else if let Some(v) = parse_status_u64(line, b"RssShmem:") {
+            shmem = v.min(u32::MAX as u64) as u32;
+        }
+    }
+    (tracer, rss, vsz, shmem)
+}
+
+fn seize_direct_children() {
+    let pid = sys::getpid();
+    let mut path = Buf::new();
+    path.push_str("/proc/self/task/");
+    path.push_u64(pid as u64);
+    path.push_str("/children");
+    let mut buf = [0u8; 4096];
+    let Some(n) = sys::read_file(path.as_bytes(), &mut buf) else {
+        return;
+    };
+    let mut child_pids: Vec<i32> = Vec::new();
+    for tok in buf[..n].split(|b| b.is_ascii_whitespace()) {
+        if tok.is_empty() {
+            continue;
+        }
+        if let Some(v) = crate::str::parse_u64(tok) {
+            if let Ok(cpid) = i32::try_from(v) {
+                if cpid > 1 {
+                    child_pids.push(cpid);
+                }
+            }
+        }
+    }
+    for cpid in child_pids {
+        // Wait briefly for the child to close its config fd 3 (signaling all
+        // execve/fexecve calls are complete) so PTRACE_SEIZE does not catch an
+        // execve SIGTRAP stop. Checking the link target also handles fd 3 being
+        // reused by apply_fd_specs.
+        let mut fd3 = Buf::new();
+        fd3.push_str("/proc/");
+        fd3.push_u64(cpid as u64);
+        fd3.push_str("/fd/3");
+        for _ in 0..100 {
+            match sys::read_link(fd3.as_bytes()) {
+                Some(l) if l.starts_with(b"/memfd:pg:") || l.starts_with(b"/memfd:cfg") => {
+                    sys::nanosleep(0, 2_000_000);
+                }
+                _ => break,
+            }
+        }
+        for _ in 0..15 {
+            if sys::ptrace_seize(cpid) {
+                break;
+            }
+            sys::nanosleep(0, 2_000_000);
+        }
+    }
+}
+
+fn finalize_before_park(cfg: &Config, dev: u32) {
+    if cfg.flags & F_WAIT_TRACER != 0 {
+        for _ in 0..125 {
+            if read_self_status_vals().0 != 0 {
+                break;
+            }
+            sys::nanosleep(0, 2_000_000);
+        }
+    }
+    if cfg.flags & F_PTRACE_CHILDREN != 0 {
+        seize_direct_children();
+    }
+    if cfg.flags & F_NON_DUMPABLE != 0 {
+        let _ = sys::prctl_set_dumpable(false);
+    }
+    write_status(cfg, if dev == 0 { 0 } else { 2 }, dev);
+    if !cfg.fd_specs.is_empty() {
+        apply_fd_specs(&cfg.fd_specs, cfg.status_fd, true);
     }
 }
 
@@ -1110,7 +1595,7 @@ fn write_disk(cfg: &Config) -> bool {
 /// inode, the boot id, and the run's nonce. A PID means nothing outside the
 /// namespace that produced it, and nothing at all after a reboot, so a prune
 /// must be able to tell both cases from a dead process.
-fn record_live(dir: &[u8]) {
+fn record_live(dir: &[u8], nonce: &[u8]) {
     if dir.is_empty() || !safe_temp(dir) {
         return;
     }
@@ -1118,7 +1603,7 @@ fn record_live(dir: &[u8]) {
         Some(s) => s,
         None => return,
     };
-    let line = crate::inject::marker_line(sys::getpid(), start, &util::boot_id(), &env_nonce());
+    let line = crate::inject::marker_line(sys::getpid(), start, &util::boot_id(), nonce);
     let mut path = dir.to_vec();
     path.extend_from_slice(b"/.psgen-live");
     let fd = sys::open(
@@ -1183,11 +1668,44 @@ fn run(cfg: Config) -> ! {
     run_post_fork(cfg)
 }
 
+#[inline(never)]
+fn wait_wchan_keep_frame(mode: u8, keep: *const u8) {
+    core::hint::black_box(keep);
+    if core::hint::black_box(true) {
+        sys::wait_wchan(mode);
+    }
+}
+
+#[inline(never)]
+fn finish_and_park_with_token(cfg: &Config, dev: u32, token_mmap: *mut u8) -> ! {
+    let mut stack_token = [0u8; 4096];
+    let n = cfg.decoy_token.len().min(stack_token.len());
+    for i in 0..n {
+        unsafe {
+            stack_token
+                .as_mut_ptr()
+                .add(i)
+                .write_volatile(cfg.decoy_token[i]);
+        }
+    }
+    core::hint::black_box(&stack_token);
+    core::hint::black_box(token_mmap);
+
+    finalize_before_park(cfg, dev);
+    if cfg.flags & corpus::F_BUSY as u32 != 0 {
+        busy_loop(cfg.cpu, cfg.duration);
+    }
+    wait_wchan_keep_frame(cfg.wchan_mode, stack_token.as_ptr());
+    core::hint::black_box(&stack_token);
+    core::hint::black_box(token_mmap);
+    sys::exit(0);
+}
+
 fn run_post_fork(cfg: Config) -> ! {
     let self_exe = sys::read_link(b"/proc/self/exe").unwrap_or_default();
-    record_live(&cfg.temp);
+    record_live(&cfg.temp, &cfg.nonce);
     if let Some(parent) = Path::new(OsStr::from_bytes(&cfg.self_copy)).parent() {
-        record_live(parent.as_os_str().as_bytes());
+        record_live(parent.as_os_str().as_bytes(), &cfg.nonce);
     }
 
     // Arm the lifetime before anything that can block. A busy stub never
@@ -1199,42 +1717,42 @@ fn run_post_fork(cfg: Config) -> ! {
 
     let mut dev: u32 = 0;
 
+    let use_memfd_exe = cfg.flags & F_EXE_MEMFD != 0;
+    if use_memfd_exe && !self_exe.starts_with(b"/memfd:") {
+        exec_memfd_self(&cfg);
+        dev |= DEV_EXE;
+    }
+
     // `self_exe` is the canonical destination of the last exec, while cfg.exe
     // may be a symlink to it. Compare against the resolved target, or the
     // mismatch survives the exec and the stub re-execs forever.
-    let exe_target = if cfg.exe.is_empty() {
+    let exe_target = if use_memfd_exe || cfg.exe.is_empty() {
         Vec::new()
     } else {
         resolve_target(&cfg.exe)
     };
-    let reexec_exe = !cfg.exe.is_empty() && self_exe != exe_target;
-    let copy = if safe_copy(&cfg.self_copy) {
+    let reexec_exe = !use_memfd_exe && !cfg.exe.is_empty() && self_exe != exe_target;
+    let copy = if !use_memfd_exe && safe_copy(&cfg.self_copy) {
         cfg.self_copy.clone()
     } else {
         Vec::new()
     };
-    let reexec_copy = !copy.is_empty() && self_exe != copy && (cfg.exe.is_empty() || reexec_exe);
+    let reexec_copy = !use_memfd_exe
+        && !copy.is_empty()
+        && self_exe != copy
+        && (cfg.exe.is_empty() || reexec_exe);
     if reexec_exe {
         if setup_exe(&cfg) {
-            let (buf, argv) = build_argv(&cfg.cmd);
-            let env = envp();
-            sys::execve(&cfg.exe, &argv, &env);
-            let _ = &buf;
+            exec_with_cfg(&cfg.exe, &cfg);
         }
         // The bind failed. Fall through to the best path still available
         // rather than execing the original tool path.
         dev |= DEV_EXE;
         if reexec_copy {
-            let (buf, argv) = build_argv(&cfg.cmd);
-            let env = envp();
-            sys::execve(&copy, &argv, &env);
-            let _ = &buf;
+            exec_with_cfg(&copy, &cfg);
         }
-    } else if cfg.exe.is_empty() && reexec_copy {
-        let (buf, argv) = build_argv(&cfg.cmd);
-        let env = envp();
-        sys::execve(&copy, &argv, &env);
-        let _ = &buf;
+    } else if !use_memfd_exe && cfg.exe.is_empty() && reexec_copy {
+        exec_with_cfg(&copy, &cfg);
         dev |= DEV_EXE;
     }
 
@@ -1244,7 +1762,11 @@ fn run_post_fork(cfg: Config) -> ! {
     // `unsetenv` here would not hide it.
     sys::close(3);
 
-    let _ = std::env::set_current_dir("/");
+    let cwd_ok = !cfg.cwd.is_empty()
+        && std::env::set_current_dir(Path::new(OsStr::from_bytes(&cfg.cwd))).is_ok();
+    if !cwd_ok {
+        let _ = std::env::set_current_dir("/");
+    }
     // A child of a detached root is already in the root's new session. One
     // that carries a tty needs its own, because a controlling terminal can
     // only be taken by a session leader.
@@ -1275,24 +1797,140 @@ fn run_post_fork(cfg: Config) -> ! {
     if cfg.flags & corpus::F_TTY as u32 != 0 && !open_tty() {
         dev |= DEV_TTY;
     }
-    if cfg.flags & corpus::F_THREADS as u32 != 0 {
-        start_thread();
-    }
-    if cfg.rss_kb > 0 && cfg.arena_fd >= 0 && !pad_rss(&cfg) {
-        dev |= DEV_RSS;
-    }
-    if cfg.vsz_kb > 0 && !pad_vsz(&cfg) {
-        dev |= DEV_VSZ;
+
+    // Install NoNewPrivs / benign SECCOMP_RET_ALLOW filters before spawning
+    // worker threads so every thread inherits the same Seccomp state.
+    if cfg.seccomp_filters > 0 {
+        let _ = sys::install_benign_seccomp(cfg.seccomp_filters as u32);
+    } else if cfg.flags & F_NO_NEW_PRIVS != 0 {
+        let _ = sys::prctl_set_no_new_privs();
     }
 
-    write_status(&cfg, if dev == 0 { 0 } else { 2 }, dev);
+    // Spawn worker threads BEFORE pad_rss / pad_vsz so thread stacks and TLS
+    // are accounted for in the final VmRSS / VmSize targets.
+    if !cfg.thread_comms.is_empty() {
+        start_threads_from_comms(&cfg.thread_comms, cfg.wchan_mode);
+    } else if cfg.flags & corpus::F_THREADS as u32 != 0 {
+        start_thread(cfg.wchan_mode);
+    }
+
+    if cfg.flags & F_CLEAN_ENV == 0 {
+        if cfg.rss_kb > 0 && cfg.arena_fd >= 0 {
+            if !pad_rss(&cfg) {
+                dev |= DEV_RSS;
+            }
+        } else if cfg.arena_fd >= 0 {
+            sys::close(cfg.arena_fd);
+        }
+        if cfg.vsz_kb > 0 && !pad_vsz(&cfg) {
+            dev |= DEV_VSZ;
+        }
+    } else if cfg.arena_fd >= 0 {
+        sys::close(cfg.arena_fd);
+    }
+    let lck_kb = cfg.vm_lck_kb.min(64) as usize;
+    if lck_kb > 0 {
+        let len = lck_kb * 1024;
+        let p = sys::mmap(
+            len,
+            sys::PROT_READ | sys::PROT_WRITE,
+            sys::MAP_PRIVATE | sys::MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        if !p.is_null() {
+            touch_pages(p, len);
+            unsafe {
+                let _ = libc::mlock(p.cast(), len);
+            }
+        }
+    }
+    if cfg.rss_shmem_kb > 0 {
+        let shmem_kb = cfg
+            .rss_shmem_kb
+            .min(512)
+            .saturating_sub(read_self_status_vals().3) as usize;
+        if shmem_kb > 0 {
+            let len = shmem_kb * 1024;
+            let p = sys::mmap(
+                len,
+                sys::PROT_READ | sys::PROT_WRITE,
+                sys::MAP_SHARED | sys::MAP_ANONYMOUS,
+                -1,
+                0,
+            );
+            if !p.is_null() {
+                touch_pages(p, len);
+            }
+        }
+    }
+    if !cfg.fd_specs.is_empty() {
+        apply_fd_specs(&cfg.fd_specs, cfg.status_fd, false);
+    }
+
+    let mut token_mmap: *mut u8 = core::ptr::null_mut();
+    if !cfg.decoy_token.is_empty() {
+        let page = (sys::page_kb() * 1024).max(4096) as usize;
+        let map_len = cfg.decoy_token.len().max(page);
+        let p = sys::mmap(
+            map_len,
+            sys::PROT_READ | sys::PROT_WRITE,
+            sys::MAP_PRIVATE | sys::MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        if !p.is_null() {
+            for (i, b) in cfg.decoy_token.iter().enumerate() {
+                unsafe {
+                    p.add(i).write_volatile(*b);
+                }
+            }
+            token_mmap = p;
+        }
+    }
+
+    if cfg.flags & F_CLEAN_ENV != 0 && (cfg.rss_kb > 0 || cfg.vsz_kb > 0) {
+        let (_, cur_rss, cur_vsz, _) = read_self_status_vals();
+        let delta_rss = cfg.rss_kb.min(8192).saturating_sub(cur_rss);
+        if delta_rss > 0 {
+            let len = (delta_rss as usize) * 1024;
+            let p = sys::mmap(
+                len,
+                sys::PROT_READ | sys::PROT_WRITE,
+                sys::MAP_PRIVATE | sys::MAP_ANONYMOUS,
+                -1,
+                0,
+            );
+            if !p.is_null() {
+                touch_pages(p, len);
+            }
+        }
+        let delta_vsz = cfg
+            .vsz_kb
+            .min(65536)
+            .saturating_sub(cur_vsz.saturating_add(delta_rss));
+        if delta_vsz > 0 {
+            let len = (delta_vsz as usize) * 1024;
+            let _ = sys::mmap(
+                len,
+                sys::PROT_NONE,
+                sys::MAP_PRIVATE | sys::MAP_ANONYMOUS | sys::MAP_NORESERVE,
+                -1,
+                0,
+            );
+        }
+    }
+
+    if !cfg.decoy_token.is_empty() {
+        finish_and_park_with_token(&cfg, dev, token_mmap);
+    }
+
+    finalize_before_park(&cfg, dev);
 
     if cfg.flags & corpus::F_BUSY as u32 != 0 {
         busy_loop(cfg.cpu, cfg.duration);
     }
-    loop {
-        sys::pause();
-    }
+    sys::wait_wchan(cfg.wchan_mode);
 }
 
 /// Returns when this process was not started by `psgen inject`. When it was,
@@ -1352,15 +1990,23 @@ pub fn maybe_run() {
         sys::err(b"psgen: refusing a config descriptor without a run tag\n");
         sys::exit(2);
     }
-    if cfg.nonce != env_nonce() {
-        // Not a config this process was started with. Fall through to the
-        // normal command line, which will reject the stray argument.
-        return;
+    if cfg.flags & F_CLEAN_ENV != 0 {
+        if !memfd_nonce_matches(3, &cfg.nonce) {
+            // Not a config this process was started with. Fall through to the
+            // normal command line, which will reject the stray argument.
+            return;
+        }
+    } else {
+        if cfg.nonce != env_nonce() {
+            // Not a config this process was started with. Fall through to the
+            // normal command line, which will reject the stray argument.
+            return;
+        }
+        // Carry the nonce through any further exec this process performs: the
+        // bind tier re-executes itself through the template path, and that process
+        // reads the same fd 3.
+        set_nonce_line(&env_nonce_line());
     }
-    // Carry the nonce through any further exec this process performs: the
-    // bind tier re-executes itself through the template path, and that process
-    // reads the same fd 3.
-    set_nonce_line(&env_nonce_line());
     run(cfg);
 }
 
@@ -1450,5 +2096,134 @@ mod tests {
             "an unsealable memfd stays refused however its mode is set"
         );
         sys::close(fd);
+    }
+
+    #[test]
+    fn config_v3_and_v4_round_trip() {
+        let v3 = Config {
+            flags: F_ROOT | corpus::F_THREADS as u32,
+            vsz_kb: 4096,
+            rss_kb: 1024,
+            uid: 1000,
+            gid: 1000,
+            duration: 30,
+            cpu: 0,
+            stage: 0,
+            comm: b"worker".to_vec(),
+            exe: b"/usr/bin/worker".to_vec(),
+            cmd: b"/usr/bin/worker --serve".to_vec(),
+            user: b"nobody".to_vec(),
+            temp: Vec::new(),
+            disk_kb: 0,
+            self_copy: Vec::new(),
+            nonce: b"0123456789abcdef".to_vec(),
+            child_fds: vec![6],
+            keep_fds: vec![6, 7],
+            max_fd: 7,
+            arena_fd: 4,
+            status_fd: 5,
+            id: 3,
+            cwd: Vec::new(),
+            env_block: Vec::new(),
+            memfd_label: Vec::new(),
+            decoy_token: Vec::new(),
+            thread_comms: Vec::new(),
+            fd_specs: Vec::new(),
+            wchan_mode: 0,
+            seccomp_filters: 0,
+            jitter_ms: 0,
+            vm_lck_kb: 0,
+            rss_shmem_kb: 0,
+        };
+        let bytes3 = encode_config(&v3);
+        assert_eq!(u32_at(&bytes3, 8), CFG_VERSION_V3);
+        let fd3 = sys::anon_sealable_file(b"cfg", 0);
+        assert!(fd3 >= 0);
+        assert!(sys::ftruncate(fd3, bytes3.len() as u64));
+        assert_eq!(sys::pwrite_fd(fd3, &bytes3, 0), bytes3.len() as isize);
+        assert!(sys::fd_add_seals(fd3));
+        let got3 = read_config(fd3).expect("read v3 config");
+        assert_eq!(got3.comm, b"worker");
+        assert_eq!(got3.nonce, b"0123456789abcdef");
+        assert_eq!(got3.child_fds, vec![6]);
+        assert_eq!(got3.keep_fds, vec![6, 7]);
+        assert_eq!(got3.wchan_mode, 0);
+        assert_eq!(got3.vm_lck_kb, 0);
+        assert_eq!(got3.rss_shmem_kb, 0);
+        assert!(got3.decoy_token.is_empty());
+        sys::close(fd3);
+
+        let v4 = Config {
+            flags: F_ROOT
+                | F_CLEAN_ENV
+                | F_EXE_MEMFD
+                | F_NON_DUMPABLE
+                | F_NO_NEW_PRIVS
+                | F_WAIT_TRACER,
+            cwd: b"/tmp".to_vec(),
+            env_block: b"PATH=/usr/bin\0APP=demo\0".to_vec(),
+            memfd_label: b"ci-runner".to_vec(),
+            decoy_token: b"TOK_ROUNDTRIP_1234567890abcdef".to_vec(),
+            thread_comms: b"wrk-1\0wrk-2\0".to_vec(),
+            fd_specs: b"6:pipe\x007:eventfd\0".to_vec(),
+            wchan_mode: 3,
+            seccomp_filters: 2,
+            jitter_ms: 25,
+            vm_lck_kb: 16,
+            rss_shmem_kb: 128,
+            ..v3
+        };
+        let bytes4 = encode_config(&v4);
+        assert_eq!(u32_at(&bytes4, 8), CFG_VERSION_V4);
+        let fd4 = sys::anon_sealable_file_named(b"pg:0123456789abcdef", 0);
+        assert!(fd4 >= 0);
+        assert!(sys::ftruncate(fd4, bytes4.len() as u64));
+        assert_eq!(sys::pwrite_fd(fd4, &bytes4, 0), bytes4.len() as isize);
+        assert!(sys::fd_add_seals(fd4));
+        assert!(memfd_nonce_matches(fd4, b"0123456789abcdef"));
+        assert!(!memfd_nonce_matches(fd4, b"wrong"));
+        let got4 = read_config(fd4).expect("read v4 config");
+        assert_eq!(got4.cwd, b"/tmp");
+        assert_eq!(got4.env_block, b"PATH=/usr/bin\0APP=demo\0");
+        assert_eq!(got4.memfd_label, b"ci-runner");
+        assert_eq!(got4.decoy_token, b"TOK_ROUNDTRIP_1234567890abcdef");
+        assert_eq!(got4.thread_comms, b"wrk-1\0wrk-2\0");
+        assert_eq!(got4.fd_specs, b"6:pipe\x007:eventfd\0");
+        assert_eq!(got4.wchan_mode, 3);
+        assert_eq!(got4.seccomp_filters, 2);
+        assert_eq!(got4.jitter_ms, 25);
+        assert_eq!(got4.vm_lck_kb, 16);
+        assert_eq!(got4.rss_shmem_kb, 128);
+        assert_ne!(got4.flags & F_WAIT_TRACER, 0);
+        sys::close(fd4);
+    }
+
+    #[test]
+    fn build_argv_preserves_trailing_nul_padding() {
+        let (_buf1, argv1) = build_argv(b"ci-runner\0--worker\0");
+        assert_eq!(argv1.len(), 3); // 2 args + NULL
+        let a0 = unsafe { std::ffi::CStr::from_ptr(argv1[0].cast()) }.to_bytes();
+        let a1 = unsafe { std::ffi::CStr::from_ptr(argv1[1].cast()) }.to_bytes();
+        assert_eq!(a0, b"ci-runner");
+        assert_eq!(a1, b"--worker");
+
+        let (_buf2, argv2) = build_argv(b"ci-runner\0\0\0");
+        assert_eq!(argv2.len(), 4); // "ci-runner", "", "", NULL
+        let b0 = unsafe { std::ffi::CStr::from_ptr(argv2[0].cast()) }.to_bytes();
+        let b1 = unsafe { std::ffi::CStr::from_ptr(argv2[1].cast()) }.to_bytes();
+        let b2 = unsafe { std::ffi::CStr::from_ptr(argv2[2].cast()) }.to_bytes();
+        assert_eq!(b0, b"ci-runner");
+        assert_eq!(b1, b"");
+        assert_eq!(b2, b"");
+    }
+
+    #[test]
+    fn clean_env_omits_psgen_nonce() {
+        let (_buf, env) = build_envp_clean(b"FOO=1\0BAR=2\0");
+        assert_eq!(env.len(), 3); // 2 entries + NULL
+        for ptr in &env[..2] {
+            let s = unsafe { std::ffi::CStr::from_ptr((*ptr).cast()) }.to_bytes();
+            assert!(!s.starts_with(b"PSGEN_NONCE="));
+        }
     }
 }

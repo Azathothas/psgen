@@ -948,36 +948,37 @@ pub fn is_mount_point(path: &[u8]) -> bool {
         return true;
     }
     let want = (st.st_dev as u64, st.st_ino as u64);
-    let mounts = match std::fs::read_to_string("/proc/self/mountinfo") {
+    let mounts = match std::fs::read("/proc/self/mountinfo") {
         Ok(s) => s,
         Err(_) => return true,
     };
-    for line in mounts.lines() {
-        // mountinfo: id parent major:minor root mount-point options ...
-        let mut it = line.split(' ');
+    for line in mounts.split(|&b| b == b'\n') {
+        let mut it = line.split(|&b| b == b' ');
         let (Some(_id), Some(_parent), Some(dev)) = (it.next(), it.next(), it.next()) else {
             continue;
         };
         let Some(_root) = it.next() else { continue };
         let Some(mp) = it.next() else { continue };
-        let Some((maj, min)) = dev.split_once(':') else {
+        let Some(colon) = dev.iter().position(|&b| b == b':') else {
             continue;
         };
-        let (Ok(maj), Ok(min)) = (maj.parse::<u64>(), min.parse::<u64>()) else {
+        let (Some(maj), Some(min)) = (
+            crate::str::parse_u64(&dev[..colon]),
+            crate::str::parse_u64(&dev[colon + 1..]),
+        ) else {
             continue;
         };
         if libc::makedev(maj as u32, min as u32) as u64 != want.0 {
             continue;
         }
-        if unescape_mount_path(mp).as_os_str().as_bytes() == t.as_bytes() {
+        if unescape_mount_bytes(mp) == t.as_bytes() {
             return true;
         }
     }
     false
 }
 
-fn unescape_mount_path(raw: &str) -> PathBuf {
-    let b = raw.as_bytes();
+fn unescape_mount_bytes(b: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
@@ -993,7 +994,7 @@ fn unescape_mount_path(raw: &str) -> PathBuf {
         out.push(b[i]);
         i += 1;
     }
-    PathBuf::from(OsStr::from_bytes(&out))
+    out
 }
 
 /// Delete a staging directory, refusing anything that is not an ordinary
@@ -1019,4 +1020,407 @@ pub fn wait_exit_code(status: i32) -> Option<i32> {
     } else {
         None
     }
+}
+
+pub fn prctl_set_dumpable(dumpable: bool) -> bool {
+    let v: libc::c_ulong = if dumpable { 1 } else { 0 };
+    unsafe {
+        libc::prctl(
+            libc::PR_SET_DUMPABLE,
+            v,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+        ) == 0
+    }
+}
+
+pub fn prctl_set_no_new_privs() -> bool {
+    unsafe {
+        libc::prctl(
+            libc::PR_SET_NO_NEW_PRIVS,
+            1 as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+        ) == 0
+    }
+}
+
+#[repr(C)]
+struct SockFilter {
+    code: u16,
+    jt: u8,
+    jf: u8,
+    k: u32,
+}
+
+#[repr(C)]
+struct SockFprog {
+    len: u16,
+    filter: *const SockFilter,
+}
+
+/// Install `count.min(8)` minimal 1-instruction `SECCOMP_RET_ALLOW` classic BPF
+/// filters after enabling `PR_SET_NO_NEW_PRIVS`.
+#[allow(clippy::unnecessary_cast)]
+pub fn install_benign_seccomp(count: u32) -> bool {
+    let n = count.min(8);
+    if n == 0 {
+        return true;
+    }
+    if !prctl_set_no_new_privs() {
+        return false;
+    }
+    let filter = SockFilter {
+        code: 0x06,
+        jt: 0,
+        jf: 0,
+        k: 0x7fff_0000,
+    };
+    let prog = SockFprog {
+        len: 1,
+        filter: &filter,
+    };
+    for _ in 0..n {
+        let r = unsafe {
+            libc::prctl(
+                libc::PR_SET_SECCOMP,
+                libc::SECCOMP_MODE_FILTER as libc::c_ulong,
+                &prog as *const SockFprog as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+            )
+        };
+        if r != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+pub fn prctl_set_subreaper() -> bool {
+    set_child_subreaper()
+}
+
+pub fn reap_children_nonblock() -> usize {
+    let mut reaped = 0usize;
+    let mut st: i32 = 0;
+    loop {
+        let r = unsafe { libc::waitpid(-1, &mut st, libc::WNOHANG) };
+        if r > 0 {
+            reaped += 1;
+        } else {
+            break;
+        }
+    }
+    reaped
+}
+
+pub fn anon_sealable_file_named(name: &[u8], flags: u32) -> i32 {
+    memfd_create(name, flags | libc::MFD_ALLOW_SEALING)
+}
+
+pub fn memfd_exec_copy(label: &[u8], src_path: &[u8]) -> i32 {
+    let raw = if label.is_empty() { b"exec" } else { label };
+    let name = &raw[..raw.len().min(240)];
+    let mfd = memfd_create(name, libc::MFD_CLOEXEC);
+    if mfd < 0 {
+        return -1;
+    }
+    let sfd = open(src_path, libc::O_RDONLY | libc::O_CLOEXEC, 0);
+    if sfd < 0 {
+        close(mfd);
+        return -1;
+    }
+    let mut buf = [0u8; 16384];
+    let mut ok = true;
+    loop {
+        let n = read_fd(sfd, &mut buf);
+        if n < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            ok = false;
+            break;
+        }
+        if n == 0 {
+            break;
+        }
+        if !write_fd(mfd, &buf[..n as usize]) {
+            ok = false;
+            break;
+        }
+    }
+    close(sfd);
+    if !ok {
+        close(mfd);
+        return -1;
+    }
+    let _ = unsafe { libc::fchmod(mfd, 0o700) };
+    mfd
+}
+
+pub fn fexecve(fd: i32, argv: &[*const u8], envp: &[*const u8]) -> i32 {
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_execveat,
+            fd as libc::c_long,
+            c"".as_ptr(),
+            argv.as_ptr().cast::<*const libc::c_char>(),
+            envp.as_ptr().cast::<*const libc::c_char>(),
+            0x1000 as libc::c_long,
+        )
+    };
+    if r < 0 && errno() == libc::ENOSYS {
+        let mut path = crate::str::Buf::new();
+        path.push_str("/proc/self/fd/");
+        path.push_u64(fd as u64);
+        return execve(path.as_bytes(), argv, envp) as i32;
+    }
+    r as i32
+}
+
+#[allow(clippy::unnecessary_cast)]
+pub fn wait_wchan(mode: u8) -> ! {
+    match mode {
+        1 => {
+            let ep = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+            if ep >= 0 {
+                let mut ev = libc::epoll_event { events: 0, u64: 0 };
+                loop {
+                    unsafe {
+                        libc::epoll_wait(ep, &mut ev, 1, -1);
+                    }
+                }
+            }
+        }
+        2 => loop {
+            unsafe {
+                libc::poll(core::ptr::null_mut(), 0, -1);
+            }
+        },
+        3 => loop {
+            nanosleep(3600, 0);
+        },
+        4 => {
+            const FUTEX_WAIT_PRIVATE: libc::c_long = 128;
+            static V: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            loop {
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_futex,
+                        &V as *const core::sync::atomic::AtomicU32,
+                        FUTEX_WAIT_PRIVATE,
+                        0 as libc::c_long,
+                        core::ptr::null::<libc::timespec>(),
+                        core::ptr::null::<u32>(),
+                        0 as libc::c_long,
+                    );
+                }
+            }
+        }
+        5 => {
+            if let Some((r, _w)) = pipe2_pair() {
+                let mut b = [0u8; 1];
+                loop {
+                    let n = read_fd(r, &mut b);
+                    if n == 0 {
+                        pause();
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    loop {
+        pause();
+    }
+}
+
+pub fn pipe2_pair() -> Option<(i32, i32)> {
+    let mut fds = [0i32; 2];
+    if pipe2(&mut fds, O_CLOEXEC) {
+        Some((fds[0], fds[1]))
+    } else {
+        None
+    }
+}
+
+pub fn socketpair_unix() -> Option<(i32, i32)> {
+    let mut fds = [0i32; 2];
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+            fds.as_mut_ptr(),
+        )
+    } == 0
+    {
+        Some((fds[0], fds[1]))
+    } else {
+        None
+    }
+}
+
+pub fn eventfd_open() -> i32 {
+    unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) }
+}
+
+pub fn memfd_dummy(name: &[u8]) -> i32 {
+    let raw = if name.is_empty() { b"anon" } else { name };
+    let n = &raw[..raw.len().min(240)];
+    memfd_create(n, libc::MFD_CLOEXEC)
+}
+
+pub fn ptrace_seize(pid: i32) -> bool {
+    const PTRACE_SEIZE: libc::c_long = 0x4206;
+    unsafe {
+        libc::syscall(
+            libc::SYS_ptrace,
+            PTRACE_SEIZE,
+            pid as libc::c_long,
+            0 as libc::c_long,
+            0 as libc::c_long,
+        ) == 0
+    }
+}
+
+/// Run an external program via `fork` + `execvp`/`execve` + `waitpid` without
+/// pulling in `std::process::Command` / `CommandEnv` / `BTreeMap<OsString, OsString>`.
+///
+/// When `env` is `Some`, uses `execve` with the given `KEY=VAL` entries; otherwise
+/// uses `execvp` inheriting the parent environment. When `capture_stderr` is true,
+/// redirects stdout to `/dev/null` and captures up to 64 KiB of stderr.
+/// Returns `Ok((exit_code, stderr))` on exec success, or `Err(errno)` if fork/exec fails.
+pub fn run_cmd(
+    prog: &[u8],
+    argv: &[&[u8]],
+    env: Option<&[&[u8]]>,
+    capture_stderr: bool,
+) -> Result<(i32, Vec<u8>), i32> {
+    let c_prog = cstr(prog).ok_or(libc::EINVAL)?;
+    let mut c_args: Vec<CString> = Vec::with_capacity(argv.len());
+    for &a in argv {
+        c_args.push(cstr(a).ok_or(libc::EINVAL)?);
+    }
+    let mut arg_ptrs: Vec<*const libc::c_char> = Vec::with_capacity(c_args.len() + 1);
+    for a in &c_args {
+        arg_ptrs.push(a.as_ptr());
+    }
+    arg_ptrs.push(core::ptr::null());
+
+    let mut c_env: Vec<CString> = Vec::new();
+    let mut env_ptrs: Vec<*const libc::c_char> = Vec::new();
+    if let Some(es) = env {
+        c_env.reserve(es.len());
+        for &e in es {
+            c_env.push(cstr(e).ok_or(libc::EINVAL)?);
+        }
+        env_ptrs.reserve(c_env.len() + 1);
+        for e in &c_env {
+            env_ptrs.push(e.as_ptr());
+        }
+        env_ptrs.push(core::ptr::null());
+    }
+
+    let (err_r, err_w) = pipe2_pair().ok_or_else(errno)?;
+    let serr_pipe = if capture_stderr {
+        match pipe2_pair() {
+            Some(p) => Some(p),
+            None => {
+                let e = errno();
+                close(err_r);
+                close(err_w);
+                return Err(e);
+            }
+        }
+    } else {
+        None
+    };
+
+    let pid = fork();
+    if pid < 0 {
+        let e = errno();
+        close(err_r);
+        close(err_w);
+        if let Some((sr, sw)) = serr_pipe {
+            close(sr);
+            close(sw);
+        }
+        return Err(e);
+    }
+    if pid == 0 {
+        close(err_r);
+        if let Some((sr, sw)) = serr_pipe {
+            close(sr);
+            let dn = open(b"/dev/null", O_RDWR, 0);
+            if dn >= 0 {
+                dup2(dn, 1);
+                if dn > 2 {
+                    close(dn);
+                }
+            }
+            dup2(sw, 2);
+            if sw > 2 {
+                close(sw);
+            }
+        }
+        unsafe {
+            if env.is_some() {
+                libc::execve(c_prog.as_ptr(), arg_ptrs.as_ptr(), env_ptrs.as_ptr());
+            } else {
+                libc::execvp(c_prog.as_ptr(), arg_ptrs.as_ptr());
+            }
+        }
+        let e = errno().to_ne_bytes();
+        let _ = write_fd(err_w, &e);
+        unsafe { libc::_exit(127) }
+    }
+
+    close(err_w);
+    let mut stderr_out = Vec::new();
+    if let Some((sr, sw)) = serr_pipe {
+        close(sw);
+        let mut buf = [0u8; 4096];
+        while stderr_out.len() < 65_536 {
+            let n = read_fd(sr, &mut buf);
+            if n <= 0 {
+                break;
+            }
+            stderr_out.extend_from_slice(&buf[..n as usize]);
+        }
+        close(sr);
+    }
+
+    let mut err_buf = [0u8; 4];
+    let mut err_got = 0usize;
+    while err_got < 4 {
+        let n = read_fd(err_r, &mut err_buf[err_got..]);
+        if n <= 0 {
+            break;
+        }
+        err_got += n as usize;
+    }
+    close(err_r);
+
+    let mut status: libc::c_int = 0;
+    loop {
+        let r = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if r < 0 && errno() == libc::EINTR {
+            continue;
+        }
+        break;
+    }
+
+    if err_got == 4 {
+        return Err(i32::from_ne_bytes(err_buf));
+    }
+    let code = if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else {
+        1
+    };
+    Ok((code, stderr_out))
 }

@@ -5,11 +5,16 @@ use crate::check;
 use crate::corpus;
 use crate::doctor;
 use crate::gen::{self, Opts};
+use crate::harness;
 use crate::inject;
+use crate::json;
 use crate::live;
 use crate::loggen;
 use crate::probe;
+use crate::profile;
 use crate::rng::Rng;
+use crate::score;
+use crate::selftest;
 use crate::str::{self, Buf};
 use crate::sys;
 use crate::table;
@@ -18,7 +23,7 @@ use crate::users;
 use crate::util;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::vec::Vec;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -33,18 +38,24 @@ pub enum Sub {
     Doctor,
     Log,
     Load,
+    Profile,
+    Run,
+    Score,
+    Replay,
+    Verify,
+    Selftest,
     Help,
     Version,
 }
 
 impl Sub {
-    /// One bit per subcommand, so an option's set is a single `u16`.
-    const fn bit(self) -> u16 {
-        1 << (self as u16)
+    /// One bit per subcommand, so an option's set is a single `u32`.
+    const fn bit(self) -> u32 {
+        1 << (self as u32)
     }
 }
 
-const ALL_SUBS: u16 = Sub::List.bit()
+const ALL_SUBS: u32 = Sub::List.bit()
     | Sub::Table.bit()
     | Sub::Inject.bit()
     | Sub::Stop.bit()
@@ -54,6 +65,12 @@ const ALL_SUBS: u16 = Sub::List.bit()
     | Sub::Doctor.bit()
     | Sub::Log.bit()
     | Sub::Load.bit()
+    | Sub::Profile.bit()
+    | Sub::Run.bit()
+    | Sub::Score.bit()
+    | Sub::Replay.bit()
+    | Sub::Verify.bit()
+    | Sub::Selftest.bit()
     | Sub::Help.bit()
     | Sub::Version.bit();
 
@@ -61,16 +78,16 @@ const ALL_SUBS: u16 = Sub::List.bit()
 // set is written once instead of repeated in a `matches!` per subcommand.
 
 /// The three commands that draw rows from the corpus with a profile.
-const GEN: u16 = Sub::List.bit() | Sub::Table.bit() | Sub::Inject.bit();
+const GEN: u32 = Sub::List.bit() | Sub::Table.bit() | Sub::Inject.bit();
 /// `GEN` plus `unit`, which forwards the inject options into `ExecStart`.
-const GEN_UNIT: u16 = GEN | Sub::Unit.bit();
+const GEN_UNIT: u32 = GEN | Sub::Unit.bit();
 /// Everything that expands corpus commands and so reads a seed or a family.
-const EXPAND: u16 = GEN | Sub::Check.bit() | Sub::Unit.bit();
+const EXPAND: u32 = GEN | Sub::Check.bit() | Sub::Unit.bit();
 /// The two `inject`-shaped commands: one spawns, one renders a unit that does.
-const INJECT_UNIT: u16 = Sub::Inject.bit() | Sub::Unit.bit();
+const INJECT_UNIT: u32 = Sub::Inject.bit() | Sub::Unit.bit();
 /// `--help` and `--version` are accepted everywhere, including as the `help`
 /// and `version` subcommands' own arguments.
-const ANY: u16 = ALL_SUBS;
+const ANY: u32 = ALL_SUBS;
 
 /// One option the parser understands, and the subcommands that consume it.
 ///
@@ -79,20 +96,119 @@ const ANY: u16 = ALL_SUBS;
 /// cannot be accepted and silently ignored, and the two unit tests below fail
 /// when the table and the help text disagree: adding a documented option
 /// without deciding its subcommands is a test failure, not a silent no-op.
-struct Opt {
-    /// The canonical long form, which is what `Args::seen` records and what an
-    /// error message names.
-    name: &'static str,
-    /// Other spellings that select the same option.
-    aliases: &'static [&'static str],
-    /// Takes no value, so `--flag=value` is a usage error rather than a value
-    /// of the next option.
-    boolean: bool,
-    /// Bitmask of `Sub::bit()`.
-    subs: u16,
+#[derive(Clone, Copy)]
+enum OptId {
+    Help,
+    Version,
+    Count,
+    Seed,
+    Profile,
+    Family,
+    UtcOffset,
+    Local,
+    Sort,
+    NoSort,
+    Uniq,
+    NoUniq,
+    Duration,
+    Pidfile,
+    Mem,
+    NoMem,
+    MemCap,
+    MemTarget,
+    PhysCap,
+    Disk,
+    Exe,
+    NoExe,
+    ShadowDir,
+    NoRoot,
+    Tty,
+    NoTty,
+    Threads,
+    NoThreads,
+    User,
+    NoUser,
+    CreateUsers,
+    Busy,
+    Cpu,
+    DryRun,
+    Plan,
+    Json,
+    Table,
+    Verify,
+    Wait,
+    Elevate,
+    Quiet,
+    Binaries,
+    RequireBinaries,
+    HostMem,
+    HostPidMax,
+    HostUptime,
+    Live,
+    RepeatMax,
+    CpuUtil,
+    MemUtil,
+    DiskUtil,
+    Force,
+    Module,
+    Lines,
+    Delay,
+    Speed,
+    LogFmt,
+    Pid,
+    Validate,
+    Out,
+    Tree,
+    Label,
+    Masker,
+    ProfileName,
+    RedactToken,
+    RedactEnv,
+    FromProfile,
+    DecoyLevel,
+    CleanEnv,
+    ExeMemfd,
+    DecoyToken,
+    Dumpable,
+    Seccomp,
+    Wchan,
+    JitterMs,
+    Churn,
+    MaskerCmd,
+    Decoys,
+    Mode,
+    Level,
+    Control,
+    HardNegatives,
+    ObserverUid,
+    BlindDir,
+    RunId,
+    TargetPid,
+    TargetCmd,
+    Runs,
+    Pick,
 }
 
-const OPTS: &[Opt] = &[
+struct OptRow {
+    id: OptId,
+    name: &'static str,
+    #[cfg(test)]
+    alias: &'static str,
+    boolean: bool,
+    subs: u32,
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+struct Opt {
+    name: &'static str,
+    aliases: &'static [&'static str],
+    boolean: bool,
+    subs: u32,
+}
+
+#[cfg(test)]
+const OPTS_ANCHOR: &[Opt] = &[
     Opt {
         name: "--help",
         aliases: &["-h"],
@@ -100,344 +216,154 @@ const OPTS: &[Opt] = &[
         subs: ANY,
     },
     Opt {
-        name: "--version",
-        aliases: &["-V"],
-        boolean: true,
-        subs: ANY,
-    },
-    Opt {
-        name: "--count",
-        aliases: &["-n"],
-        boolean: false,
-        subs: GEN_UNIT,
-    },
-    Opt {
-        name: "--seed",
-        aliases: &["-s"],
-        boolean: false,
-        subs: EXPAND | Sub::Log.bit(),
-    },
-    Opt {
-        name: "--profile",
-        aliases: &["-p"],
-        boolean: false,
-        subs: GEN_UNIT,
-    },
-    Opt {
-        name: "--family",
-        aliases: &["-f"],
-        boolean: false,
-        subs: EXPAND,
-    },
-    // `--local` and `--utc-offset` are synthetic-table knobs. A live table is
-    // always the host's own zone, so they are rejected for `table --live` and
-    // for every `inject` mode; there is no second place that could shift it.
-    Opt {
-        name: "--utc-offset",
-        aliases: &[],
-        boolean: false,
-        subs: Sub::Table.bit() | Sub::Inject.bit(),
-    },
-    Opt {
-        name: "--local",
-        aliases: &[],
-        boolean: true,
-        subs: Sub::Table.bit() | Sub::Inject.bit(),
-    },
-    Opt {
-        name: "--sort",
-        aliases: &[],
-        boolean: true,
-        subs: Sub::List.bit(),
-    },
-    Opt {
-        name: "--no-sort",
-        aliases: &[],
-        boolean: true,
-        subs: Sub::List.bit(),
-    },
-    Opt {
-        name: "--uniq",
-        aliases: &[],
-        boolean: true,
-        subs: Sub::List.bit(),
-    },
-    Opt {
-        name: "--no-uniq",
-        aliases: &[],
-        boolean: true,
-        subs: Sub::List.bit(),
-    },
-    Opt {
-        name: "--duration",
-        aliases: &["-d"],
-        boolean: false,
-        subs: Sub::Inject.bit() | Sub::Unit.bit() | Sub::Load.bit(),
-    },
-    Opt {
-        name: "--pidfile",
-        aliases: &[],
-        boolean: false,
-        subs: Sub::Inject.bit() | Sub::Stop.bit() | Sub::Unit.bit() | Sub::Doctor.bit(),
-    },
-    Opt {
-        name: "--mem",
-        aliases: &[],
-        boolean: true,
-        subs: INJECT_UNIT,
-    },
-    Opt {
-        name: "--no-mem",
-        aliases: &[],
-        boolean: true,
-        subs: INJECT_UNIT,
-    },
-    Opt {
-        name: "--mem-cap",
-        aliases: &[],
-        boolean: false,
-        subs: INJECT_UNIT,
-    },
-    Opt {
-        name: "--mem-target",
-        aliases: &[],
-        boolean: false,
-        subs: INJECT_UNIT,
-    },
-    Opt {
-        name: "--phys-cap",
-        aliases: &[],
-        boolean: false,
-        subs: INJECT_UNIT,
-    },
-    Opt {
-        name: "--disk",
-        aliases: &[],
-        boolean: false,
-        subs: INJECT_UNIT,
-    },
-    Opt {
-        name: "--exe",
-        aliases: &[],
-        boolean: true,
-        subs: INJECT_UNIT,
-    },
-    Opt {
-        name: "--no-exe",
-        aliases: &["--allow-proc-exe"],
-        boolean: true,
-        subs: INJECT_UNIT,
-    },
-    Opt {
-        name: "--shadow-dir",
-        aliases: &[],
-        boolean: false,
-        subs: INJECT_UNIT,
-    },
-    Opt {
-        name: "--no-root",
-        aliases: &[],
-        boolean: true,
-        subs: INJECT_UNIT,
-    },
-    Opt {
-        name: "--tty",
-        aliases: &[],
-        boolean: true,
-        subs: INJECT_UNIT,
-    },
-    Opt {
-        name: "--no-tty",
-        aliases: &[],
-        boolean: true,
-        subs: INJECT_UNIT,
-    },
-    Opt {
-        name: "--threads",
-        aliases: &[],
-        boolean: true,
-        subs: INJECT_UNIT,
-    },
-    Opt {
-        name: "--no-threads",
-        aliases: &[],
-        boolean: true,
-        subs: INJECT_UNIT,
-    },
-    Opt {
-        name: "--user",
-        aliases: &[],
-        boolean: true,
-        subs: INJECT_UNIT,
-    },
-    Opt {
-        name: "--no-user",
-        aliases: &[],
-        boolean: true,
-        subs: INJECT_UNIT,
-    },
-    Opt {
-        name: "--create-users",
-        aliases: &[],
-        boolean: true,
-        subs: INJECT_UNIT,
-    },
-    Opt {
-        name: "--busy",
-        aliases: &[],
-        boolean: true,
-        subs: INJECT_UNIT,
-    },
-    Opt {
-        name: "--cpu",
-        aliases: &[],
-        boolean: false,
-        subs: INJECT_UNIT,
-    },
-    Opt {
-        name: "--dry-run",
-        aliases: &[],
-        boolean: true,
-        subs: Sub::Inject.bit(),
-    },
-    Opt {
-        name: "--plan",
-        aliases: &[],
-        boolean: true,
-        subs: Sub::Inject.bit() | Sub::Stop.bit(),
-    },
-    Opt {
-        name: "--json",
-        aliases: &[],
-        boolean: true,
-        subs: Sub::Inject.bit() | Sub::Doctor.bit(),
-    },
-    Opt {
-        name: "--table",
-        aliases: &[],
-        boolean: true,
-        subs: Sub::Inject.bit(),
-    },
-    Opt {
-        name: "--verify",
-        aliases: &[],
-        boolean: true,
-        subs: INJECT_UNIT,
-    },
-    Opt {
-        name: "--wait",
-        aliases: &[],
-        boolean: true,
-        subs: Sub::Inject.bit(),
-    },
-    Opt {
-        name: "--elevate",
-        aliases: &[],
-        boolean: true,
-        subs: Sub::Inject.bit() | Sub::Stop.bit(),
-    },
-    Opt {
-        name: "--quiet",
-        aliases: &["-q"],
-        boolean: true,
-        subs: Sub::Inject.bit() | Sub::Stop.bit() | Sub::Load.bit(),
-    },
-    Opt {
-        name: "--binaries",
-        aliases: &[],
-        boolean: true,
-        subs: Sub::Check.bit(),
-    },
-    Opt {
-        name: "--require-binaries",
-        aliases: &[],
-        boolean: true,
-        subs: Sub::Check.bit(),
-    },
-    Opt {
-        name: "--host-mem",
-        aliases: &[],
-        boolean: false,
-        subs: Sub::Table.bit(),
-    },
-    Opt {
-        name: "--host-pid-max",
-        aliases: &[],
-        boolean: false,
-        subs: Sub::Table.bit(),
-    },
-    Opt {
-        name: "--host-uptime",
-        aliases: &[],
-        boolean: false,
-        subs: Sub::Table.bit(),
-    },
-    Opt {
-        name: "--live",
-        aliases: &[],
-        boolean: true,
-        subs: Sub::Table.bit(),
-    },
-    Opt {
-        name: "--repeat-max",
-        aliases: &[],
-        boolean: false,
-        subs: Sub::Table.bit() | Sub::Inject.bit(),
-    },
-    Opt {
-        name: "--cpu-util",
-        aliases: &[],
-        boolean: false,
-        subs: Sub::Load.bit(),
-    },
-    Opt {
-        name: "--mem-util",
-        aliases: &[],
-        boolean: false,
-        subs: Sub::Load.bit(),
-    },
-    Opt {
-        name: "--disk-util",
-        aliases: &[],
-        boolean: false,
-        subs: Sub::Load.bit(),
-    },
-    Opt {
         name: "--force",
         aliases: &[],
         boolean: true,
         subs: Sub::Stop.bit() | Sub::Load.bit(),
     },
-    Opt {
-        name: "--module",
-        aliases: &["-m"],
-        boolean: false,
-        subs: Sub::Log.bit(),
-    },
-    Opt {
-        name: "--lines",
-        aliases: &[],
-        boolean: false,
-        subs: Sub::Log.bit(),
-    },
-    Opt {
-        name: "--delay",
-        aliases: &[],
-        boolean: false,
-        subs: Sub::Log.bit(),
-    },
-    Opt {
-        name: "--speed",
-        aliases: &[],
-        boolean: false,
-        subs: Sub::Log.bit(),
-    },
-    Opt {
-        name: "--log-fmt",
-        aliases: &[],
-        boolean: false,
-        subs: Sub::Log.bit(),
-    },
+];
+
+const OPT_NAMES: &str = concat!(
+    "--help,-h|--version,-V|--count,-n|--seed,-s|--profile,-p|--family,-f|",
+    "--utc-offset|--local|--sort|--no-sort|--uniq|--no-uniq|--duration,-d|--pidfile|",
+    "--mem|--no-mem|--mem-cap|--mem-target|--phys-cap|--disk|--exe|--no-exe,--allow-proc-exe|",
+    "--shadow-dir|--no-root|--tty|--no-tty|--threads|--no-threads|--user|--no-user|",
+    "--create-users|--busy|--cpu|--dry-run|--plan|--json|--table|--verify|--wait|--elevate|",
+    "--quiet,-q|--binaries|--require-binaries|--host-mem|--host-pid-max|--host-uptime|",
+    "--live|--repeat-max|--cpu-util|--mem-util|--disk-util|--force|--module,-m|--lines|",
+    "--delay|--speed|--log-fmt|--pid|--validate|--out|--tree|--label|--masker|--profile-name|",
+    "--redact-token|--redact-env|--from-profile|--decoy-level|--clean-env|--exe-memfd|",
+    "--decoy-token|--dumpable|--seccomp|--wchan|--jitter-ms|--churn|--masker-cmd|--decoys|",
+    "--mode|--level|--control|--hard-negatives|--observer-uid|--blind-dir|--run-id|",
+    "--target-pid|--target-cmd|--runs|--pick",
+);
+
+const OPT_META: &[(OptId, bool, u32)] = &[
+    (OptId::Help, true, ANY),
+    (OptId::Version, true, ANY),
+    (OptId::Count, false, GEN_UNIT),
+    (OptId::Seed, false, EXPAND | Sub::Log.bit() | Sub::Run.bit()),
+    (OptId::Profile, false, GEN_UNIT | Sub::Run.bit()),
+    (OptId::Family, false, EXPAND),
+    (
+        OptId::UtcOffset,
+        false,
+        Sub::Table.bit() | Sub::Inject.bit(),
+    ),
+    (OptId::Local, true, Sub::Table.bit() | Sub::Inject.bit()),
+    (OptId::Sort, true, Sub::List.bit()),
+    (OptId::NoSort, true, Sub::List.bit()),
+    (OptId::Uniq, true, Sub::List.bit()),
+    (OptId::NoUniq, true, Sub::List.bit()),
+    (
+        OptId::Duration,
+        false,
+        Sub::Inject.bit() | Sub::Unit.bit() | Sub::Load.bit(),
+    ),
+    (
+        OptId::Pidfile,
+        false,
+        Sub::Inject.bit() | Sub::Stop.bit() | Sub::Unit.bit() | Sub::Doctor.bit(),
+    ),
+    (OptId::Mem, true, INJECT_UNIT),
+    (OptId::NoMem, true, INJECT_UNIT),
+    (OptId::MemCap, false, INJECT_UNIT),
+    (OptId::MemTarget, false, INJECT_UNIT),
+    (OptId::PhysCap, false, INJECT_UNIT),
+    (OptId::Disk, false, INJECT_UNIT),
+    (OptId::Exe, true, INJECT_UNIT),
+    (OptId::NoExe, true, INJECT_UNIT),
+    (OptId::ShadowDir, false, INJECT_UNIT),
+    (OptId::NoRoot, true, INJECT_UNIT),
+    (OptId::Tty, true, INJECT_UNIT),
+    (OptId::NoTty, true, INJECT_UNIT),
+    (OptId::Threads, true, INJECT_UNIT),
+    (OptId::NoThreads, true, INJECT_UNIT),
+    (OptId::User, true, INJECT_UNIT),
+    (OptId::NoUser, true, INJECT_UNIT),
+    (OptId::CreateUsers, true, INJECT_UNIT),
+    (OptId::Busy, true, INJECT_UNIT),
+    (OptId::Cpu, false, INJECT_UNIT),
+    (OptId::DryRun, true, Sub::Inject.bit()),
+    (OptId::Plan, true, Sub::Inject.bit() | Sub::Stop.bit()),
+    (OptId::Json, true, Sub::Inject.bit() | Sub::Doctor.bit()),
+    (OptId::Table, true, Sub::Inject.bit()),
+    (OptId::Verify, true, INJECT_UNIT),
+    (OptId::Wait, true, Sub::Inject.bit()),
+    (OptId::Elevate, true, Sub::Inject.bit() | Sub::Stop.bit()),
+    (
+        OptId::Quiet,
+        true,
+        Sub::Inject.bit() | Sub::Stop.bit() | Sub::Load.bit(),
+    ),
+    (OptId::Binaries, true, Sub::Check.bit()),
+    (OptId::RequireBinaries, true, Sub::Check.bit()),
+    (OptId::HostMem, false, Sub::Table.bit()),
+    (OptId::HostPidMax, false, Sub::Table.bit()),
+    (OptId::HostUptime, false, Sub::Table.bit()),
+    (OptId::Live, true, Sub::Table.bit() | Sub::Run.bit()),
+    (
+        OptId::RepeatMax,
+        false,
+        Sub::Table.bit() | Sub::Inject.bit(),
+    ),
+    (OptId::CpuUtil, false, Sub::Load.bit()),
+    (OptId::MemUtil, false, Sub::Load.bit()),
+    (OptId::DiskUtil, false, Sub::Load.bit()),
+    (OptId::Force, true, Sub::Stop.bit() | Sub::Load.bit()),
+    (OptId::Module, false, Sub::Log.bit()),
+    (OptId::Lines, false, Sub::Log.bit()),
+    (OptId::Delay, false, Sub::Log.bit()),
+    (OptId::Speed, false, Sub::Log.bit()),
+    (OptId::LogFmt, false, Sub::Log.bit()),
+    (OptId::Pid, false, Sub::Profile.bit()),
+    (OptId::Validate, false, Sub::Profile.bit()),
+    (
+        OptId::Out,
+        false,
+        Sub::Profile.bit()
+            | Sub::Run.bit()
+            | Sub::Score.bit()
+            | Sub::Replay.bit()
+            | Sub::Selftest.bit(),
+    ),
+    (OptId::Tree, true, Sub::Profile.bit()),
+    (OptId::Label, false, Sub::Profile.bit()),
+    (OptId::Masker, false, Sub::Profile.bit()),
+    (OptId::ProfileName, false, Sub::Profile.bit()),
+    (
+        OptId::RedactToken,
+        false,
+        Sub::Profile.bit() | Sub::Verify.bit(),
+    ),
+    (OptId::RedactEnv, false, Sub::Profile.bit()),
+    (OptId::FromProfile, false, Sub::Inject.bit()),
+    (OptId::DecoyLevel, false, Sub::Inject.bit()),
+    (OptId::CleanEnv, true, Sub::Inject.bit()),
+    (OptId::ExeMemfd, true, Sub::Inject.bit()),
+    (OptId::DecoyToken, false, Sub::Inject.bit() | Sub::Run.bit()),
+    (OptId::Dumpable, false, Sub::Inject.bit()),
+    (OptId::Seccomp, false, Sub::Inject.bit()),
+    (OptId::Wchan, false, Sub::Inject.bit()),
+    (OptId::JitterMs, false, Sub::Inject.bit() | Sub::Run.bit()),
+    (OptId::Churn, false, Sub::Inject.bit() | Sub::Run.bit()),
+    (OptId::MaskerCmd, false, Sub::Inject.bit() | Sub::Run.bit()),
+    (OptId::Decoys, false, Sub::Run.bit()),
+    (OptId::Mode, false, Sub::Run.bit()),
+    (OptId::Level, false, Sub::Run.bit()),
+    (OptId::Control, false, Sub::Run.bit()),
+    (OptId::HardNegatives, false, Sub::Run.bit()),
+    (OptId::ObserverUid, false, Sub::Run.bit()),
+    (OptId::BlindDir, false, Sub::Run.bit()),
+    (OptId::RunId, false, Sub::Run.bit()),
+    (OptId::TargetPid, false, Sub::Run.bit()),
+    (OptId::TargetCmd, false, Sub::Run.bit()),
+    (OptId::Runs, false, Sub::Score.bit()),
+    (
+        OptId::Pick,
+        false,
+        Sub::Score.bit() | Sub::Replay.bit() | Sub::Verify.bit(),
+    ),
 ];
 
 pub struct Args {
@@ -500,6 +426,43 @@ pub struct Args {
     pub host_pid_max: Option<u64>,
     /// `--host-uptime S`: generate for a host that has been up this long.
     pub host_uptime: Option<u64>,
+    /// Positional `<run-dir>` for `score`, `replay`, and `verify`.
+    pub run_dir: Option<Vec<u8>>,
+    /// `profile` options.
+    pub target_pid: Option<i32>,
+    pub validate_file: Option<Vec<u8>>,
+    pub out_path: Option<Vec<u8>>,
+    pub tree: bool,
+    pub label: Option<String>,
+    pub masker: Option<String>,
+    pub profile_name: Option<String>,
+    pub redact_tokens: Vec<String>,
+    pub redact_envs: Vec<String>,
+    /// `inject` decoy options (and shared `run` live options).
+    pub from_profile: Option<Vec<u8>>,
+    pub decoy_level: Option<u8>,
+    pub clean_env: bool,
+    pub exe_memfd: bool,
+    pub decoy_token: Option<String>,
+    pub dumpable: Option<u8>,
+    pub seccomp: Option<u8>,
+    pub wchan: Option<u8>,
+    pub jitter_ms: u32,
+    pub churn: u32,
+    pub masker_cmd: Option<String>,
+    /// `run` options.
+    pub decoys: usize,
+    pub run_mode: harness::Mode,
+    pub run_level: u8,
+    pub run_control: harness::Control,
+    pub hard_negatives: Option<Vec<harness::HardNeg>>,
+    pub observer_uid: Option<u32>,
+    pub blind_dir: Option<Vec<u8>>,
+    pub run_id: Option<String>,
+    pub target_cmd: Option<String>,
+    /// `score` / `replay` / `verify` options.
+    pub runs: Option<String>,
+    pub pick: Option<String>,
     /// Every option name seen on the command line, in canonical long form.
     /// Used to reject an option that the chosen subcommand does not consume.
     pub seen: Vec<&'static str>,
@@ -559,6 +522,38 @@ impl Args {
             host_mem_mb: None,
             host_pid_max: None,
             host_uptime: None,
+            run_dir: None,
+            target_pid: None,
+            validate_file: None,
+            out_path: None,
+            tree: false,
+            label: None,
+            masker: None,
+            profile_name: None,
+            redact_tokens: Vec::new(),
+            redact_envs: Vec::new(),
+            from_profile: None,
+            decoy_level: None,
+            clean_env: false,
+            exe_memfd: false,
+            decoy_token: None,
+            dumpable: None,
+            seccomp: None,
+            wchan: None,
+            jitter_ms: 0,
+            churn: 0,
+            masker_cmd: None,
+            decoys: 50,
+            run_mode: harness::Mode::Both,
+            run_level: 5,
+            run_control: harness::Control::C06Main,
+            hard_negatives: None,
+            observer_uid: None,
+            blind_dir: None,
+            run_id: None,
+            target_cmd: None,
+            runs: None,
+            pick: None,
             seen: Vec::new(),
         }
     }
@@ -580,22 +575,22 @@ impl Args {
             push("-f", Some(crate::corpus::family_name(f).as_bytes()));
         }
         if self.duration > 0 {
-            push("-d", Some(self.duration.to_string().as_bytes()));
+            push("-d", Some(json::u64_str(self.duration as u64).as_bytes()));
         }
         if !self.mem {
             push("--no-mem", None);
         }
         if self.mem_cap_mb > 0 {
-            push("--mem-cap", Some(self.mem_cap_mb.to_string().as_bytes()));
+            push("--mem-cap", Some(json::u64_str(self.mem_cap_mb).as_bytes()));
         }
         if let Some(kb) = self.mem_target_kb {
-            push("--mem-target", Some(kb.to_string().as_bytes()));
+            push("--mem-target", Some(json::u64_str(kb as u64).as_bytes()));
         }
         if let Some(mb) = self.phys_cap {
-            push("--phys-cap", Some(mb.to_string().as_bytes()));
+            push("--phys-cap", Some(json::u64_str(mb).as_bytes()));
         }
         if let Some(mb) = self.disk_mb {
-            push("--disk", Some(mb.to_string().as_bytes()));
+            push("--disk", Some(json::u64_str(mb).as_bytes()));
         }
         if self.no_exe {
             push("--no-exe", None);
@@ -619,7 +614,7 @@ impl Args {
             push("--busy", None);
         }
         if let Some(pct) = self.cpu_pct {
-            push("--cpu", Some(pct.to_string().as_bytes()));
+            push("--cpu", Some(json::u64_str(pct as u64).as_bytes()));
         }
         if self.verify {
             push("--verify", None);
@@ -644,6 +639,12 @@ USAGE
   psgen log [options]           write activity logs to stdout
   psgen load [options]          create real cpu, memory and disk pressure
   psgen unit [options]          print a systemd unit that injects at boot
+  psgen profile [options]       capture a live process profile or validate JSON
+  psgen run [options]           build a reproducible blind evaluation bundle
+  psgen score <run-dir> [opts]  score one or more blind evaluation picks
+  psgen replay <run-dir> [opts] deterministically rescore an archived run
+  psgen verify <run-dir> [opts] verify manifest, schema, hygiene and replay
+  psgen selftest [--out DIR]    run planted-defect and discrimination guards
 
 COMMON
   -n, --count N       rows or commands (list: all templates, table: 30,
@@ -729,6 +730,17 @@ INJECT
       --wait            block for a non-zero --duration, then stop the stubs
       --elevate         re-exec through sudo -n when not already root
   -q, --quiet           suppress the inject summary
+      --from-profile FILE  spawn matched live decoy trees from profile JSON
+      --decoy-level N      decoy fidelity level 1..6 (default 5)
+      --clean-env          memfd-name auth, no PSGEN_NONCE
+      --exe-memfd          re-exec via memfd_create + execveat
+      --decoy-token PREFIX decoy token prefix for memory scans
+      --dumpable N         PR_SET_DUMPABLE override (0 or 1)
+      --seccomp N          install N benign seccomp filters (0..8)
+      --wchan MODE         pause, epoll, poll, nanosleep, futex or read
+      --jitter-ms MS       startup jitter ceiling in ms
+      --churn N            short-lived churn workers
+      --masker-cmd CMD     spawn decoys via external masker command
 
 CORPUS AND CHECK
       --binaries        report which template executables exist on this host
@@ -802,6 +814,21 @@ STOP
   A pidfile from a live run is left in place, so the same path can be used
   again; stop the run twice and the second call is a no-op. The summary counts
   processes, not lines, and `skipped` counts lines.
+
+PROFILE
+      --pid PID / --validate FILE / --out FILE / --tree
+      --label STR / --masker STR / --profile-name STR
+      --redact-token STR / --redact-env VAR
+
+RUN
+      --profile FILE / --out DIR / --decoys N / --seed N
+      --mode MODE / --level N / --control ID / --hard-negatives SET
+      --observer-uid UID / --blind-dir DIR / --run-id STR / --decoy-token PREFIX
+      --live / --target-pid PID / --target-cmd CMD / --masker-cmd CMD
+      --jitter-ms MS / --churn N
+
+SCORE, REPLAY, VERIFY AND SELFTEST
+      --runs DIRS / --pick FILE / --out FILE / --redact-token STR
 ";
 
 fn usage() -> Vec<u8> {
@@ -824,6 +851,12 @@ fn set_sub(a: &mut Args, name: &[u8]) -> bool {
         b"doctor" | b"probe" | b"env" => Sub::Doctor,
         b"log" | b"activity" => Sub::Log,
         b"load" | b"lookbusy" => Sub::Load,
+        b"profile" => Sub::Profile,
+        b"run" => Sub::Run,
+        b"score" => Sub::Score,
+        b"replay" => Sub::Replay,
+        b"verify" => Sub::Verify,
+        b"selftest" => Sub::Selftest,
         b"help" => Sub::Help,
         b"version" => Sub::Version,
         _ => return false,
@@ -847,16 +880,45 @@ fn take_value<'a>(
     }
 }
 
-/// The option a spelling selects, if the table knows it.
-fn opt_of(name: &[u8]) -> Option<&'static Opt> {
-    OPTS.iter()
-        .find(|o| o.name.as_bytes() == name || o.aliases.iter().any(|a| a.as_bytes() == name))
+#[inline(never)]
+fn opt_of(needle: &[u8]) -> Option<OptRow> {
+    for (spec, &(id, boolean, subs)) in OPT_NAMES.split('|').zip(OPT_META.iter()) {
+        let (name, alias) = spec.split_once(',').unwrap_or((spec, ""));
+        if name.as_bytes() == needle || (!alias.is_empty() && alias.as_bytes() == needle) {
+            return Some(OptRow {
+                id,
+                name,
+                #[cfg(test)]
+                alias,
+                boolean,
+                subs,
+            });
+        }
+    }
+    None
 }
 
-fn is_boolean_flag(name: &[u8]) -> bool {
-    opt_of(name).map(|o| o.boolean).unwrap_or(false)
+#[cfg(test)]
+fn all_opts() -> Vec<OptRow> {
+    let specs: Vec<&str> = OPT_NAMES.split('|').collect();
+    assert_eq!(specs.len(), OPT_META.len());
+    specs
+        .into_iter()
+        .zip(OPT_META.iter())
+        .map(|(spec, &(id, boolean, subs))| {
+            let (name, alias) = spec.split_once(',').unwrap_or((spec, ""));
+            OptRow {
+                id,
+                name,
+                alias,
+                boolean,
+                subs,
+            }
+        })
+        .collect()
 }
 
+#[inline(never)]
 fn abs_path(p: &[u8]) -> Vec<u8> {
     let path = Path::new(OsStr::from_bytes(p));
     if path.is_absolute() {
@@ -870,6 +932,7 @@ fn abs_path(p: &[u8]) -> Vec<u8> {
 
 /// A usage error. Static for the common cases, owned when the message has to
 /// name the option and the subcommand.
+#[cfg_attr(test, derive(Debug))]
 pub enum ParseError {
     Static(&'static str),
     Owned(String),
@@ -887,12 +950,19 @@ impl From<String> for ParseError {
     }
 }
 
+impl ParseError {
+    pub fn as_str(&self) -> &str {
+        match self {
+            ParseError::Static(s) => s,
+            ParseError::Owned(s) => s.as_str(),
+        }
+    }
+}
+
+#[cfg(test)]
 impl core::fmt::Display for ParseError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            ParseError::Static(s) => f.write_str(s),
-            ParseError::Owned(s) => f.write_str(s),
-        }
+        f.write_str(self.as_str())
     }
 }
 
@@ -908,17 +978,52 @@ fn sub_name(sub: Sub) -> &'static str {
         Sub::Doctor => "doctor",
         Sub::Log => "log",
         Sub::Load => "load",
+        Sub::Profile => "profile",
+        Sub::Run => "run",
+        Sub::Score => "score",
+        Sub::Replay => "replay",
+        Sub::Verify => "verify",
+        Sub::Selftest => "selftest",
         Sub::Help => "help",
         Sub::Version => "version",
     }
 }
 
+fn req_utf8(v: &[u8], name: &str) -> Result<String, ParseError> {
+    core::str::from_utf8(v)
+        .map(String::from)
+        .map_err(|_| json::cat2("invalid ", name).into())
+}
+
+fn req_num(
+    v: &[u8],
+    name: &str,
+    lo: u64,
+    hi: u64,
+    range_err: &'static str,
+) -> Result<u64, ParseError> {
+    let n = str::parse_u64(v).ok_or_else(|| json::cat2("invalid ", name))?;
+    if n < lo || n > hi {
+        return Err(if range_err.is_empty() {
+            json::cat2("invalid ", name).into()
+        } else {
+            range_err.into()
+        });
+    }
+    Ok(n)
+}
+
+fn err_unknown_val(flag: &str, v: &[u8], suffix: &str) -> ParseError {
+    let mut s = String::with_capacity(64);
+    s.push_str("unknown ");
+    s.push_str(flag);
+    s.push(' ');
+    json::push_escaped_str(&String::from_utf8_lossy(v), &mut s);
+    s.push_str(suffix);
+    ParseError::Owned(s)
+}
+
 /// Whether `sub` consumes the option `name` (canonical long form).
-///
-/// One table decides, so an option that a subcommand does not read cannot be
-/// accepted and silently dropped. The worst case before this was `unit -p
-/// desktop`, which printed a unit that injected server rows; rejecting it also
-/// catches typos such as `--famly`.
 fn applies(sub: Sub, name: &str) -> bool {
     match opt_of(name.as_bytes()) {
         Some(o) => o.subs & sub.bit() != 0,
@@ -926,6 +1031,172 @@ fn applies(sub: Sub, name: &str) -> bool {
     }
 }
 
+#[inline(never)]
+fn set_opt_str(slot: &mut Option<String>, v: &[u8], name: &str) -> Result<(), ParseError> {
+    *slot = Some(req_utf8(v, name)?);
+    Ok(())
+}
+
+#[inline(never)]
+fn apply_opt(a: &mut Args, opt: &OptRow, v: &[u8]) -> Result<(), ParseError> {
+    const UMAX: u64 = usize::MAX as u64;
+    const U32M: u64 = u32::MAX as u64;
+    let name = opt.name;
+    match opt.id {
+        OptId::Help => a.want_help = true,
+        OptId::Version => a.want_version = true,
+        OptId::Local => a.local = true,
+        OptId::Sort => a.sort = true,
+        OptId::NoSort => a.sort = false,
+        OptId::Uniq => a.uniq = true,
+        OptId::NoUniq => a.uniq = false,
+        OptId::Mem => a.mem = true,
+        OptId::NoMem => a.mem = false,
+        OptId::Tty => a.tty = true,
+        OptId::NoTty => a.tty = false,
+        OptId::Threads => a.threads = true,
+        OptId::NoThreads => a.threads = false,
+        OptId::User => a.user = true,
+        OptId::NoUser => a.user = false,
+        OptId::CreateUsers => a.create_users = true,
+        OptId::Busy => a.busy = true,
+        OptId::DryRun => a.dry_run = true,
+        OptId::Plan => a.plan = true,
+        OptId::Wait => a.wait = true,
+        OptId::Binaries => a.binaries = true,
+        OptId::RequireBinaries => {
+            a.binaries = true;
+            a.require_binaries = true;
+        }
+        OptId::Elevate => a.elevate = true,
+        OptId::Table => a.table = true,
+        OptId::Live => a.live = true,
+        OptId::Force => a.force = true,
+        OptId::Verify => a.verify = true,
+        OptId::Exe => a.no_exe = false,
+        OptId::NoExe => a.no_exe = true,
+        OptId::NoRoot => a.no_root = true,
+        OptId::Json => a.json = true,
+        OptId::Quiet => a.quiet = true,
+        OptId::Tree => a.tree = true,
+        OptId::CleanEnv => a.clean_env = true,
+        OptId::ExeMemfd => a.exe_memfd = true,
+        OptId::Label => set_opt_str(&mut a.label, v, name)?,
+        OptId::Masker => set_opt_str(&mut a.masker, v, name)?,
+        OptId::ProfileName => set_opt_str(&mut a.profile_name, v, name)?,
+        OptId::DecoyToken => set_opt_str(&mut a.decoy_token, v, name)?,
+        OptId::MaskerCmd => set_opt_str(&mut a.masker_cmd, v, name)?,
+        OptId::RunId => set_opt_str(&mut a.run_id, v, name)?,
+        OptId::TargetCmd => set_opt_str(&mut a.target_cmd, v, name)?,
+        OptId::Runs => set_opt_str(&mut a.runs, v, name)?,
+        OptId::Pick => set_opt_str(&mut a.pick, v, name)?,
+        OptId::Validate => a.validate_file = Some(v.to_vec()),
+        OptId::Out => a.out_path = Some(v.to_vec()),
+        OptId::FromProfile => a.from_profile = Some(v.to_vec()),
+        OptId::BlindDir => a.blind_dir = Some(v.to_vec()),
+        OptId::Pidfile => a.pidfile = Some(abs_path(v)),
+        OptId::ShadowDir => a.shadow_dir = Some(abs_path(v)),
+        OptId::Profile => a.profile = v.to_vec(),
+        OptId::Module => a.log_module = v.to_vec(),
+        OptId::RedactToken => a.redact_tokens.push(req_utf8(v, name)?),
+        OptId::RedactEnv => a.redact_envs.push(req_utf8(v, name)?),
+        OptId::Family => {
+            a.family = Some(corpus::family_id(v).ok_or_else(|| {
+                err_unknown_val("--family", v, "; see `--help` for the accepted set")
+            })?);
+        }
+        OptId::LogFmt => {
+            a.log_fmt = Some(loggen::Format::parse(v).ok_or_else(|| {
+                err_unknown_val("--log-fmt", v, "; expected apache, json or syslog")
+            })?);
+        }
+        OptId::UtcOffset => {
+            let m = str::parse_i64(v).ok_or("invalid --utc-offset")?;
+            if !(-1440..=1440).contains(&m) {
+                return Err("--utc-offset must be -1440..1440".into());
+            }
+            a.offset_min = m;
+        }
+        OptId::Wchan => {
+            let s = req_utf8(v, name)?;
+            a.wchan =
+                Some(inject::parse_wchan_mode(&s).ok_or(
+                    "invalid --wchan; expected pause, epoll, poll, nanosleep, futex or read",
+                )?);
+        }
+        OptId::Mode => a.run_mode = harness::Mode::parse(&req_utf8(v, name)?)?,
+        OptId::Control => a.run_control = harness::Control::parse(&req_utf8(v, name)?)?,
+        OptId::HardNegatives => {
+            a.hard_negatives = Some(harness::HardNeg::parse_list(&req_utf8(v, name)?)?);
+        }
+        OptId::Count => a.count = req_num(v, name, 0, UMAX, "")? as usize,
+        OptId::Decoys => a.decoys = req_num(v, name, 0, UMAX, "")? as usize,
+        OptId::RepeatMax => a.repeat_max = Some(req_num(v, name, 0, UMAX, "")? as usize),
+        OptId::Lines => {
+            a.log_lines = req_num(v, name, 1, UMAX, "--lines must be at least 1")? as usize
+        }
+        OptId::Duration => a.duration = req_num(v, name, 0, U32M, "")? as u32,
+        OptId::JitterMs => a.jitter_ms = req_num(v, name, 0, U32M, "")? as u32,
+        OptId::Churn => a.churn = req_num(v, name, 0, U32M, "")? as u32,
+        OptId::MemTarget => a.mem_target_kb = Some(req_num(v, name, 0, U32M, "")? as u32),
+        OptId::ObserverUid => a.observer_uid = Some(req_num(v, name, 0, U32M, "")? as u32),
+        OptId::Seed => a.seed = Some(req_num(v, name, 0, u64::MAX, "")?),
+        OptId::MemCap => a.mem_cap_mb = req_num(v, name, 0, u64::MAX, "")?,
+        OptId::PhysCap => a.phys_cap = Some(req_num(v, name, 0, u64::MAX, "")?),
+        OptId::Delay => a.log_delay_ms = req_num(v, name, 0, u64::MAX, "")?,
+        OptId::DiskUtil => a.load_disk = Some(req_num(v, name, 0, u64::MAX, "")?),
+        OptId::Disk => a.disk_mb = Some(req_num(v, name, 0, U32M / 1024, "")?),
+        OptId::Pid | OptId::TargetPid => {
+            a.target_pid = Some(req_num(v, name, 1, i32::MAX as u64, "")? as i32)
+        }
+        OptId::Cpu => a.cpu_pct = Some(req_num(v, name, 0, 100, "--cpu must be 0..100")? as u32),
+        OptId::Speed => a.speed = req_num(v, name, 1, u64::MAX, "--speed must be at least 1")?,
+        OptId::CpuUtil => {
+            a.load_cpu = Some(req_num(v, name, 0, 100, "--cpu-util must be 0..100")? as u32)
+        }
+        OptId::MemUtil => {
+            a.load_mem = Some(req_num(v, name, 0, 95, "--mem-util must be 0..95")? as u32)
+        }
+        OptId::HostMem => {
+            a.host_mem_mb = Some(req_num(
+                v,
+                name,
+                1,
+                u64::MAX,
+                "--host-mem must be at least 1 MiB",
+            )?)
+        }
+        OptId::HostPidMax => {
+            a.host_pid_max = Some(req_num(
+                v,
+                name,
+                1,
+                u64::MAX,
+                "--host-pid-max must be at least 1",
+            )?)
+        }
+        OptId::HostUptime => {
+            a.host_uptime = Some(req_num(
+                v,
+                name,
+                1,
+                u64::MAX,
+                "--host-uptime must be at least 1",
+            )?)
+        }
+        OptId::DecoyLevel => {
+            a.decoy_level = Some(req_num(v, name, 1, 6, "--decoy-level must be 1..6")? as u8)
+        }
+        OptId::Dumpable => {
+            a.dumpable = Some(req_num(v, name, 0, 1, "--dumpable must be 0 or 1")? as u8)
+        }
+        OptId::Seccomp => a.seccomp = Some(req_num(v, name, 0, 8, "--seccomp must be 0..8")? as u8),
+        OptId::Level => a.run_level = req_num(v, name, 1, 6, "--level must be 1..6")? as u8,
+    }
+    Ok(())
+}
+
+#[inline(never)]
 pub fn parse(args: &[Vec<u8>]) -> Result<Args, ParseError> {
     let mut a = Args::new();
     let mut i = 1usize;
@@ -943,383 +1214,47 @@ pub fn parse(args: &[Vec<u8>]) -> Result<Args, ParseError> {
                 Some(pos) => (&arg[..pos], Some(&arg[pos + 1..])),
                 None => (&arg[..], None),
             };
-            if inline.is_some() && is_boolean_flag(name) {
+            if inline.is_some() && matches!(name, b"-V" | b"--version") {
                 return Err("this option does not take a value".into());
             }
             match name {
-                b"-h" | b"--help" => {
-                    a.want_help = true;
-                    a.seen.push("--help");
+                b"--flame" => {
+                    return Err(
+                        "--flame is not supported (it was an alias in an older draft); use `psgen load --cpu-util`"
+                            .into(),
+                    );
                 }
                 b"-V" | b"--version" => {
                     a.want_version = true;
                     a.seen.push("--version");
                 }
-                b"-n" | b"--count" => {
-                    a.seen.push("--count");
-                    let v = take_value(args, &mut i, inline).ok_or("missing value for --count")?;
-                    a.count =
-                        usize::try_from(str::parse_u64(v).ok_or("invalid --count")?)
-                            .map_err(|_| "invalid --count")?;
-                }
-                b"-s" | b"--seed" => {
-                    a.seen.push("--seed");
-                    let v = take_value(args, &mut i, inline).ok_or("missing value for --seed")?;
-                    a.seed = Some(str::parse_u64(v).ok_or("invalid --seed")?);
-                }
-                b"-p" | b"--profile" => {
-                    a.seen.push("--profile");
-                    let v =
-                        take_value(args, &mut i, inline).ok_or("missing value for --profile")?;
-                    if v != b"server" && v != b"dev" && v != b"desktop" {
-                        // Name the flag and the value: a script that takes
-                        // PROFILE from the environment otherwise cannot tell
-                        // which of its arguments was refused.
-                        return Err(format!(
-                            "unknown --profile {:?}; expected server, dev or desktop",
-                            String::from_utf8_lossy(v)
-                        )
-                        .into());
+                _ => {
+                    let opt = opt_of(name).ok_or("unknown option")?;
+                    if inline.is_some() && opt.boolean {
+                        return Err("this option does not take a value".into());
                     }
-                    a.profile = v.to_vec();
+                    a.seen.push(opt.name);
+                    let val: &[u8] = if opt.boolean {
+                        b""
+                    } else {
+                        take_value(args, &mut i, inline)
+                            .ok_or_else(|| json::cat2("missing value for ", opt.name))?
+                    };
+                    apply_opt(&mut a, &opt, val)?;
                 }
-                b"-f" | b"--family" => {
-                    a.seen.push("--family");
-                    let v = take_value(args, &mut i, inline).ok_or("missing value for --family")?;
-                    a.family = Some(
-                        corpus::family_id(v).ok_or_else(|| {
-                            format!(
-                                "unknown --family {:?}; see `--help` for the accepted set",
-                                String::from_utf8_lossy(v)
-                            )
-                        })?,
-                    );
-                }
-                b"--utc-offset" => {
-                    a.seen.push("--utc-offset");
-                    let v =
-                        take_value(args, &mut i, inline).ok_or("missing value for --utc-offset")?;
-                    let m = str::parse_i64(v).ok_or("invalid --utc-offset")?;
-                    // The START column is a clock field. An offset beyond a day
-                    // can only produce a year with more digits than the column
-                    // has room for, which shifts every field after it.
-                    if !(-1440..=1440).contains(&m) {
-                        return Err("--utc-offset must be -1440..1440".into());
-                    }
-                    a.offset_min = m;
-                }
-                b"--local" => {
-                    a.seen.push("--local");
-                    a.local = true;
-                }
-                b"--pidfile" => {
-                    a.seen.push("--pidfile");
-                    let v =
-                        take_value(args, &mut i, inline).ok_or("missing value for --pidfile")?;
-                    a.pidfile = Some(abs_path(v));
-                }
-                b"-d" | b"--duration" => {
-                    a.seen.push("--duration");
-                    let v =
-                        take_value(args, &mut i, inline).ok_or("missing value for --duration")?;
-                    let n = str::parse_u64(v).ok_or("invalid --duration")?;
-                    a.duration = u32::try_from(n).map_err(|_| "invalid --duration")?;
-                }
-                b"--mem-cap" => {
-                    a.seen.push("--mem-cap");
-                    let v =
-                        take_value(args, &mut i, inline).ok_or("missing value for --mem-cap")?;
-                    a.mem_cap_mb = str::parse_u64(v).ok_or("invalid --mem-cap")?;
-                }
-                b"--phys-cap" => {
-                    a.seen.push("--phys-cap");
-                    let v =
-                        take_value(args, &mut i, inline).ok_or("missing value for --phys-cap")?;
-                    a.phys_cap = Some(str::parse_u64(v).ok_or("invalid --phys-cap")?);
-                }
-                b"--sort" => {
-                    a.seen.push("--sort");
-                    a.sort = true;
-                }
-                b"--no-sort" => {
-                    a.seen.push("--no-sort");
-                    a.sort = false;
-                }
-                b"--uniq" => {
-                    a.seen.push("--uniq");
-                    a.uniq = true;
-                }
-                b"--no-uniq" => {
-                    a.seen.push("--no-uniq");
-                    a.uniq = false;
-                }
-                b"--mem" => {
-                    a.seen.push("--mem");
-                    a.mem = true;
-                }
-                b"--no-mem" => {
-                    a.seen.push("--no-mem");
-                    a.mem = false;
-                }
-                b"--tty" => {
-                    a.seen.push("--tty");
-                    a.tty = true;
-                }
-                b"--no-tty" => {
-                    a.seen.push("--no-tty");
-                    a.tty = false;
-                }
-                b"--threads" => {
-                    a.seen.push("--threads");
-                    a.threads = true;
-                }
-                b"--no-threads" => {
-                    a.seen.push("--no-threads");
-                    a.threads = false;
-                }
-                b"--user" => {
-                    a.seen.push("--user");
-                    a.user = true;
-                }
-                b"--no-user" => {
-                    a.seen.push("--no-user");
-                    a.user = false;
-                }
-                b"--create-users" => {
-                    a.seen.push("--create-users");
-                    a.create_users = true;
-                }
-                b"--busy" => {
-                    a.seen.push("--busy");
-                    a.busy = true;
-                }
-                b"--dry-run" => {
-                    a.seen.push("--dry-run");
-                    a.dry_run = true;
-                }
-                b"--plan" => {
-                    a.seen.push("--plan");
-                    a.plan = true;
-                }
-                b"--wait" => {
-                    a.seen.push("--wait");
-                    a.wait = true;
-                }
-                b"--binaries" => {
-                    a.seen.push("--binaries");
-                    a.binaries = true;
-                }
-                b"--require-binaries" => {
-                    a.seen.push("--require-binaries");
-                    a.binaries = true;
-                    a.require_binaries = true;
-                }
-                b"--elevate" => {
-                    a.seen.push("--elevate");
-                    a.elevate = true;
-                }
-                b"--table" => {
-                    a.seen.push("--table");
-                    a.table = true;
-                }
-                b"--live" => {
-                    a.seen.push("--live");
-                    a.live = true;
-                }
-                b"--force" => {
-                    a.seen.push("--force");
-                    a.force = true;
-                }
-                b"--verify" => {
-                    a.seen.push("--verify");
-                    a.verify = true;
-                }
-                b"--exe" => {
-                    a.seen.push("--exe");
-                    a.no_exe = false;
-                }
-                b"--no-exe" | b"--allow-proc-exe" => {
-                    a.seen.push("--no-exe");
-                    a.no_exe = true;
-                }
-                b"--shadow-dir" => {
-                    a.seen.push("--shadow-dir");
-                    let v =
-                        take_value(args, &mut i, inline).ok_or("missing value for --shadow-dir")?;
-                    a.shadow_dir = Some(abs_path(v));
-                }
-                b"--no-root" => {
-                    a.seen.push("--no-root");
-                    a.no_root = true;
-                }
-                b"--cpu" => {
-                    a.seen.push("--cpu");
-                    let v = take_value(args, &mut i, inline).ok_or("missing value for --cpu")?;
-                    let n = str::parse_u64(v).ok_or("invalid --cpu")?;
-                    if n > 100 {
-                        return Err("--cpu must be 0..100".into());
-                    }
-                    a.cpu_pct = Some(n as u32);
-                }
-                b"--mem-target" => {
-                    a.seen.push("--mem-target");
-                    let v =
-                        take_value(args, &mut i, inline).ok_or("missing value for --mem-target")?;
-                    let n = str::parse_u64(v).ok_or("invalid --mem-target")?;
-                    a.mem_target_kb =
-                        Some(u32::try_from(n).map_err(|_| "invalid --mem-target")?);
-                }
-                b"--disk" => {
-                    a.seen.push("--disk");
-                    let v = take_value(args, &mut i, inline).ok_or("missing value for --disk")?;
-                    let n = str::parse_u64(v).ok_or("invalid --disk")?;
-                    if n > u32::MAX as u64 / 1024 {
-                        return Err("invalid --disk".into());
-                    }
-                    a.disk_mb = Some(n);
-                }
-                b"--json" => {
-                    a.seen.push("--json");
-                    a.json = true;
-                }
-                b"--log-fmt" => {
-                    a.seen.push("--log-fmt");
-                    let v =
-                        take_value(args, &mut i, inline).ok_or("missing value for --log-fmt")?;
-                    a.log_fmt = Some(loggen::Format::parse(v).ok_or_else(|| {
-                        format!(
-                            "unknown --log-fmt {:?}; expected apache, json or syslog",
-                            String::from_utf8_lossy(v)
-                        )
-                    })?);
-                }
-                b"-m" | b"--module" => {
-                    a.seen.push("--module");
-                    let v = take_value(args, &mut i, inline).ok_or("missing value for --module")?;
-                    a.log_module = v.to_vec();
-                }
-                b"--lines" => {
-                    a.seen.push("--lines");
-                    let v = take_value(args, &mut i, inline).ok_or("missing value for --lines")?;
-                    let n = usize::try_from(str::parse_u64(v).ok_or("invalid --lines")?)
-                        .map_err(|_| "invalid --lines")?;
-                    // 0 used to reach `run_log`, write nothing and exit 0,
-                    // which is a silent success rather than a cap. Every
-                    // other count-like option has a lower bound.
-                    if n == 0 {
-                        return Err("--lines must be at least 1".into());
-                    }
-                    a.log_lines = n;
-                }
-                b"--delay" => {
-                    a.seen.push("--delay");
-                    let v = take_value(args, &mut i, inline).ok_or("missing value for --delay")?;
-                    a.log_delay_ms = str::parse_u64(v).ok_or("invalid --delay")?;
-                }
-                b"--speed" => {
-                    a.seen.push("--speed");
-                    let v = take_value(args, &mut i, inline).ok_or("missing value for --speed")?;
-                    let n = str::parse_u64(v).ok_or("invalid --speed")?;
-                    if n == 0 {
-                        return Err("--speed must be at least 1".into());
-                    }
-                    a.speed = n;
-                }
-                b"--cpu-util" => {
-                    a.seen.push("--cpu-util");
-                    let v =
-                        take_value(args, &mut i, inline).ok_or("missing value for --cpu-util")?;
-                    let n = str::parse_u64(v).ok_or("invalid --cpu-util")?;
-                    if n > 100 {
-                        return Err("--cpu-util must be 0..100".into());
-                    }
-                    a.load_cpu = Some(n as u32);
-                }
-                b"--mem-util" => {
-                    a.seen.push("--mem-util");
-                    let v =
-                        take_value(args, &mut i, inline).ok_or("missing value for --mem-util")?;
-                    let n = str::parse_u64(v).ok_or("invalid --mem-util")?;
-                    if n > 95 {
-                        return Err("--mem-util must be 0..95".into());
-                    }
-                    a.load_mem = Some(n as u32);
-                }
-                b"--disk-util" => {
-                    a.seen.push("--disk-util");
-                    let v =
-                        take_value(args, &mut i, inline).ok_or("missing value for --disk-util")?;
-                    a.load_disk = Some(str::parse_u64(v).ok_or("invalid --disk-util")?);
-                }
-                b"--flame" => {
-                    return Err(
-                        "--flame is not supported (it was an alias in an older draft); use `psgen load --cpu-util`"
-                            .into(),
-                    )
-                }
-                b"--host-mem" => {
-                    a.seen.push("--host-mem");
-                    let v = take_value(args, &mut i, inline).ok_or("missing value for --host-mem")?;
-                    let n = str::parse_u64(v).ok_or("invalid --host-mem")?;
-                    // 0 means "unknown" inside Fit, so accepting it here would
-                    // silently fall back to this host instead of the one asked
-                    // for. A host with no memory is not a host.
-                    if n == 0 {
-                        return Err("--host-mem must be at least 1 MiB".into());
-                    }
-                    a.host_mem_mb = Some(n);
-                }
-                b"--host-pid-max" => {
-                    a.seen.push("--host-pid-max");
-                    let v =
-                        take_value(args, &mut i, inline).ok_or("missing value for --host-pid-max")?;
-                    let n = str::parse_u64(v).ok_or("invalid --host-pid-max")?;
-                    // 0 means "unknown" inside Fit; a host with pid_max 0 has
-                    // no PID at all, which is a different statement.
-                    if n == 0 {
-                        return Err("--host-pid-max must be at least 1".into());
-                    }
-                    a.host_pid_max = Some(n);
-                }
-                b"--host-uptime" => {
-                    a.seen.push("--host-uptime");
-                    let v =
-                        take_value(args, &mut i, inline).ok_or("missing value for --host-uptime")?;
-                    let n = str::parse_u64(v).ok_or("invalid --host-uptime")?;
-                    // 0 means "unknown" inside Fit, so accepting it here would
-                    // silently generate for this host instead of a host that
-                    // has just booted — the case the flag exists to exercise.
-                    if n == 0 {
-                        return Err("--host-uptime must be at least 1".into());
-                    }
-                    a.host_uptime = Some(n);
-                }
-                b"--repeat-max" => {
-                    a.seen.push("--repeat-max");
-                    let v =
-                        take_value(args, &mut i, inline).ok_or("missing value for --repeat-max")?;
-                    let n = str::parse_u64(v).ok_or("invalid --repeat-max")?;
-                    a.repeat_max = Some(usize::try_from(n).map_err(|_| "invalid --repeat-max")?);
-                }
-                b"-q" | b"--quiet" => {
-                    a.seen.push("--quiet");
-                    a.quiet = true;
-                }
-                _ => return Err("unknown option".into()),
             }
         } else if !saw_sub {
             if !set_sub(&mut a, arg) {
                 return Err("unknown subcommand".into());
             }
             saw_sub = true;
+        } else if matches!(a.sub, Sub::Score | Sub::Replay | Sub::Verify) && a.run_dir.is_none() {
+            a.run_dir = Some(arg.clone());
         } else {
             return Err("unexpected argument".into());
         }
         i += 1;
     }
-    // `--help` and `--version` are answered whatever else is on the line, in
-    // both spellings: `psgen help -n 5` must not be an error where `psgen
-    // --help -n 5` is not.
     if a.want_help || a.want_version || a.sub == Sub::Help || a.sub == Sub::Version {
         a.sub = if a.want_version || a.sub == Sub::Version {
             Sub::Version
@@ -1328,17 +1263,23 @@ pub fn parse(args: &[Vec<u8>]) -> Result<Args, ParseError> {
         };
         return Ok(a);
     }
-    // An option that the chosen subcommand does not consume is an error, not
-    // a silent no-op. The first offending option is named.
     for name in &a.seen {
         if !applies(a.sub, name) {
-            return Err(format!("{} does not apply to {}", name, sub_name(a.sub)).into());
+            return Err(json::cat3(name, " does not apply to ", sub_name(a.sub)).into());
         }
     }
-    // The table decides whether a subcommand reads an option at all; the mode
-    // the other flags select decides whether it can change anything. Both
-    // rejections name the flag and the reason, because an accepted no-op is
-    // indistinguishable from a bug.
+    if a.sub != Sub::Run
+        && a.seen.contains(&"--profile")
+        && a.profile != b"server"
+        && a.profile != b"dev"
+        && a.profile != b"desktop"
+    {
+        return Err(err_unknown_val(
+            "--profile",
+            &a.profile,
+            "; expected server, dev or desktop",
+        ));
+    }
     forbid(&a)?;
     Ok(a)
 }
@@ -1358,74 +1299,50 @@ fn run_mode(a: &Args) -> Run {
     }
 }
 
+fn reject_if_seen(a: &Args, name: &str, why: &str) -> Result<(), ParseError> {
+    if a.seen.contains(&name) {
+        Err(json::cat3(name, " ", why).into())
+    } else {
+        Ok(())
+    }
+}
+
+fn reject_csv(a: &Args, names_csv: &str, why: &str) -> Result<(), ParseError> {
+    for name in names_csv.split(',') {
+        reject_if_seen(a, name, why)?;
+    }
+    Ok(())
+}
+
 /// Reject an option the chosen mode cannot act on.
+#[inline(never)]
 fn forbid(a: &Args) -> Result<(), ParseError> {
-    let seen = |name: &str| a.seen.contains(&name);
-    let reject = |name: &str, why: &str| -> Result<(), ParseError> {
-        if seen(name) {
-            Err(format!("{} {}", name, why).into())
-        } else {
-            Ok(())
-        }
-    };
-    // A live table *is* the host's table: %MEM divides by MemTotal and START
-    // is the host's own zone, because that is what the `ps` beside it prints.
-    // Only the synthetic table has a clock to choose.
     if a.sub == Sub::Table && a.live {
-        for name in [
-            "--local",
-            "--utc-offset",
-            "--profile",
-            "--family",
-            "--seed",
-            "--repeat-max",
-            "--host-mem",
-            "--host-pid-max",
-            "--host-uptime",
-        ] {
-            reject(
-                name,
-                "does not apply to table --live: the table is this host's own, not a generated one",
-            )?;
-        }
+        reject_csv(
+            a,
+            "--local,--utc-offset,--profile,--family,--seed,--repeat-max,--host-mem,--host-pid-max,--host-uptime",
+            "does not apply to table --live: the table is this host's own, not a generated one",
+        )?;
     }
     if a.sub == Sub::Inject {
-        // `inject --table` renders a live table, and a live table is always
-        // the host's own zone. There is no mode of `inject` where the clock
-        // options could change anything, so they are rejected for all of them
-        // (design §11; the class issue #17 belonged to).
-        reject(
-            "--local",
-            "does not apply to inject: the only table it renders is a live one",
-        )?;
-        reject(
-            "--utc-offset",
+        reject_csv(
+            a,
+            "--local,--utc-offset",
             "does not apply to inject: the only table it renders is a live one",
         )?;
         match run_mode(a) {
             Run::Dry => {
-                // A dry run forks nothing, so a flag that only takes effect
-                // after the fork has nothing to act on.
-                reject(
-                    "--table",
-                    "needs a real spawn; use --plan to see the rows a run would create",
-                )?;
-                reject(
-                    "--verify",
-                    "compares each stub's /proc with the plan; nothing is spawned with --dry-run",
-                )?;
-                reject(
-                    "--wait",
-                    "waits for a spawned run; nothing is spawned with --dry-run",
-                )?;
-                reject(
-                    "--elevate",
-                    "does not apply with --dry-run: a preview never elevates",
-                )?;
-                reject(
-                    "--quiet",
-                    "suppresses the spawn summary, which a preview does not print",
-                )?;
+                const DRY_REJECT: &str = "\
+--table|needs a real spawn; use --plan to see the rows a run would create\n\
+--verify|compares each stub's /proc with the plan; nothing is spawned with --dry-run\n\
+--wait|waits for a spawned run; nothing is spawned with --dry-run\n\
+--elevate|does not apply with --dry-run: a preview never elevates\n\
+--quiet|suppresses the spawn summary, which a preview does not print";
+                for line in DRY_REJECT.lines() {
+                    if let Some((flag, why)) = line.split_once('|') {
+                        reject_if_seen(a, flag, why)?;
+                    }
+                }
                 if a.json && a.plan {
                     return Err("--plan and --json encode the same preview; use one of them".into());
                 }
@@ -1445,6 +1362,26 @@ fn forbid(a: &Args) -> Result<(), ParseError> {
                 }
             }
         }
+        if a.from_profile.is_some() && a.masker_cmd.is_some() {
+            return Err("--from-profile and --masker-cmd are mutually exclusive".into());
+        }
+        if a.from_profile.is_none() {
+            reject_csv(
+                a,
+                "--decoy-level,--clean-env,--exe-memfd,--dumpable,--seccomp,--wchan",
+                "requires --from-profile",
+            )?;
+            if a.masker_cmd.is_none() {
+                reject_csv(
+                    a,
+                    "--decoy-token,--jitter-ms,--churn",
+                    "requires --from-profile or --masker-cmd",
+                )?;
+            }
+        }
+        if (a.from_profile.is_some() || a.masker_cmd.is_some()) && a.dry_run {
+            return Err("--dry-run does not apply with --from-profile or --masker-cmd".into());
+        }
     }
     if a.sub == Sub::Stop && a.plan && a.elevate {
         return Err(
@@ -1453,7 +1390,92 @@ fn forbid(a: &Args) -> Result<(), ParseError> {
                 .into(),
         );
     }
+    if a.sub == Sub::Profile {
+        if a.target_pid.is_some() && a.validate_file.is_some() {
+            return Err("--pid and --validate are mutually exclusive".into());
+        }
+        if a.target_pid.is_none() && a.validate_file.is_none() {
+            return Err("profile requires --pid or --validate".into());
+        }
+        if a.validate_file.is_some() {
+            reject_csv(
+                a,
+                "--tree,--label,--masker,--profile-name,--redact-env,--out",
+                "does not apply with --validate",
+            )?;
+        }
+    }
+    if a.sub == Sub::Run {
+        if !a.seen.contains(&"--profile") {
+            return Err("run requires --profile".into());
+        }
+        if a.out_path.is_none() {
+            return Err("run requires --out".into());
+        }
+        if a.target_pid.is_some() && a.target_cmd.is_some() {
+            return Err("--target-pid and --target-cmd are mutually exclusive".into());
+        }
+    }
+    if a.sub == Sub::Score {
+        if a.run_dir.is_some() && a.runs.is_some() {
+            return Err("use either <run-dir> or --runs, not both".into());
+        }
+        if a.run_dir.is_none() && a.runs.is_none() {
+            return Err("score requires <run-dir> or --runs".into());
+        }
+        let _ = parse_score_pairs(a)?;
+    }
+    if a.sub == Sub::Replay {
+        if a.run_dir.is_none() {
+            return Err("replay requires <run-dir>".into());
+        }
+        if a.pick.is_none() {
+            return Err("replay requires --pick".into());
+        }
+    }
+    if a.sub == Sub::Verify && a.run_dir.is_none() {
+        return Err("verify requires <run-dir>".into());
+    }
     Ok(())
+}
+
+#[inline(never)]
+fn split_csv_paths(raw: &str) -> Vec<PathBuf> {
+    raw.split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
+fn parse_score_pairs(a: &Args) -> Result<Vec<(PathBuf, PathBuf)>, ParseError> {
+    if let Some(ref rd) = a.run_dir {
+        let dir = PathBuf::from(OsStr::from_bytes(rd));
+        let pick = match &a.pick {
+            Some(p) => PathBuf::from(p),
+            None => dir.join("pick.json"),
+        };
+        return Ok(vec![(dir, pick)]);
+    }
+    let runs_raw = a
+        .runs
+        .as_deref()
+        .ok_or("score requires <run-dir> or --runs")?;
+    let dirs = split_csv_paths(runs_raw);
+    if dirs.is_empty() {
+        return Err("--runs must list at least one run directory".into());
+    }
+    let picks: Vec<PathBuf> = match &a.pick {
+        None => dirs.iter().map(|d| d.join("pick.json")).collect(),
+        Some(raw) => {
+            let list = split_csv_paths(raw);
+            if list.len() != dirs.len() {
+                return Err("--pick count must match --runs count".into());
+            }
+            list
+        }
+    };
+    Ok(dirs.into_iter().zip(picks).collect())
 }
 
 fn elevate(argv: &[Vec<u8>], args: &Args) -> Option<i32> {
@@ -1468,28 +1490,28 @@ fn elevate(argv: &[Vec<u8>], args: &Args) -> Option<i32> {
         Ok(p) => p,
         Err(_) => return None,
     };
-    let probe = std::process::Command::new("sudo")
-        .arg("-n")
-        .arg("true")
-        .status();
-    if !probe.map(|s| s.success()).unwrap_or(false) {
+    let probe = sys::run_cmd(b"sudo", &[b"sudo", b"-n", b"true"], None, false);
+    if !matches!(probe, Ok((0, _))) {
         sys::err(b"psgen: sudo -n is not available; continuing unprivileged\n");
         return None;
     }
-    let mut cmd = std::process::Command::new("sudo");
-    cmd.arg("-n").arg(&self_exe);
+    let self_b = self_exe.as_os_str().as_bytes();
+    let mut cmd_argv: Vec<&[u8]> = Vec::with_capacity(argv.len() + 2);
+    cmd_argv.push(b"sudo");
+    cmd_argv.push(b"-n");
+    cmd_argv.push(self_b);
     for a in argv.iter().skip(1) {
         if a == b"--elevate" {
             continue;
         }
-        cmd.arg(OsStr::from_bytes(a));
+        cmd_argv.push(a.as_slice());
     }
-    match cmd.status() {
-        Ok(s) => Some(s.code().unwrap_or(1)),
+    match sys::run_cmd(b"sudo", &cmd_argv, None, false) {
+        Ok((code, _)) => Some(code),
         Err(e) => {
             let mut out = Buf::new();
             out.push_str("psgen: cannot run sudo: ");
-            out.push_str(&e.to_string());
+            out.push_str(&std::io::Error::from_raw_os_error(e).to_string());
             out.push(b'\n');
             sys::err(out.as_bytes());
             Some(1)
@@ -1588,6 +1610,7 @@ fn phys_uses_kib(est_kb: u64, budget_kb: u64) -> bool {
     budget_kb > 0 && est_kb > budget_kb && est_kb / 1024 == budget_kb / 1024
 }
 
+#[inline(never)]
 fn print_summary(prep: &inject::Prep, result: &inject::SpawnResult, args: &Args) {
     print_failures(result);
     if args.quiet {
@@ -2049,6 +2072,7 @@ fn staging_parents(dirs: &[Vec<u8>]) -> Vec<Vec<u8>> {
 }
 
 /// `--dry-run --plan`: everything `prepare()` decided, per row.
+#[inline(never)]
 fn print_plan(rows: &[gen::Proc], prep: &inject::Prep, create: &[Vec<u8>], args: &Args) {
     let mut out = Buf::new();
     out.push_str("tier ");
@@ -2204,6 +2228,7 @@ fn print_plan(rows: &[gen::Proc], prep: &inject::Prep, create: &[Vec<u8>], args:
 }
 
 /// `--dry-run --json`: the same plan as one JSON object.
+#[inline(never)]
 fn print_json_plan(rows: &[gen::Proc], prep: &inject::Prep, create: &[Vec<u8>], args: &Args) {
     let mut out = Buf::new();
     out.push_str("{\"version\":");
@@ -2314,6 +2339,664 @@ fn print_json_plan(rows: &[gen::Proc], prep: &inject::Prep, create: &[Vec<u8>], 
     sys::out(out.as_bytes());
 }
 
+fn err_line(msg: &str) -> i32 {
+    let mut out = Buf::new();
+    out.push_str("psgen: ");
+    out.push_str(msg);
+    out.push(b'\n');
+    sys::err(out.as_bytes());
+    1
+}
+
+fn write_text_output(out_path: Option<&[u8]>, text: &str) -> Result<(), String> {
+    let mut bytes = Vec::with_capacity(text.len() + 1);
+    bytes.extend_from_slice(text.as_bytes());
+    if !bytes.ends_with(b"\n") {
+        bytes.push(b'\n');
+    }
+    match out_path {
+        Some(p) => {
+            let path = Path::new(OsStr::from_bytes(p));
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    json::mkdir_all(parent)?;
+                }
+            }
+            json::write_file(path, &bytes)
+        }
+        None => {
+            sys::out(&bytes);
+            Ok(())
+        }
+    }
+}
+
+fn load_profile_file(path: &[u8], forbidden: &[&str]) -> Result<profile::Profile, String> {
+    let p = Path::new(OsStr::from_bytes(path));
+    let text = json::read_str(p)?;
+    let prof = profile::Profile::parse_str(&text)?;
+    prof.validate(forbidden)?;
+    Ok(prof)
+}
+
+fn apply_decoy_overrides(node: &mut inject::DecoyNodeSpec, args: &Args) {
+    if args.exe_memfd {
+        node.exe_memfd = true;
+        if node.memfd_label.is_empty() {
+            node.memfd_label = if node.comm.is_empty() {
+                b"worker".to_vec()
+            } else {
+                node.comm.clone()
+            };
+        }
+    }
+    if let Some(d) = args.dumpable {
+        node.non_dumpable = d == 0;
+    }
+    if let Some(sc) = args.seccomp {
+        node.seccomp_filters = sc;
+        if sc > 0 {
+            node.no_new_privs = true;
+        }
+    }
+    if let Some(wc) = args.wchan {
+        node.wchan_mode = wc;
+    }
+    for child in &mut node.children {
+        apply_decoy_overrides(child, args);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_decoy_trees(
+    prof: &profile::Profile,
+    count: usize,
+    level: u8,
+    token_prefix: Option<&str>,
+    force_token: bool,
+    jitter_ms: u32,
+    seed: u64,
+    overrides: Option<&Args>,
+) -> Vec<inject::DecoyNodeSpec> {
+    let mut rng = Rng::new(seed ^ 0x9e37_79b9_7f4a_7c15);
+    let mut trees = Vec::with_capacity(count);
+    for _ in 0..count {
+        let tok = token_prefix.map(|pfx| inject::make_decoy_token(pfx, &mut rng));
+        let mut spec = inject::profile_to_decoy_tree(prof, level, tok.as_deref(), jitter_ms);
+        if level >= 6 {
+            inject::apply_decoy_mem_jitter(&mut spec, &mut rng);
+        }
+        if force_token && spec.decoy_token.is_empty() {
+            if let Some(ref t) = tok {
+                spec.decoy_token = t[..t.len().min(4096)].to_vec();
+            }
+        }
+        if let Some(a) = overrides {
+            apply_decoy_overrides(&mut spec, a);
+        }
+        trees.push(spec);
+    }
+    trees
+}
+
+fn filter_root_pids(pids: &[i32]) -> Vec<i32> {
+    let mut roots = Vec::with_capacity(pids.len());
+    for &pid in pids {
+        let ppid = live::read_stat(pid).map(|s| s.ppid as i32).unwrap_or(0);
+        if !pids.contains(&ppid) && !roots.contains(&pid) {
+            roots.push(pid);
+        }
+    }
+    roots
+}
+
+fn collect_pid_tree(roots: &[i32]) -> Vec<i32> {
+    let mut all: Vec<i32> = Vec::with_capacity(roots.len() * 2);
+    for &r in roots {
+        if r > 1 && !all.contains(&r) {
+            all.push(r);
+        }
+    }
+    let mut pairs: Vec<(i32, i32)> = Vec::new();
+    if let Ok(pids) = profile::read_numeric_dir("/proc") {
+        for pid in pids {
+            if let Some(st) = live::read_stat(pid) {
+                pairs.push((pid, st.ppid as i32));
+            }
+        }
+    }
+    let mut idx = 0;
+    while idx < all.len() {
+        let cur = all[idx];
+        idx += 1;
+        for &(pid, ppid) in &pairs {
+            if ppid == cur && pid > 1 && !all.contains(&pid) {
+                all.push(pid);
+            }
+        }
+    }
+    all
+}
+
+struct LiveCleanup {
+    pids: Vec<i32>,
+}
+
+impl LiveCleanup {
+    fn new() -> Self {
+        Self { pids: Vec::new() }
+    }
+
+    fn extend(&mut self, pids: &[i32]) {
+        for &p in pids {
+            if p > 1 && !self.pids.contains(&p) {
+                self.pids.push(p);
+            }
+        }
+    }
+}
+
+impl Drop for LiveCleanup {
+    fn drop(&mut self) {
+        if self.pids.is_empty() {
+            return;
+        }
+        let targets = collect_pid_tree(&self.pids);
+        for &pid in &targets {
+            sys::kill(-pid, sys::SIGKILL);
+            sys::kill(pid, sys::SIGKILL);
+        }
+        for _ in 0..50 {
+            let _ = sys::reap_children_nonblock();
+            if !targets.iter().any(|&p| live::alive(p)) {
+                break;
+            }
+            sys::nanosleep(0, 10_000_000);
+        }
+        let _ = sys::reap_children_nonblock();
+    }
+}
+
+#[inline(never)]
+fn make_gen_opts(
+    args: &Args,
+    count: usize,
+    seed: u64,
+    self_user: Vec<u8>,
+    repeat_max: Option<usize>,
+    uptime: Option<u64>,
+) -> Opts {
+    Opts {
+        count,
+        seed,
+        profile: args.profile.clone(),
+        profile_set: args.seen.contains(&"--profile"),
+        family: args.family,
+        self_user,
+        uniq: args.uniq,
+        repeat_max,
+        uptime,
+    }
+}
+
+#[inline(never)]
+fn render_live_table(pids: &[i32]) {
+    let mut live_rows = live::read_pids(pids);
+    json::shell_sort_by(&mut live_rows, |a, b| a.pid > b.pid);
+    let out = table::render(
+        &live_rows,
+        live::mem_total_kb(),
+        &table::Clock::live(sys::now_secs()),
+        sys::page_kb(),
+    );
+    sys::out(out.as_bytes());
+}
+
+#[inline(never)]
+fn acquire_pidfile_lock(p: &[u8]) -> Result<inject::PidfileLock, i32> {
+    match inject::lock_pidfile(p) {
+        Ok(lock) => Ok(lock),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            let mut out = Buf::new();
+            out.push_str("psgen: another psgen run holds the pidfile ");
+            out.push_bytes(p);
+            out.push_str("; wait for it to finish or choose another --pidfile\n");
+            sys::err(out.as_bytes());
+            Err(2)
+        }
+        Err(e) => {
+            let mut out = Buf::new();
+            out.push_str("psgen: cannot lock the pidfile ");
+            out.push_bytes(p);
+            out.push_str(": ");
+            out.push_str(&e.to_string());
+            out.push(b'\n');
+            sys::err(out.as_bytes());
+            Err(2)
+        }
+    }
+}
+
+#[inline(never)]
+fn run_profile(args: &Args) -> i32 {
+    let forbidden: Vec<&str> = args.redact_tokens.iter().map(String::as_str).collect();
+    if let Some(ref file) = args.validate_file {
+        let prof = match load_profile_file(file, &forbidden) {
+            Ok(p) => p,
+            Err(e) => return err_line(&e),
+        };
+        let mut w = json::Jw::new(false);
+        w.obj_open();
+        w.k_bool("ok", true);
+        w.k_i64("schema", prof.schema as i64);
+        w.k_str("comm", &prof.identity.comm);
+        w.k_i64("children", prof.children.len() as i64);
+        w.obj_close();
+        if let Err(e) = write_text_output(None, &w.finish()) {
+            return err_line(&e);
+        }
+        return 0;
+    }
+    let pid = match args.target_pid {
+        Some(p) => p,
+        None => return err_line("profile requires --pid or --validate"),
+    };
+    let mut eopts = profile::ExtractOpts::for_pid(pid);
+    eopts.tree = args.tree;
+    eopts.label = args.label.clone();
+    eopts.masker = args
+        .masker
+        .clone()
+        .unwrap_or_else(|| String::from("unknown"));
+    eopts.profile_name = args.profile_name.clone().unwrap_or_else(|| {
+        if args.tree {
+            String::from("tree")
+        } else {
+            String::from("single")
+        }
+    });
+    eopts.redact_tokens = args.redact_tokens.clone();
+    eopts.redact_envs = args.redact_envs.clone();
+    let prof = match profile::extract_live(&eopts) {
+        Ok(p) => p,
+        Err(e) => return err_line(&e),
+    };
+    if let Err(e) = prof.validate(&forbidden) {
+        return err_line(&e);
+    }
+    if let Err(e) = write_text_output(args.out_path.as_deref(), &prof.to_json_str(true)) {
+        return err_line(&e);
+    }
+    0
+}
+
+fn spawn_masker_tracked(
+    cmd: &str,
+    count: usize,
+    jitter_ms: u32,
+    seed: u64,
+    tok: Option<&str>,
+    cleanup: &mut LiveCleanup,
+) -> Result<Vec<i32>, String> {
+    let v = inject::spawn_masker_decoys(cmd, count, 300, jitter_ms, seed, tok)?;
+    cleanup.extend(&v);
+    Ok(v)
+}
+
+#[inline(never)]
+fn run_harness_inner(args: &Args) -> Result<String, String> {
+    let mut prof = load_profile_file(&args.profile, &[])?;
+    let out_dir = match &args.out_path {
+        Some(p) => PathBuf::from(OsStr::from_bytes(p)),
+        None => return Err("run requires --out".to_string()),
+    };
+    let blind_dir = args
+        .blind_dir
+        .as_deref()
+        .map(|p| PathBuf::from(OsStr::from_bytes(p)));
+    let seed = args.seed.unwrap_or(1234);
+    let tok_prefix = args.decoy_token.as_deref().unwrap_or("TOK-");
+    let hard_negatives = match &args.hard_negatives {
+        Some(v) => v.clone(),
+        None if args.run_mode == harness::Mode::Table => Vec::new(),
+        None => harness::HardNeg::all().to_vec(),
+    };
+
+    let wants_target = !matches!(
+        args.run_control,
+        harness::Control::C02Hidden | harness::Control::C04NoTarget
+    );
+    let uses_decoys = matches!(
+        args.run_control,
+        harness::Control::C02Hidden
+            | harness::Control::C04NoTarget
+            | harness::Control::C06Main
+            | harness::Control::C07HiddenByMask
+    );
+
+    let mut cleanup = LiveCleanup::new();
+    let mut live_target_pids: Vec<i32> = Vec::new();
+    let mut live_decoy_pids: Vec<i32> = Vec::new();
+    let mut synthetic_decoys = args.decoys;
+    let decoy_n = if uses_decoys { args.decoys } else { 0 };
+    let eff_jitter =
+        if args.jitter_ms == 0 && args.run_level >= 6 && (args.live || args.target_cmd.is_some()) {
+            20
+        } else {
+            args.jitter_ms
+        };
+
+    if let Some(ref mcmd) = args.masker_cmd {
+        let mut spawn_m =
+            |cmd: &str, n: usize, s: u64, tok: Option<&str>| -> Result<Vec<i32>, String> {
+                if n == 0 {
+                    return Ok(Vec::new());
+                }
+                spawn_masker_tracked(cmd, n, eff_jitter, s, tok, &mut cleanup)
+            };
+        let mut all_d = Vec::new();
+        if let Some(tcmd) = args.target_cmd.as_deref().filter(|_| wants_target) {
+            let pre_n = decoy_n / 2;
+            all_d.extend(spawn_m(mcmd, pre_n, seed, Some(tok_prefix))?);
+            live_target_pids = spawn_m(tcmd, 1, seed ^ 1, None)?;
+            all_d.extend(spawn_m(
+                mcmd,
+                decoy_n.saturating_sub(pre_n),
+                seed ^ 2,
+                Some(tok_prefix),
+            )?);
+        } else {
+            if args.target_cmd.is_none() {
+                if let Some(tpid) = args.target_pid {
+                    live_target_pids.push(tpid);
+                }
+            }
+            all_d = spawn_m(mcmd, decoy_n, seed, Some(tok_prefix))?;
+        }
+        if !all_d.is_empty() || !live_target_pids.is_empty() {
+            sys::nanosleep(0, 150_000_000);
+        }
+        live_decoy_pids = filter_root_pids(&all_d);
+        synthetic_decoys = 0;
+    } else {
+        let trees = if args.live && decoy_n > 0 {
+            let tp = (args.run_level >= 5).then_some(tok_prefix);
+            build_decoy_trees(
+                &prof,
+                decoy_n,
+                args.run_level,
+                tp,
+                false,
+                eff_jitter,
+                seed,
+                None,
+            )
+        } else {
+            Vec::new()
+        };
+        let spawn_opts = inject::DecoySpawnOpts {
+            duration: 300,
+            pidfile: None,
+            clean_env: true,
+            jitter_ms: eff_jitter,
+            churn: args.churn,
+            seed,
+            quiet: true,
+            wait: false,
+            bind_exe: false,
+        };
+        if let Some(tcmd) = args.target_cmd.as_ref().filter(|_| wants_target) {
+            let mid = trees.len() / 2;
+            let (mut pre, tgt, suf) =
+                inject::spawn_interleaved_target(&trees[..mid], tcmd, &trees[mid..], &spawn_opts)?;
+            cleanup.extend(&pre);
+            cleanup.extend(&[tgt]);
+            cleanup.extend(&suf);
+            sys::nanosleep(0, 150_000_000);
+            live_target_pids.push(tgt);
+            pre.extend_from_slice(&suf);
+            live_decoy_pids = filter_root_pids(&pre);
+        } else {
+            if args.target_cmd.is_none() {
+                if let Some(tpid) = args.target_pid {
+                    live_target_pids.push(tpid);
+                }
+            }
+            if !trees.is_empty() {
+                let decs = inject::spawn_decoy_trees(&trees, &spawn_opts)?;
+                cleanup.extend(&decs);
+                live_decoy_pids = filter_root_pids(&decs);
+            }
+        }
+        if args.live {
+            synthetic_decoys = 0;
+        }
+    }
+
+    harness::sanitize_live_profile(&mut prof);
+    let run_opts = harness::RunOpts {
+        profile: prof,
+        decoys: synthetic_decoys,
+        seed,
+        mode: args.run_mode,
+        level: args.run_level,
+        control: args.run_control,
+        hard_negatives,
+        observer_uid: args.observer_uid,
+        out_dir,
+        blind_dir,
+        run_id: args.run_id.clone(),
+        live_target_pids,
+        live_decoy_pids,
+        decoy_token_prefix: tok_prefix.to_string(),
+    };
+
+    let res = harness::build_run(&run_opts);
+    drop(cleanup);
+    let res = res?;
+
+    let mut w = json::Jw::new(false);
+    w.obj_open();
+    w.k_str("run_id", &res.run_id);
+    w.k_str("out_dir", &res.out_dir.to_string_lossy());
+    match res.blind_dir {
+        Some(ref b) => w.k_str("blind_dir", &b.to_string_lossy()),
+        None => w.k_null("blind_dir"),
+    }
+    w.k_i32_arr("target_pids", &res.target_pids);
+    w.k_i64("decoy_count", res.decoy_count as i64);
+    w.k_i64("hn_count", res.hn_count as i64);
+    w.k_i64("total_rows", res.total_rows as i64);
+    w.k_i64("manifest_files", res.manifest_files as i64);
+    w.obj_close();
+    Ok(w.finish())
+}
+
+fn run_harness(args: &Args) -> i32 {
+    match run_harness_inner(args).and_then(|s| write_text_output(None, &s)) {
+        Ok(()) => 0,
+        Err(e) => err_line(&e),
+    }
+}
+
+#[inline(never)]
+fn run_score_or_replay(args: &Args, replay: bool) -> i32 {
+    let res = if replay {
+        let Some(ref rd) = args.run_dir else {
+            return err_line("replay requires <run-dir>");
+        };
+        let Some(ref pk) = args.pick else {
+            return err_line("replay requires --pick");
+        };
+        score::replay_run(Path::new(OsStr::from_bytes(rd)), Path::new(pk))
+    } else {
+        match parse_score_pairs(args) {
+            Ok(pairs) => score::score_runs(&pairs),
+            Err(e) => Err(e.as_str().to_string()),
+        }
+    };
+    match res.and_then(|s| write_text_output(args.out_path.as_deref(), &s)) {
+        Ok(()) => 0,
+        Err(e) => err_line(&e),
+    }
+}
+
+#[inline(never)]
+fn run_verify(args: &Args) -> i32 {
+    let Some(ref rd) = args.run_dir else {
+        return err_line("verify requires <run-dir>");
+    };
+    let pick_path = args.pick.as_deref().map(Path::new);
+    let forbidden: Vec<&str> = args.redact_tokens.iter().map(String::as_str).collect();
+    let ver = match score::verify_run(Path::new(OsStr::from_bytes(rd)), pick_path, &forbidden) {
+        Ok(v) => v,
+        Err(e) => return err_line(&e),
+    };
+    if let Err(e) = write_text_output(None, &ver.json) {
+        return err_line(&e);
+    }
+    i32::from(!ver.ok)
+}
+
+#[inline(never)]
+fn run_selftest(args: &Args) -> i32 {
+    let out_dir = args
+        .out_path
+        .as_deref()
+        .map(|p| Path::new(OsStr::from_bytes(p)));
+    let (ok, report) = match selftest::run_selftest(out_dir) {
+        Ok(v) => v,
+        Err(e) => return err_line(&e),
+    };
+    if let Err(e) = write_text_output(None, &report) {
+        return err_line(&e);
+    }
+    i32::from(!ok)
+}
+
+#[inline(never)]
+fn run_inject_decoy(args: &Args) -> i32 {
+    if args.count > 500 {
+        sys::err(b"psgen: inject count capped at 500\n");
+    }
+    let count = if args.count == 0 {
+        1
+    } else {
+        args.count.min(500)
+    };
+    let seed = args.seed.unwrap_or(1234);
+
+    if let Some(ref p) = args.pidfile {
+        if !check_pidfile_inactive(p) {
+            return 2;
+        }
+    }
+    let _pidfile_lock = match &args.pidfile {
+        Some(p) => match acquire_pidfile_lock(p) {
+            Ok(lock) => Some(lock),
+            Err(code) => return code,
+        },
+        None => None,
+    };
+    if let Some(ref p) = args.pidfile {
+        if !check_pidfile_inactive(p) {
+            return 2;
+        }
+    }
+
+    let pids = if let Some(ref prof_path) = args.from_profile {
+        let prof = match load_profile_file(prof_path, &[]) {
+            Ok(p) => p,
+            Err(e) => return err_line(&e),
+        };
+        let level = args.decoy_level.unwrap_or(5);
+        let tok_prefix = if args.decoy_token.is_some() || level >= 5 {
+            Some(args.decoy_token.as_deref().unwrap_or("TOK-"))
+        } else {
+            None
+        };
+        let trees = build_decoy_trees(
+            &prof,
+            count,
+            level,
+            tok_prefix,
+            args.decoy_token.is_some(),
+            args.jitter_ms,
+            seed,
+            Some(args),
+        );
+        let opts = inject::DecoySpawnOpts {
+            duration: args.duration,
+            pidfile: args.pidfile.clone(),
+            clean_env: args.clean_env,
+            jitter_ms: args.jitter_ms,
+            churn: args.churn,
+            seed,
+            quiet: args.quiet,
+            wait: args.wait,
+            bind_exe: args.seen.contains(&"--exe") && !args.no_exe && !args.no_root,
+        };
+        match inject::spawn_decoy_trees(&trees, &opts) {
+            Ok(v) => v,
+            Err(e) => return err_line(&e),
+        }
+    } else if let Some(ref mcmd) = args.masker_cmd {
+        let spawned = match inject::spawn_masker_decoys(
+            mcmd,
+            count,
+            args.duration,
+            args.jitter_ms,
+            seed,
+            args.decoy_token.as_deref(),
+        ) {
+            Ok(v) => v,
+            Err(e) => return err_line(&e),
+        };
+        if let Some(ref pf) = args.pidfile {
+            sys::nanosleep(0, 50_000_000);
+            let all_pids = collect_pid_tree(&spawned);
+            if !inject::write_external_pidfile(pf, &all_pids) {
+                return err_line("cannot write pidfile");
+            }
+        }
+        if args.wait && args.duration > 0 && !spawned.is_empty() {
+            let mut guard = LiveCleanup::new();
+            guard.extend(&spawned);
+            sys::nanosleep(args.duration as u64, 0);
+            drop(guard);
+        }
+        spawned
+    } else {
+        return err_line("internal error: missing decoy source");
+    };
+
+    if pids.is_empty() {
+        return err_line("no processes were spawned");
+    }
+
+    if !args.quiet {
+        let mut out = Buf::new();
+        out.push_str("spawned ");
+        out.push_u64(pids.len() as u64);
+        out.push_str(" processes");
+        if let Some(ref path) = args.pidfile {
+            out.push_str(", pids in ");
+            out.push_bytes(path);
+        }
+        out.push(b'\n');
+        if args.table {
+            sys::err(out.as_bytes());
+        } else {
+            sys::out(out.as_bytes());
+        }
+    }
+
+    if args.table {
+        render_live_table(&pids);
+    }
+    0
+}
+
 pub fn run() -> i32 {
     let argv: Vec<Vec<u8>> = std::env::args_os().map(|s| s.as_bytes().to_vec()).collect();
     if argv.is_empty() {
@@ -2325,7 +3008,7 @@ pub fn run() -> i32 {
         Err(msg) => {
             let mut out = Buf::new();
             out.push_str("psgen: ");
-            out.push_str(&msg.to_string());
+            out.push_str(msg.as_str());
             out.push_str("\n(psgen --help for the full option list)\n");
             sys::err(out.as_bytes());
             return 2;
@@ -2359,6 +3042,12 @@ pub fn run() -> i32 {
         Sub::Doctor => doctor::run(args.json, args.pidfile.as_deref()),
         Sub::Log => activity::run_log(&args),
         Sub::Load => activity::run_load(&args),
+        Sub::Profile => run_profile(&args),
+        Sub::Run => run_harness(&args),
+        Sub::Score => run_score_or_replay(&args, false),
+        Sub::Replay => run_score_or_replay(&args, true),
+        Sub::Verify => run_verify(&args),
+        Sub::Selftest => run_selftest(&args),
         Sub::Corpus => {
             let mut out = Buf::new();
             for t in corpus::CORPUS.iter() {
@@ -2378,17 +3067,14 @@ pub fn run() -> i32 {
         }
         Sub::Check => {
             let mut rng = Rng::new(args.seed.unwrap_or(1));
-            let opts = Opts {
-                count: 0,
-                seed: args.seed.unwrap_or(1),
-                profile: args.profile.clone(),
-                profile_set: args.seen.contains(&"--profile"),
-                family: args.family,
-                self_user: b"deploy".to_vec(),
-                uniq: args.uniq,
-                repeat_max: None,
-                uptime: None,
-            };
+            let opts = make_gen_opts(
+                &args,
+                0,
+                args.seed.unwrap_or(1),
+                b"deploy".to_vec(),
+                None,
+                None,
+            );
             check::run(&mut rng, &opts, args.binaries, args.require_binaries)
         }
         Sub::Unit => {
@@ -2426,22 +3112,14 @@ pub fn run() -> i32 {
                 Some(s) => Rng::new(s),
                 None => Rng::from_entropy(),
             };
-            let opts = Opts {
-                // A bare `list` means one line per template, and the profile
-                // says which order the templates are drawn in. Passing 0 takes
-                // gen_list's corpus-order arm, where the profile is never
-                // consulted, so `list -p desktop` printed exactly what
-                // `list -p server` printed (issue #9a).
-                count: list_target(&args),
-                seed: args.seed.unwrap_or(0),
-                profile: args.profile.clone(),
-                profile_set: args.seen.contains(&"--profile"),
-                family: args.family,
-                self_user: util::current_user().name,
-                uniq: args.uniq,
-                repeat_max: args.repeat_max,
-                uptime: args.host_uptime,
-            };
+            let opts = make_gen_opts(
+                &args,
+                list_target(&args),
+                args.seed.unwrap_or(0),
+                util::current_user().name,
+                args.repeat_max,
+                args.host_uptime,
+            );
             let mut cmds = gen::gen_list(&mut rng, &opts);
             if lists_count(&args) {
                 let want = if args.count == 0 {
@@ -2463,7 +3141,7 @@ pub fn run() -> i32 {
                 );
             }
             if args.sort {
-                cmds.sort_unstable();
+                json::shell_sort_by(&mut cmds, |a, b| a > b);
             }
             let mut out = Buf::with_capacity(cmds.len() * 96);
             for c in &cmds {
@@ -2499,28 +3177,21 @@ pub fn run() -> i32 {
                 Some(s) => Rng::new(s),
                 None => Rng::from_entropy(),
             };
-            let opts = Opts {
-                count: if args.count == 0 {
-                    30
-                } else {
-                    args.count.min(5000)
-                },
-                seed: args.seed.unwrap_or(0),
-                profile: args.profile.clone(),
-                profile_set: args.seen.contains(&"--profile"),
-                family: args.family,
-                self_user: util::current_user().name,
-                uniq: args.uniq,
-                repeat_max: args.repeat_max,
-                uptime: args.host_uptime,
-            };
-            let fit = gen::Fit::target(args.host_mem_mb, args.host_pid_max);
-            let rows = gen::gen_table(&mut rng, &opts, &fit);
             let want = if args.count == 0 {
                 30
             } else {
                 args.count.min(5000)
             };
+            let opts = make_gen_opts(
+                &args,
+                want,
+                args.seed.unwrap_or(0),
+                util::current_user().name,
+                args.repeat_max,
+                args.host_uptime,
+            );
+            let fit = gen::Fit::target(args.host_mem_mb, args.host_pid_max);
+            let rows = gen::gen_table(&mut rng, &opts, &fit);
             let has_init = rows.iter().any(|r| r.pid == 1);
             shortfall(
                 args.family,
@@ -2554,6 +3225,9 @@ pub fn run() -> i32 {
             0
         }
         Sub::Inject => {
+            if args.from_profile.is_some() || args.masker_cmd.is_some() {
+                return run_inject_decoy(&args);
+            }
             if args.count > 500 {
                 sys::err(b"psgen: inject count capped at 500\n");
             }
@@ -2562,29 +3236,20 @@ pub fn run() -> i32 {
                 Some(s) => Rng::new(s),
                 None => Rng::from_entropy(),
             };
-            let opts = Opts {
-                count: if args.count == 0 {
-                    12
-                } else {
-                    args.count.min(500)
-                },
-                seed: args.seed.unwrap_or(0),
-                profile: args.profile.clone(),
-                profile_set: args.seen.contains(&"--profile"),
-                family: args.family,
-                self_user: me.name,
-                uniq: args.uniq,
-                repeat_max: args.repeat_max,
-                uptime: args.host_uptime,
-            };
-            // The stub's own sizes are planned by prepare(); only the corpus
-            // sizes need to be lowered to what this host can hold.
-            let mut rows = gen::gen_inject(&mut rng, &opts, &gen::Fit::none());
             let want = if args.count == 0 {
                 12
             } else {
                 args.count.min(500)
             };
+            let opts = make_gen_opts(
+                &args,
+                want,
+                args.seed.unwrap_or(0),
+                me.name,
+                args.repeat_max,
+                args.host_uptime,
+            );
+            let mut rows = gen::gen_inject(&mut rng, &opts, &gen::Fit::none());
 
             // A preview never creates `<pidfile>.lock`, but if another run
             // already holds it, refuse with exit 2 just like a real run would.
@@ -2763,26 +3428,9 @@ pub fn run() -> i32 {
             // check above is a read, and two runs that pass it together both
             // rename a file into place; the second erases the first's rows.
             let _pidfile_lock = match &args.pidfile {
-                Some(p) => match inject::lock_pidfile(p) {
+                Some(p) => match acquire_pidfile_lock(p) {
                     Ok(lock) => Some(lock),
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        let mut out = Buf::new();
-                        out.push_str("psgen: another psgen run holds the pidfile ");
-                        out.push_bytes(p);
-                        out.push_str("; wait for it to finish or choose another --pidfile\n");
-                        sys::err(out.as_bytes());
-                        return 2;
-                    }
-                    Err(e) => {
-                        let mut out = Buf::new();
-                        out.push_str("psgen: cannot lock the pidfile ");
-                        out.push_bytes(p);
-                        out.push_str(": ");
-                        out.push_str(&e.to_string());
-                        out.push(b'\n');
-                        sys::err(out.as_bytes());
-                        return 2;
-                    }
+                    Err(code) => return code,
                 },
                 None => None,
             };
@@ -2909,19 +3557,7 @@ pub fn run() -> i32 {
             }
 
             if args.table {
-                let mut live_rows = live::read_pids(&result.pids);
-                live_rows.sort_unstable_by_key(|p| p.pid);
-                // `inject --table` is a live table: the same renderer inputs as
-                // `table --live`, so the two cannot disagree about %MEM or
-                // START for the same stub (issue #3's cgroup divergence and
-                // issue #17's double shift).
-                let out = table::render(
-                    &live_rows,
-                    live::mem_total_kb(),
-                    &table::Clock::live(sys::now_secs()),
-                    sys::page_kb(),
-                );
-                sys::out(out.as_bytes());
+                render_live_table(&result.pids);
             }
 
             if args.wait && args.duration > 0 {
@@ -3034,9 +3670,10 @@ mod tests {
     #[test]
     fn every_row_in_the_table_has_a_help_spelling() {
         let help = documented();
-        let missing: Vec<&str> = OPTS
-            .iter()
+        let missing: Vec<&str> = all_opts()
+            .into_iter()
             .map(|o| o.name)
+            .chain(OPTS_ANCHOR.iter().map(|o| o.name))
             .filter(|n| !help.contains(n))
             .collect();
         assert!(
@@ -3045,15 +3682,9 @@ mod tests {
         );
     }
 
-    /// Every row names the subcommands that consume it.
-    ///
-    /// A zero set means the parser accepts the option nowhere, so the row is
-    /// dead; `ANY` means every subcommand takes it, which is almost always a
-    /// mistake for a subcommand-specific flag and must be written out in the
-    /// help if it is intended.
     #[test]
     fn every_option_declares_its_subcommands() {
-        for o in OPTS {
+        for o in all_opts() {
             assert_ne!(o.subs, 0, "{} is accepted by no subcommand", o.name);
             assert!(
                 o.subs & !ALL_SUBS == 0,
@@ -3074,10 +3705,10 @@ mod tests {
     /// A row's aliases are spellings too, and each must be reachable.
     #[test]
     fn every_alias_selects_its_own_row() {
-        for o in OPTS {
-            for a in o.aliases {
-                let got = opt_of(a.as_bytes()).expect("an alias is in the table");
-                assert_eq!(got.name, o.name, "{a} does not select {}", o.name);
+        for o in all_opts() {
+            if !o.alias.is_empty() {
+                let got = opt_of(o.alias.as_bytes()).expect("an alias is in the table");
+                assert_eq!(got.name, o.name, "{} does not select {}", o.alias, o.name);
             }
         }
     }
@@ -3093,10 +3724,16 @@ mod tests {
     #[test]
     fn the_table_has_no_duplicate_spelling() {
         let mut names: Vec<&str> = Vec::new();
-        for o in OPTS {
-            for n in core::iter::once(o.name).chain(o.aliases.iter().copied()) {
-                assert!(!names.contains(&n), "{n} appears twice in OPTS");
-                names.push(n);
+        for o in all_opts() {
+            assert!(!names.contains(&o.name), "{} appears twice in OPTS", o.name);
+            names.push(o.name);
+            if !o.alias.is_empty() {
+                assert!(
+                    !names.contains(&o.alias),
+                    "{} appears twice in OPTS",
+                    o.alias
+                );
+                names.push(o.alias);
             }
         }
     }
@@ -3197,5 +3834,333 @@ mod tests {
         assert!(!phys_uses_kib(31 * 1024, 30 * 1024));
         assert!(!phys_uses_kib(29 * 1024, 30 * 1024));
         assert!(!phys_uses_kib(100, 0));
+    }
+
+    fn parse_strs(argv: &[&str]) -> Result<Args, ParseError> {
+        let argv: Vec<Vec<u8>> = core::iter::once("psgen")
+            .chain(argv.iter().copied())
+            .map(|s| s.as_bytes().to_vec())
+            .collect();
+        parse(&argv)
+    }
+
+    #[test]
+    fn profile_subcommand_flags_and_conflicts() {
+        let a = parse_strs(&[
+            "profile",
+            "--pid",
+            "42",
+            "--tree",
+            "--label",
+            "ci-runner",
+            "--masker",
+            "pmask",
+            "--profile-name",
+            "tree",
+            "--redact-token",
+            "SEC1",
+            "--redact-token",
+            "SEC2",
+            "--redact-env",
+            "API_KEY",
+            "--out",
+            "/tmp/p.json",
+        ])
+        .unwrap();
+        assert!(a.sub == Sub::Profile);
+        assert_eq!(a.target_pid, Some(42));
+        assert!(a.tree);
+        assert_eq!(a.label.as_deref(), Some("ci-runner"));
+        assert_eq!(a.masker.as_deref(), Some("pmask"));
+        assert_eq!(a.profile_name.as_deref(), Some("tree"));
+        assert_eq!(a.redact_tokens, vec!["SEC1", "SEC2"]);
+        assert_eq!(a.redact_envs, vec!["API_KEY"]);
+        assert_eq!(a.out_path.as_deref(), Some(&b"/tmp/p.json"[..]));
+
+        let v = parse_strs(&[
+            "profile",
+            "--validate",
+            "/tmp/p.json",
+            "--redact-token",
+            "FORBID",
+        ])
+        .unwrap();
+        assert!(v.sub == Sub::Profile);
+        assert_eq!(v.validate_file.as_deref(), Some(&b"/tmp/p.json"[..]));
+        assert_eq!(v.redact_tokens, vec!["FORBID"]);
+
+        assert!(!ok(&["profile"]));
+        assert!(!ok(&["profile", "--pid", "1", "--validate", "/tmp/p.json"]));
+        assert!(!ok(&["profile", "--pid", "0"]));
+        assert!(!ok(&["profile", "--validate", "/tmp/p.json", "--tree"]));
+        assert!(!ok(&["profile", "--pid", "1", "extra-pos"]));
+    }
+
+    #[test]
+    fn run_subcommand_flags_defaults_and_conflicts() {
+        let a = parse_strs(&["run", "--profile", "/tmp/p.json", "--out", "/tmp/run"]).unwrap();
+        assert!(a.sub == Sub::Run);
+        assert_eq!(a.profile, b"/tmp/p.json");
+        assert_eq!(a.out_path.as_deref(), Some(&b"/tmp/run"[..]));
+        assert_eq!(a.decoys, 50);
+        assert_eq!(a.run_mode, harness::Mode::Both);
+        assert_eq!(a.run_level, 5);
+        assert_eq!(a.run_control, harness::Control::C06Main);
+        assert!(a.hard_negatives.is_none());
+
+        let b = parse_strs(&[
+            "run",
+            "--profile",
+            "/tmp/p.json",
+            "--out",
+            "/tmp/run",
+            "--decoys",
+            "12",
+            "--seed",
+            "999",
+            "--mode",
+            "deep",
+            "--level",
+            "6",
+            "--control",
+            "C-04",
+            "--hard-negatives",
+            "HN-01,HN-05",
+            "--observer-uid",
+            "2000",
+            "--blind-dir",
+            "/tmp/blind",
+            "--run-id",
+            "r01",
+            "--decoy-token",
+            "DT-",
+            "--live",
+            "--target-cmd",
+            "exec /bin/sleep 5",
+            "--jitter-ms",
+            "25",
+            "--churn",
+            "3",
+        ])
+        .unwrap();
+        assert_eq!(b.decoys, 12);
+        assert_eq!(b.seed, Some(999));
+        assert_eq!(b.run_mode, harness::Mode::Deep);
+        assert_eq!(b.run_level, 6);
+        assert_eq!(b.run_control, harness::Control::C04NoTarget);
+        assert_eq!(
+            b.hard_negatives,
+            Some(vec![harness::HardNeg::Hn01Exe, harness::HardNeg::Hn05Maps])
+        );
+        assert_eq!(b.observer_uid, Some(2000));
+        assert_eq!(b.blind_dir.as_deref(), Some(&b"/tmp/blind"[..]));
+        assert_eq!(b.run_id.as_deref(), Some("r01"));
+        assert_eq!(b.decoy_token.as_deref(), Some("DT-"));
+        assert!(b.live);
+        assert_eq!(b.target_cmd.as_deref(), Some("exec /bin/sleep 5"));
+        assert_eq!(b.jitter_ms, 25);
+        assert_eq!(b.churn, 3);
+
+        assert!(!ok(&["run", "--out", "/tmp/run"]));
+        assert!(!ok(&["run", "--profile", "/tmp/p.json"]));
+        assert!(!ok(&[
+            "run",
+            "--profile",
+            "/tmp/p.json",
+            "--out",
+            "/tmp/run",
+            "--level",
+            "7"
+        ]));
+        assert!(!ok(&[
+            "run",
+            "--profile",
+            "/tmp/p.json",
+            "--out",
+            "/tmp/run",
+            "--target-pid",
+            "10",
+            "--target-cmd",
+            "sleep 5"
+        ]));
+        assert!(!ok(&[
+            "run",
+            "--profile",
+            "/tmp/p.json",
+            "--out",
+            "/tmp/run",
+            "unexpected-pos"
+        ]));
+    }
+
+    #[test]
+    fn score_replay_verify_selftest_positional_and_flags() {
+        let s1 = parse_strs(&["score", "/tmp/r1", "--pick", "/tmp/p1.json"]).unwrap();
+        assert!(s1.sub == Sub::Score);
+        assert_eq!(s1.run_dir.as_deref(), Some(&b"/tmp/r1"[..]));
+        assert_eq!(s1.pick.as_deref(), Some("/tmp/p1.json"));
+
+        let s2 = parse_strs(&[
+            "score",
+            "--runs",
+            "/tmp/r1,/tmp/r2",
+            "--pick",
+            "/tmp/p1.json,/tmp/p2.json",
+            "--out",
+            "/tmp/s.json",
+        ])
+        .unwrap();
+        assert_eq!(parse_score_pairs(&s2).unwrap().len(), 2);
+
+        assert!(!ok(&["score"]));
+        assert!(!ok(&["score", "/tmp/r1", "--runs", "/tmp/r2"]));
+        assert!(!ok(&["score", "/tmp/r1", "/tmp/r2"]));
+        assert!(!ok(&[
+            "score",
+            "--runs",
+            "/tmp/r1,/tmp/r2",
+            "--pick",
+            "/tmp/p1.json"
+        ]));
+
+        let rep = parse_strs(&[
+            "replay",
+            "/tmp/r1",
+            "--pick",
+            "/tmp/p1.json",
+            "--out",
+            "/tmp/o.json",
+        ])
+        .unwrap();
+        assert!(rep.sub == Sub::Replay);
+        assert_eq!(rep.run_dir.as_deref(), Some(&b"/tmp/r1"[..]));
+        assert!(!ok(&["replay", "/tmp/r1"]));
+        assert!(!ok(&["replay", "--pick", "/tmp/p1.json"]));
+
+        let ver = parse_strs(&[
+            "verify",
+            "/tmp/r1",
+            "--pick",
+            "/tmp/p1.json",
+            "--redact-token",
+            "SECRET_A",
+            "--redact-token",
+            "SECRET_B",
+        ])
+        .unwrap();
+        assert!(ver.sub == Sub::Verify);
+        assert_eq!(ver.redact_tokens, vec!["SECRET_A", "SECRET_B"]);
+        assert!(!ok(&["verify"]));
+        assert!(!ok(&["verify", "/tmp/r1", "/tmp/extra"]));
+
+        let st = parse_strs(&["selftest", "--out", "/tmp/st"]).unwrap();
+        assert!(st.sub == Sub::Selftest);
+        assert_eq!(st.out_path.as_deref(), Some(&b"/tmp/st"[..]));
+        assert!(ok(&["selftest"]));
+        assert!(!ok(&["selftest", "extra-pos"]));
+    }
+
+    #[test]
+    fn inject_new_decoy_flags_and_legacy_preservation() {
+        let a = parse_strs(&[
+            "inject",
+            "--from-profile",
+            "/tmp/p.json",
+            "-n",
+            "10",
+            "-d",
+            "30",
+            "--decoy-level",
+            "6",
+            "--clean-env",
+            "--exe-memfd",
+            "--decoy-token",
+            "DT-",
+            "--dumpable",
+            "0",
+            "--seccomp",
+            "2",
+            "--wchan",
+            "epoll",
+            "--jitter-ms",
+            "40",
+            "--churn",
+            "2",
+            "--pidfile",
+            "/tmp/d.pid",
+        ])
+        .unwrap();
+        assert!(a.sub == Sub::Inject);
+        assert_eq!(a.from_profile.as_deref(), Some(&b"/tmp/p.json"[..]));
+        assert_eq!(a.decoy_level, Some(6));
+        assert!(a.clean_env);
+        assert!(a.exe_memfd);
+        assert_eq!(a.decoy_token.as_deref(), Some("DT-"));
+        assert_eq!(a.dumpable, Some(0));
+        assert_eq!(a.seccomp, Some(2));
+        assert_eq!(a.wchan, Some(1));
+        assert_eq!(a.jitter_ms, 40);
+        assert_eq!(a.churn, 2);
+
+        let m = parse_strs(&[
+            "inject",
+            "--masker-cmd",
+            "exec /bin/sleep 5",
+            "-n",
+            "3",
+            "--jitter-ms",
+            "10",
+            "--decoy-token",
+            "TOK-",
+        ])
+        .unwrap();
+        assert_eq!(m.masker_cmd.as_deref(), Some("exec /bin/sleep 5"));
+
+        // Conflicts & validation
+        assert!(!ok(&[
+            "inject",
+            "--from-profile",
+            "/tmp/p.json",
+            "--masker-cmd",
+            "sleep 5"
+        ]));
+        assert!(!ok(&["inject", "--clean-env"]));
+        assert!(!ok(&[
+            "inject",
+            "--from-profile",
+            "/tmp/p.json",
+            "--dry-run"
+        ]));
+        assert!(!ok(&[
+            "inject",
+            "--from-profile",
+            "/tmp/p.json",
+            "--dumpable",
+            "2"
+        ]));
+        assert!(!ok(&[
+            "inject",
+            "--from-profile",
+            "/tmp/p.json",
+            "--seccomp",
+            "9"
+        ]));
+        assert!(!ok(&[
+            "inject",
+            "--from-profile",
+            "/tmp/p.json",
+            "--wchan",
+            "bogus"
+        ]));
+        assert!(!ok(&[
+            "inject",
+            "--from-profile",
+            "/tmp/p.json",
+            "--decoy-level",
+            "0"
+        ]));
+        // Legacy profile validation still rejects non-corpus names on table/inject
+        assert!(!ok(&["table", "--profile", "/tmp/p.json"]));
+        assert!(!ok(&["inject", "--profile", "/tmp/p.json"]));
     }
 }

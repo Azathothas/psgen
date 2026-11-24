@@ -159,19 +159,14 @@ fn bool_txt(v: bool) -> &'static str {
 }
 
 fn environment() -> Vec<(&'static str, Vec<u8>)> {
+    let u = |n: u64| crate::json::u64_str(n).into_bytes();
     let mut v: Vec<(&'static str, Vec<u8>)> = vec![
-        ("uid", sys::getuid().to_string().into_bytes()),
-        ("euid", sys::geteuid().to_string().into_bytes()),
-        (
-            "mem_total_kb",
-            util::mem_total_kb().to_string().into_bytes(),
-        ),
-        (
-            "cgroup_mem_limit_kb",
-            util::cgroup_mem_limit_kb().to_string().into_bytes(),
-        ),
-        ("page_kb", sys::page_kb().to_string().into_bytes()),
-        ("hz", sys::hz().to_string().into_bytes()),
+        ("uid", u(sys::getuid() as u64)),
+        ("euid", u(sys::geteuid() as u64)),
+        ("mem_total_kb", u(util::mem_total_kb())),
+        ("cgroup_mem_limit_kb", u(util::cgroup_mem_limit_kb())),
+        ("page_kb", u(sys::page_kb())),
+        ("hz", u(sys::hz())),
     ];
     let mut cwd = [0u8; 4096];
     let c = match sys::getcwd(&mut cwd) {
