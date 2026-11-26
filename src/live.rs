@@ -93,6 +93,17 @@ pub fn read_comm(pid: i32) -> Option<Vec<u8>> {
     Some(str::trim(&buf[..n]).to_vec())
 }
 
+/// Read `/proc/<pid>/comm` stripping only a single trailing newline so
+/// trailing spaces in 15-byte comms (e.g. `"ci-runner      "`) are preserved.
+pub fn read_comm_exact(pid: i32) -> Option<Vec<u8>> {
+    let path = proc_path(pid, b"/comm");
+    let mut buf = [0u8; 64];
+    let n = sys::read_file(&path, &mut buf)?;
+    let s = &buf[..n];
+    let s = s.strip_suffix(b"\n").unwrap_or(s);
+    Some(s.to_vec())
+}
+
 pub fn read_starttime(pid: i32) -> Option<u64> {
     read_stat(pid).map(|s| s.starttime)
 }

@@ -20,18 +20,38 @@ fn buf_to_string(b: Buf) -> String {
     String::from_utf8(b.v).unwrap_or_default()
 }
 
-fn push_os_err(b: &mut Buf, errno: i32) {
-    let e = std::io::Error::from_raw_os_error(errno);
-    b.push_str(&e.to_string());
+#[inline(never)]
+fn warn_parts(w: &mut Vec<String>, parts: &[&[u8]]) {
+    let mut b = Buf::new();
+    for p in parts {
+        sys::buf_push_b(&mut b, p);
+    }
+    w.push(String::from_utf8_lossy(b.as_bytes()).into_owned());
 }
 
+#[inline(never)]
+fn push_cnt(b: &mut Buf, pre: &str, n: u64, suf: &str) {
+    sys::buf_push_s(b, pre);
+    sys::buf_push_u(b, n);
+    sys::buf_push_s(b, suf);
+}
+
+#[inline(never)]
+fn remove_opt_dir(d: &Option<std::path::PathBuf>) {
+    if let Some(p) = d {
+        let _ = std::fs::remove_dir_all(p);
+    }
+}
+
+#[inline(never)]
 fn err_with_errno(prefix: &str, errno: i32) -> String {
     let mut b = Buf::new();
-    b.push_str(prefix);
-    push_os_err(&mut b, errno);
+    sys::buf_push_s(&mut b, prefix);
+    sys::push_errno(&mut b, errno);
     buf_to_string(b)
 }
 
+#[inline(never)]
 fn close_fds(fds: &[i32]) {
     for &fd in fds {
         if fd >= 0 {
@@ -40,52 +60,71 @@ fn close_fds(fds: &[i32]) {
     }
 }
 
+#[inline(never)]
 fn remove_dirs(dirs: &[std::path::PathBuf]) {
     for d in dirs {
         let _ = std::fs::remove_dir_all(d);
     }
 }
 
+#[inline(never)]
 fn sort_dedup_i32(v: &mut Vec<i32>) {
-    const GAPS: [usize; 6] = [57, 23, 10, 4, 1, 0];
-    let n = v.len();
-    for &g in &GAPS {
-        if g == 0 || g >= n {
-            continue;
-        }
-        for i in g..n {
-            let cur = v[i];
-            let mut j = i;
-            while j >= g && v[j - g] > cur {
-                v[j] = v[j - g];
-                j -= g;
-            }
-            v[j] = cur;
-        }
-    }
+    crate::json::shell_sort_by(v, |a, b| a > b);
     v.dedup();
 }
 
+#[inline(never)]
 fn sort_dedup_pid_start(v: &mut Vec<(i32, u64)>) {
-    const GAPS: [usize; 6] = [57, 23, 10, 4, 1, 0];
-    let n = v.len();
-    for &g in &GAPS {
-        if g == 0 || g >= n {
-            continue;
-        }
-        for i in g..n {
-            let cur = v[i];
-            let mut j = i;
-            while j >= g && v[j - g] > cur {
-                v[j] = v[j - g];
-                j -= g;
-            }
-            v[j] = cur;
-        }
-    }
+    crate::json::shell_sort_by(v, |a, b| a > b);
     v.dedup();
 }
 
+struct CloseFd(i32);
+impl Drop for CloseFd {
+    fn drop(&mut self) {
+        if self.0 >= 0 {
+            sys::close(self.0);
+        }
+    }
+}
+
+#[inline(never)]
+fn make_memfd_name(nonce: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(3 + nonce.len());
+    v.extend_from_slice(b"pg:");
+    v.extend_from_slice(nonce);
+    v
+}
+
+#[inline(never)]
+fn maybe_node_temp(
+    need: bool,
+    idx: usize,
+    nonce: &[u8],
+    temps: &mut Vec<std::path::PathBuf>,
+) -> Vec<u8> {
+    if !need {
+        return Vec::new();
+    }
+    match make_temp_dir(idx, nonce) {
+        Some(p) => {
+            temps.push(p.clone());
+            p.as_os_str().as_bytes().to_vec()
+        }
+        None => Vec::new(),
+    }
+}
+
+#[inline(never)]
+pub(crate) fn cleanup_unbusy_temps(temps: &[std::path::PathBuf]) {
+    for t in temps {
+        if !staging_busy(t) && safe_temp_dir(t.as_os_str().as_bytes()) {
+            let _ = sys::remove_staging_dir(t);
+        }
+    }
+}
+
+#[inline(never)]
 fn open_status_pipe(install_fd5: bool) -> Result<(i32, i32), String> {
     let mut pfd = [0i32; 2];
     if let Err(e) = sys::pipe2_checked(&mut pfd, sys::O_CLOEXEC) {
@@ -123,6 +162,7 @@ fn open_status_pipe(install_fd5: bool) -> Result<(i32, i32), String> {
     }
 }
 
+#[inline(never)]
 fn alloc_sealed_cfg_fds(count: usize, name: &[u8], named: bool) -> Result<Vec<i32>, String> {
     let mut fds = Vec::with_capacity(count);
     for _ in 0..count {
@@ -135,9 +175,9 @@ fn alloc_sealed_cfg_fds(count: usize, name: &[u8], named: bool) -> Result<Vec<i3
             let e = sys::errno();
             close_fds(&fds);
             let mut b = Buf::new();
-            b.push_str("cannot create the config memfd (");
-            push_os_err(&mut b, e);
-            b.push_str("); a stub only acts on a sealed memfd");
+            sys::buf_push_s(&mut b, "cannot create the config memfd (");
+            sys::push_errno(&mut b, e);
+            sys::buf_push_s(&mut b, "); a stub only acts on a sealed memfd");
             return Err(buf_to_string(b));
         }
         let fd = if raw < 6 {
@@ -151,8 +191,11 @@ fn alloc_sealed_cfg_fds(count: usize, name: &[u8], named: bool) -> Result<Vec<i3
             let e = sys::errno();
             close_fds(&fds);
             let mut b = Buf::new();
-            b.push_str("cannot move the config memfd to a holding descriptor (");
-            push_os_err(&mut b, e);
+            sys::buf_push_s(
+                &mut b,
+                "cannot move the config memfd to a holding descriptor (",
+            );
+            sys::push_errno(&mut b, e);
             b.push(b')');
             return Err(buf_to_string(b));
         }
@@ -161,6 +204,7 @@ fn alloc_sealed_cfg_fds(count: usize, name: &[u8], named: bool) -> Result<Vec<i3
     Ok(fds)
 }
 
+#[inline(never)]
 fn collect_node_fds(
     idx: usize,
     children: &[Vec<usize>],
@@ -262,9 +306,24 @@ fn auto_phys_budget_kb() -> u64 {
     }
 }
 
+fn rss_stats(rows: &[Proc]) -> (u64, u64) {
+    let mut sum = 0u64;
+    let mut max = 0u64;
+    for p in rows {
+        sum += p.rss;
+        max = max.max(p.rss);
+    }
+    (sum, max)
+}
+
+fn assign_me(p: &mut Proc, me: &users::User) {
+    p.user = me.name.clone();
+    p.uid = me.uid;
+    p.gid = me.gid;
+}
+
 fn scale_rss(rows: &mut [Proc], budget_kb: u64, base_kb: u64, page_kb: u64) -> f64 {
-    let sum: u64 = rows.iter().map(|p| p.rss).sum();
-    let max = rows.iter().map(|p| p.rss).max().unwrap_or(0);
+    let (sum, max) = rss_stats(rows);
     let ptes = sum / 512;
     let avail = budget_kb.saturating_sub(base_kb);
     let cost = max.saturating_add(ptes);
@@ -277,13 +336,13 @@ fn scale_rss(rows: &mut [Proc], budget_kb: u64, base_kb: u64, page_kb: u64) -> f
     }
     let floor = 4096u64;
     for p in rows.iter_mut() {
-        let v = (p.rss as f64 * factor) as u64;
-        let v = v.max(floor);
+        let v = ((p.rss as f64 * factor) as u64).max(floor);
         p.rss = crate::table::round_up(v, page_kb);
     }
     factor
 }
 
+#[inline(never)]
 pub fn prepare(rows: &mut [Proc], args: &Args, create_users: bool) -> Prep {
     let me = util::current_user();
     let root = sys::geteuid() == 0;
@@ -303,69 +362,59 @@ pub fn prepare(rows: &mut [Proc], args: &Args, create_users: bool) -> Prep {
     let switch_users = args.user && !args.no_root;
 
     if switch_users && !root {
-        let mut b = Buf::new();
-        b.push_str("user switching needs root; running as ");
-        b.push_bytes(&me.name);
-        b.push_str(" (use sudo, --elevate, or --no-root)");
-        warnings.push(buf_to_string(b));
-    }
-    if args.no_root && args.user {
-        warnings.push(
-            "--no-root disables user switching and the bind tier; --shadow-dir still selects a shadow copy".to_string(),
+        warn_parts(
+            &mut warnings,
+            &[
+                b"user switching needs root; running as ",
+                &me.name,
+                b" (use sudo, --elevate, or --no-root)",
+            ],
         );
     }
-    if args.create_users && args.no_root {
-        warnings.push("--create-users has no effect with --no-root".to_string());
-    } else if args.create_users && !args.user {
-        warnings.push("--create-users has no effect with --no-user".to_string());
-    } else if args.create_users && !root {
-        // `useradd` needs root as well, so saying only "user switching needs
-        // root" leaves the caller thinking sudo would fix both.
-        warnings.push("--create-users needs root; no accounts were created".to_string());
-    }
-    if !args.mem && args.mem_cap_mb > 0 {
-        warnings.push("--mem-cap has no effect with --no-mem".to_string());
-    }
-    if !args.mem && args.phys_cap.is_some() {
-        warnings.push("--phys-cap has no effect with --no-mem".to_string());
-    }
-    if args.verify && !args.mem {
-        warnings.push("--verify has no effect with --no-mem".to_string());
+    const FLAG_WARNS: &str = "\
+--no-root disables user switching and the bind tier; --shadow-dir still selects a shadow copy|\
+--create-users has no effect with --no-root|\
+--create-users has no effect with --no-user|\
+--create-users needs root; no accounts were created|\
+--mem-cap has no effect with --no-mem|\
+--phys-cap has no effect with --no-mem|\
+--verify has no effect with --no-mem";
+    let flag_conds = [
+        args.no_root && args.user,
+        args.create_users && args.no_root,
+        args.create_users && !args.no_root && !args.user,
+        args.create_users && !args.no_root && args.user && !root,
+        !args.mem && args.mem_cap_mb > 0,
+        !args.mem && args.phys_cap.is_some(),
+        args.verify && !args.mem,
+    ];
+    for (cond, msg) in flag_conds.into_iter().zip(FLAG_WARNS.split('|')) {
+        if cond {
+            warnings.push(String::from(msg));
+        }
     }
 
     for p in rows.iter_mut() {
         if !switch_users {
-            p.user = me.name.clone();
-            p.uid = me.uid;
-            p.gid = me.gid;
+            assign_me(p, &me);
             continue;
         }
-        // A dry run creates nothing, but it must not fall back to the caller's
-        // identity either: the plan has to name what the real run would do.
-        // Reporting the caller here made `--create-users --dry-run` byte
-        // identical to the same command without the flag.
         if args.dry_run && args.create_users {
             if users::lookup_name(&p.user).is_none() {
-                // The account does not exist yet, so its uid is not known. The
-                // generated row carries a uid guessed from the passwd database
-                // (the caller's when the name is absent), and leaving it there
-                // made every such row claim uid 0 in the JSON preview.
                 p.uid = u32::MAX;
                 p.gid = u32::MAX;
                 if !warned_names.contains(&p.user) {
                     warned_names.push(p.user.clone());
-                    let mut msg = String::from("would create ");
-                    msg.push_str(&String::from_utf8_lossy(&p.user));
-                    msg.push_str(" (--dry-run creates nothing)");
-                    warnings.push(msg);
+                    warn_parts(
+                        &mut warnings,
+                        &[b"would create ", &p.user, b" (--dry-run creates nothing)"],
+                    );
                 }
             }
             continue;
         }
         if !root {
-            p.user = me.name.clone();
-            p.uid = me.uid;
-            p.gid = me.gid;
+            assign_me(p, &me);
             continue;
         }
         if p.uid == me.uid && p.user == me.name {
@@ -395,22 +444,24 @@ pub fn prepare(rows: &mut [Proc], args: &Args, create_users: bool) -> Prep {
             None => {
                 if !warned_names.contains(&p.user) {
                     warned_names.push(p.user.clone());
-                    let mut msg = String::from("no such user ");
-                    msg.push_str(&String::from_utf8_lossy(&p.user));
-                    msg.push_str("; running as ");
-                    msg.push_str(&String::from_utf8_lossy(&me.name));
-                    if !args.create_users {
-                        msg.push_str(" (pass --create-users to create it)");
-                    }
-                    if let Some(e) = err {
-                        msg.push_str(": ");
-                        msg.push_str(&e);
-                    }
-                    warnings.push(msg);
+                    warn_parts(
+                        &mut warnings,
+                        &[
+                            b"no such user ",
+                            &p.user,
+                            b"; running as ",
+                            &me.name,
+                            if !args.create_users {
+                                b" (pass --create-users to create it)"
+                            } else {
+                                b""
+                            },
+                            if err.is_some() { b": " } else { b"" },
+                            err.as_deref().map(str::as_bytes).unwrap_or(b""),
+                        ],
+                    );
                 }
-                p.user = me.name.clone();
-                p.uid = me.uid;
-                p.gid = me.gid;
+                assign_me(p, &me);
             }
         }
     }
@@ -428,12 +479,10 @@ pub fn prepare(rows: &mut [Proc], args: &Args, create_users: bool) -> Prep {
 
     if let Some(target) = args.mem_target_kb {
         if !args.mem {
-            warnings.push("--mem-target has no effect with --no-mem".to_string());
+            warnings.push(String::from("--mem-target has no effect with --no-mem"));
         } else {
             let target = target as u64;
             for p in rows.iter_mut() {
-                // Leave the base reserve below the template's VSZ, and never
-                // claim an RSS the stub cannot find room for.
                 let cap = p.vsz.saturating_sub(gen::BASE_RESERVE_KB as u64);
                 let v = target.min(cap.max(page));
                 p.rss = crate::table::round_up(v, page);
@@ -443,24 +492,30 @@ pub fn prepare(rows: &mut [Proc], args: &Args, create_users: bool) -> Prep {
 
     if args.mem_cap_mb > 0 && args.mem {
         let cap = args.mem_cap_mb.saturating_mul(1024);
-        let sum: u64 = rows.iter().map(|p| p.rss).sum();
+        let (sum, _) = rss_stats(rows);
         if sum > cap && !rows.is_empty() {
-            // The 4 MiB per-stub reserve is taken off the cap first; what is
-            // left is shared in proportion to each row's RSS above it.
             let floor = 4096u64;
             let base = floor.saturating_mul(rows.len() as u64);
             if base >= cap {
                 let mut b = Buf::new();
-                b.push_str("--mem-cap ");
-                b.push_u64(args.mem_cap_mb);
-                b.push_str(" MiB is at or below the ");
-                b.push_u64(base / 1024);
-                b.push_str(" MiB floor of ");
-                b.push_u64(rows.len() as u64);
-                b.push_str(if rows.len() == 1 { " stub" } else { " stubs" });
-                b.push_str("; the reported RSS will be at least ");
-                b.push_u64(base / 1024);
-                b.push_str(" MiB");
+                push_cnt(
+                    &mut b,
+                    "--mem-cap ",
+                    args.mem_cap_mb,
+                    " MiB is at or below the ",
+                );
+                push_cnt(&mut b, "", base / 1024, " MiB floor of ");
+                push_cnt(
+                    &mut b,
+                    "",
+                    rows.len() as u64,
+                    if rows.len() == 1 {
+                        " stub; the reported RSS will be at least "
+                    } else {
+                        " stubs; the reported RSS will be at least "
+                    },
+                );
+                push_cnt(&mut b, "", base / 1024, " MiB");
                 warnings.push(buf_to_string(b));
                 for p in rows.iter_mut() {
                     p.rss = floor;
@@ -478,26 +533,24 @@ pub fn prepare(rows: &mut [Proc], args: &Args, create_users: bool) -> Prep {
 
     if args.mem && !rows.is_empty() {
         if let Some(limit) = sys::rlimit_fsize() {
-            // Every stub maps the same arena file, and the arena is as large
-            // as the biggest RSS target. A fault past RLIMIT_FSIZE kills the
-            // stub with SIGXFSZ, so keep the targets below the limit.
             let cap_kb = (limit / 1024).saturating_sub(16 * 1024);
-            let max = rows.iter().map(|p| p.rss).max().unwrap_or(0);
+            let (_, max) = rss_stats(rows);
             if cap_kb < page {
-                warnings.push(
-                    "RLIMIT_FSIZE is too small for an RSS arena; memory padding disabled"
-                        .to_string(),
-                );
+                warnings.push(String::from(
+                    "RLIMIT_FSIZE is too small for an RSS arena; memory padding disabled",
+                ));
                 for p in rows.iter_mut() {
                     p.rss = 0;
                 }
             } else if max > cap_kb {
                 let mut b = Buf::new();
-                b.push_str("RLIMIT_FSIZE is ");
-                b.push_u64(limit / 1024 / 1024);
-                b.push_str(" MiB; RSS targets capped at ");
-                b.push_u64(cap_kb / 1024);
-                b.push_str(" MiB");
+                push_cnt(
+                    &mut b,
+                    "RLIMIT_FSIZE is ",
+                    limit / 1024 / 1024,
+                    " MiB; RSS targets capped at ",
+                );
+                push_cnt(&mut b, "", cap_kb / 1024, " MiB");
                 warnings.push(buf_to_string(b));
                 let v = cap_kb / page * page;
                 for p in rows.iter_mut() {
@@ -518,35 +571,29 @@ pub fn prepare(rows: &mut [Proc], args: &Args, create_users: bool) -> Prep {
     };
     let mut phys_estimate_kb = 0;
     if args.mem && !rows.is_empty() {
-        let sum: u64 = rows.iter().map(|p| p.rss).sum();
-        let max = rows.iter().map(|p| p.rss).max().unwrap_or(0);
-        let ptes = sum / 512;
-        let est = max.saturating_add(ptes).saturating_add(base_kb);
+        let (sum, max) = rss_stats(rows);
+        let est = max.saturating_add(sum / 512).saturating_add(base_kb);
         phys_estimate_kb = est;
         if budget > 0 && est > budget && max > 0 {
             phys_scale = scale_rss(rows, budget, base_kb, page);
-            let sum2: u64 = rows.iter().map(|p| p.rss).sum();
-            let max2 = rows.iter().map(|p| p.rss).max().unwrap_or(0);
+            let (sum2, max2) = rss_stats(rows);
             phys_estimate_kb = max2.saturating_add(sum2 / 512).saturating_add(base_kb);
         }
         if budget > 0 && phys_estimate_kb > budget {
-            // Integer MiB truncation made this sentence compare 30 with 30
-            // when the gap was below 1 MiB. KiB shows the actual difference.
             let mut b = Buf::new();
-            b.push_str("the estimated physical cost is about ");
-            b.push_u64(phys_estimate_kb);
-            b.push_str(" KiB, above the ");
-            b.push_u64(budget);
-            b.push_str(" KiB budget");
+            push_cnt(
+                &mut b,
+                "the estimated physical cost is about ",
+                phys_estimate_kb,
+                " KiB, above the ",
+            );
+            push_cnt(&mut b, "", budget, " KiB budget");
             warnings.push(buf_to_string(b));
         }
     }
 
     for p in rows.iter_mut() {
         if !args.tty {
-            // A root detaches the whole subtree from the caller's terminal.
-            // Children inherit the new session; making every row a session
-            // leader would change worker STAT and session semantics.
             p.flags &= !(corpus::F_SESSION | corpus::F_TTY);
             if p.parent.is_none() {
                 p.flags |= corpus::F_SESSION;
@@ -559,26 +606,11 @@ pub fn prepare(rows: &mut [Proc], args: &Args, create_users: bool) -> Prep {
         }
         if !args.busy {
             p.flags &= !corpus::F_BUSY;
+        } else if p.cpu > 0 {
+            p.flags |= corpus::F_BUSY;
         }
-    }
-
-    // --busy makes the CPU column true: every row that claims CPU in the
-    // table actually burns that share of a core. Without it the stubs sleep
-    // and ps reports 0.0, which is correct but not what the table said.
-    if args.busy {
-        for p in rows.iter_mut() {
-            if p.cpu > 0 {
-                p.flags |= corpus::F_BUSY;
-            }
-        }
-    }
-
-    // An explicit --cpu target replaces every row's duty cycle and forces the
-    // row onto the busy path, including rows the corpus does not normally mark.
-    if let Some(pct) = args.cpu_pct {
-        let tenths = pct.saturating_mul(10);
-        for p in rows.iter_mut() {
-            p.cpu = tenths;
+        if let Some(pct) = args.cpu_pct {
+            p.cpu = pct.saturating_mul(10);
             if pct == 0 {
                 p.flags &= !corpus::F_BUSY;
             } else {
@@ -588,20 +620,12 @@ pub fn prepare(rows: &mut [Proc], args: &Args, create_users: bool) -> Prep {
     }
 
     if args.disk_mb.unwrap_or(0) > 0 && rows.is_empty() {
-        warnings.push("--disk has no rows to write for".to_string());
+        warnings.push(String::from("--disk has no rows to write for"));
     }
 
     let caps = probe::caps();
     let mut shadow_root = args.shadow_dir.clone();
     if shadow_root.is_none() && !args.no_root && !args.no_exe && !caps.can_spoof_exe() {
-        // Keep the default so a cage without mount namespaces still gets a
-        // plausible `/proc/PID/exe`. The root does not depend on the caller's
-        // working directory: a run's cwd is not reproducible by any later run,
-        // so a cwd-derived root could never be reclaimed, and every run in a
-        // cage leaked one. The temporary directory is shared by every run of
-        // this caller and is what the prune already scans. The path is
-        // absolute so a child can exec the copy whatever working directory it
-        // inherits.
         let dir = std::env::temp_dir().join(".psgen-stubs");
         let mut v = dir.as_os_str().as_bytes().to_vec();
         if !v.ends_with(b"/") {
@@ -609,8 +633,6 @@ pub fn prepare(rows: &mut [Proc], args: &Args, create_users: bool) -> Prep {
         }
         shadow_root = Some(v);
     }
-    // --no-exe means /proc/PID/exe points at psgen, whatever else is set.
-    // --no-root alone keeps the shadow/proc-self choice.
     let tier = if args.no_exe {
         ExeTier::ProcSelf
     } else if args.no_root {
@@ -627,15 +649,18 @@ pub fn prepare(rows: &mut [Proc], args: &Args, create_users: bool) -> Prep {
         ExeTier::ProcSelf
     };
     if tier == ExeTier::ProcSelf && !args.no_exe && !args.no_root {
-        let mut b = Buf::new();
-        b.push_str("cannot bind the template path here (");
-        b.push_str(if !caps.mount_ns {
-            "mount namespaces denied"
-        } else {
-            "the bind was denied"
-        });
-        b.push_str("); /proc/PID/exe will point at psgen");
-        warnings.push(buf_to_string(b));
+        warn_parts(
+            &mut warnings,
+            &[
+                b"cannot bind the template path here (",
+                if !caps.mount_ns {
+                    b"mount namespaces denied"
+                } else {
+                    b"the bind was denied"
+                },
+                b"); /proc/PID/exe will point at psgen",
+            ],
+        );
     }
 
     Prep {
@@ -745,28 +770,19 @@ fn make_config(
         arena_fd: if p.rss > 0 { 4 } else { -1 },
         status_fd: 5,
         id: row as u32,
-        cwd: Vec::new(),
-        env_block: Vec::new(),
-        memfd_label: Vec::new(),
-        decoy_token: Vec::new(),
-        thread_comms: Vec::new(),
-        fd_specs: Vec::new(),
-        wchan_mode: 0,
-        seccomp_filters: 0,
-        jitter_ms: 0,
-        vm_lck_kb: 0,
-        rss_shmem_kb: 0,
+        ..stub::Config::default()
     }
 }
 
+#[inline(never)]
 fn write_config_fd(fd: i32, cfg: &stub::Config) -> bool {
     let data = stub::encode_config(cfg);
-    if !sys::ftruncate(fd, data.len() as u64) {
-        return false;
-    }
-    sys::pwrite_fd(fd, &data, 0) == data.len() as isize
+    sys::ftruncate(fd, data.len() as u64)
+        && sys::pwrite_fd(fd, &data, 0) == data.len() as isize
+        && sys::fd_add_seals(fd)
 }
 
+#[inline(never)]
 fn read_status_records(fd: i32, want: usize, timeout_ms: u64) -> Vec<(i32, i32, u32, u32)> {
     const REC: usize = 16;
     let mut buf: Vec<u8> = Vec::with_capacity(want * REC);
@@ -787,15 +803,16 @@ fn read_status_records(fd: i32, want: usize, timeout_ms: u64) -> Vec<(i32, i32, 
         }
         buf.extend_from_slice(&tmp[..n as usize]);
     }
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i + REC <= buf.len() {
-        let pid = i32::from_le_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]);
-        let status = i32::from_le_bytes([buf[i + 4], buf[i + 5], buf[i + 6], buf[i + 7]]);
-        let id = u32::from_le_bytes([buf[i + 8], buf[i + 9], buf[i + 10], buf[i + 11]]);
-        let dev = u32::from_le_bytes([buf[i + 12], buf[i + 13], buf[i + 14], buf[i + 15]]);
+    let mut out = Vec::with_capacity(buf.len() / REC);
+    for chunk in buf.chunks_exact(REC) {
+        let Ok(a) = <[u8; REC]>::try_from(chunk) else {
+            continue;
+        };
+        let pid = i32::from_le_bytes([a[0], a[1], a[2], a[3]]);
+        let status = i32::from_le_bytes([a[4], a[5], a[6], a[7]]);
+        let id = u32::from_le_bytes([a[8], a[9], a[10], a[11]]);
+        let dev = u32::from_le_bytes([a[12], a[13], a[14], a[15]]);
         out.push((pid, status, id, dev));
-        i += REC;
     }
     out
 }
@@ -824,6 +841,7 @@ pub fn fill_entropy(raw: &mut [u8]) {
 }
 
 /// Hex characters for a temporary name.
+#[inline(never)]
 fn random_hex(bytes: usize) -> Vec<u8> {
     let mut raw = vec![0u8; bytes];
     fill_entropy(&mut raw);
@@ -849,36 +867,37 @@ fn random_hex(bytes: usize) -> Vec<u8> {
 /// so a live row can be checked against it. A header from an older release has
 /// none, and `stop` then refuses that file's one-field lines rather than
 /// falling back to the executable test, which would match any psgen process.
+#[inline(never)]
 fn pidfile_body(pids: &[i32], temps: &[std::path::PathBuf], nonce: &[u8]) -> Option<Buf> {
     let boot = util::boot_id();
     if boot.is_empty() {
         return None;
     }
     let mut buf = Buf::new();
-    buf.push_bytes(crate::version::PIDFILE_PREFIX);
-    buf.push_str(crate::version::VERSION);
-    buf.push_str(" boot ");
-    buf.push_bytes(&boot);
+    sys::buf_push_b(&mut buf, crate::version::PIDFILE_PREFIX);
+    sys::buf_push_s(&mut buf, crate::version::VERSION);
+    sys::buf_push_s(&mut buf, " boot ");
+    sys::buf_push_b(&mut buf, &boot);
     if !nonce.is_empty() {
-        buf.push_bytes(crate::version::PIDFILE_NONCE);
-        buf.push_bytes(nonce);
+        sys::buf_push_b(&mut buf, crate::version::PIDFILE_NONCE);
+        sys::buf_push_b(&mut buf, nonce);
     }
     buf.push(b'\n');
     for t in temps {
-        buf.push_str("# temp ");
-        buf.push_bytes(t.as_os_str().as_bytes());
+        sys::buf_push_s(&mut buf, "# temp ");
+        sys::buf_push_b(&mut buf, t.as_os_str().as_bytes());
         buf.push(b'\n');
     }
     let mut sorted = pids.to_vec();
     sort_dedup_i32(&mut sorted);
     for pid in &sorted {
         let st = live::read_starttime(*pid).unwrap_or(0);
-        let comm = live::read_comm(*pid).unwrap_or_default();
-        buf.push_u64(*pid as u64);
+        let comm = live::read_comm_exact(*pid).unwrap_or_default();
+        sys::buf_push_u(&mut buf, *pid as u64);
         buf.push(b'\t');
-        buf.push_u64(st);
+        sys::buf_push_u(&mut buf, st);
         buf.push(b'\t');
-        buf.push_bytes(&comm);
+        sys::buf_push_b(&mut buf, &comm);
         buf.push(b'\n');
     }
     Some(buf)
@@ -934,6 +953,7 @@ pub fn write_external_pidfile(path: &[u8], pids: &[i32]) -> bool {
 /// Write the pidfile, falling back to shorter temporary names when the target
 /// basename is close to `NAME_MAX`. Returns whether it landed, and the errno
 /// that stopped it so the caller can name the real cause.
+#[inline(never)]
 fn write_pidfile(
     path: &[u8],
     pids: &[i32],
@@ -1057,32 +1077,43 @@ pub fn pidfile_lock_held(path: &[u8]) -> bool {
 /// became unwritable (for example `chmod 555` mid-run), falls back to
 /// `<TMPDIR>/psgen-spawned-<pid>-<nonce>.pid` so the caller still gets a valid
 /// pidfile carrying the real nonce and `# temp` paths that `stop` can use.
+#[inline(never)]
+fn write_sidecar_file(path: &Path, data: &[u8], create_new: bool) -> bool {
+    let pb = path.as_os_str().as_bytes();
+    let mut flags = sys::O_WRONLY | sys::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    flags |= if create_new {
+        sys::O_EXCL
+    } else {
+        libc::O_TRUNC
+    };
+    let fd = sys::open(pb, flags, 0o600);
+    if fd < 0 {
+        return false;
+    }
+    let ok = sys::write_fd(fd, data) && sys::fsync_fd(fd);
+    sys::close(fd);
+    if !ok {
+        let _ = std::fs::remove_file(path);
+    }
+    ok
+}
+
+#[inline(never)]
 pub fn write_pid_sidecar(
     path: &[u8],
     pids: &[i32],
     temps: &[std::path::PathBuf],
     nonce: &[u8],
 ) -> Option<Vec<u8>> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     let buf = pidfile_body(pids, temps, nonce)?;
     let mut side = path.to_vec();
     side.extend_from_slice(b".spawned");
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(Path::new(std::ffi::OsStr::from_bytes(&side)))
-    {
-        if f.write_all(buf.as_bytes())
-            .and_then(|()| f.sync_all())
-            .is_ok()
-        {
-            return Some(side);
-        }
-        let _ = std::fs::remove_file(Path::new(std::ffi::OsStr::from_bytes(&side)));
+    if write_sidecar_file(
+        Path::new(std::ffi::OsStr::from_bytes(&side)),
+        buf.as_bytes(),
+        false,
+    ) {
+        return Some(side);
     }
     let tag = if nonce.is_empty() {
         random_hex(8)
@@ -1090,26 +1121,13 @@ pub fn write_pid_sidecar(
         nonce.to_vec()
     };
     let mut fb_name = Buf::new();
-    fb_name.push_str("psgen-spawned-");
-    fb_name.push_u64(sys::getpid() as u64);
-    fb_name.push(b'-');
-    fb_name.push_bytes(&tag);
-    fb_name.push_str(".pid");
+    push_cnt(&mut fb_name, "psgen-spawned-", sys::getpid() as u64, "-");
+    sys::buf_push_b(&mut fb_name, &tag);
+    sys::buf_push_s(&mut fb_name, ".pid");
     let fallback = std::env::temp_dir().join(std::ffi::OsStr::from_bytes(fb_name.as_bytes()));
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&fallback)
-        .ok()?;
-    if f.write_all(buf.as_bytes())
-        .and_then(|()| f.sync_all())
-        .is_ok()
-    {
+    if write_sidecar_file(&fallback, buf.as_bytes(), true) {
         Some(fallback.as_os_str().as_bytes().to_vec())
     } else {
-        let _ = std::fs::remove_file(&fallback);
         None
     }
 }
@@ -1142,25 +1160,18 @@ pub fn pid_ns_inode() -> u64 {
 /// PID is meaningless whatever its starttime says. The nonce ties the line to
 /// the run that wrote it, so a marker from an older run in the same namespace
 /// is not mistaken for the current one.
+#[inline(never)]
 pub fn marker_line(pid: i32, start: u64, boot: &[u8], nonce: &[u8]) -> Vec<u8> {
     let mut line = Buf::new();
-    line.push_u64(pid as u64);
+    sys::buf_push_u(&mut line, pid as u64);
     line.push(b' ');
-    line.push_u64(start);
+    sys::buf_push_u(&mut line, start);
     line.push(b' ');
-    line.push_u64(pid_ns_inode());
+    sys::buf_push_u(&mut line, pid_ns_inode());
     line.push(b' ');
-    if boot.is_empty() {
-        line.push(b'-');
-    } else {
-        line.push_bytes(boot);
-    }
+    sys::buf_push_b(&mut line, if boot.is_empty() { b"-" } else { boot });
     line.push(b' ');
-    if nonce.is_empty() {
-        line.push(b'-');
-    } else {
-        line.push_bytes(nonce);
-    }
+    sys::buf_push_b(&mut line, if nonce.is_empty() { b"-" } else { nonce });
     line.push(b'\n');
     line.v
 }
@@ -1172,6 +1183,7 @@ pub fn marker_line(pid: i32, start: u64, boot: &[u8], nonce: &[u8]) -> Vec<u8> {
 /// rewrite would erase a stub that is alive but has not reported yet, and the
 /// prune pass would then delete the directory it is still using. Duplicate
 /// lines are harmless: every reader asks `any(live)`.
+#[inline(never)]
 fn append_marker(dir: &Path, file: &[u8], lines: &[u8]) -> bool {
     if lines.is_empty() {
         return true;
@@ -1203,6 +1215,7 @@ fn append_marker(dir: &Path, file: &[u8], lines: &[u8]) -> bool {
 /// The injector exits before a `--duration` run ends, so the owner marker goes
 /// stale while the stubs are still using their `--disk` data and shadow copy.
 /// The prune pass must keep those directories until the last stub is gone.
+#[inline(never)]
 fn write_live_marker(temps: &[std::path::PathBuf], pids: &[(i32, u64)], nonce: &[u8]) {
     // The roots the injector records are its own children, so they live in
     // the injector's namespace; a stub that records itself writes its own.
@@ -1235,6 +1248,7 @@ struct Marker {
 /// anyone still using this directory" -- would then answer "nobody" and delete
 /// a directory a live stub is holding. `None` is reserved for a file that
 /// cannot be read at all.
+#[inline(never)]
 fn read_marker(dir: &Path, file: &[u8]) -> Option<Vec<Marker>> {
     let text = std::fs::read(dir.join(std::ffi::OsStr::from_bytes(file))).ok()?;
     let mut out = Vec::new();
@@ -1279,31 +1293,29 @@ fn make_temp_dir(idx: usize, nonce: &[u8]) -> Option<std::path::PathBuf> {
     make_temp_dir_in(&std::env::temp_dir(), idx, nonce)
 }
 
+#[inline(never)]
 fn make_temp_dir_in(base: &Path, idx: usize, nonce: &[u8]) -> Option<std::path::PathBuf> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     let _ = std::fs::create_dir_all(base);
     let mut name = Buf::new();
     for i in 0..100 {
         name.v.clear();
-        name.push_str(".psgen-");
-        name.push_u64(sys::getpid() as u64);
+        sys::buf_push_s(&mut name, ".psgen-");
+        sys::buf_push_u(&mut name, sys::getpid() as u64);
         name.push(b'-');
-        name.push_u64(idx as u64);
+        sys::buf_push_u(&mut name, idx as u64);
         name.push(b'-');
-        name.push_u64(i);
+        sys::buf_push_u(&mut name, i);
         let p = base.join(std::ffi::OsStr::from_bytes(name.as_bytes()));
-        let made = std::fs::DirBuilder::new().mode(0o700).create(&p).is_ok();
-        if !made {
+        let Some(cp) = sys::cstr(p.as_os_str().as_bytes()) else {
+            continue;
+        };
+        if unsafe { libc::mkdir(cp.as_ptr(), 0o700) } != 0 {
             continue;
         }
-        if std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).is_err() {
+        if unsafe { libc::chmod(cp.as_ptr(), 0o700) } != 0 {
             let _ = std::fs::remove_dir(&p);
             continue;
         }
-        // Record who owns this directory, with the owner's starttime, PID
-        // namespace and run tag, so a later prune can tell a live run from a
-        // recycled PID and from a run in another namespace, whose PIDs it
-        // cannot read.
         let start = live::read_starttime(sys::getpid()).unwrap_or(0);
         let owner = marker_line(sys::getpid(), start, &util::boot_id(), nonce);
         let _ = append_marker(&p, OWNER_FILE, &owner);
@@ -1314,38 +1326,22 @@ fn make_temp_dir_in(base: &Path, idx: usize, nonce: &[u8]) -> Option<std::path::
 
 /// The injector PID encoded in a staging directory name, if the name matches
 /// `.psgen-<pid>-<idx>-<n>`.
+#[inline(never)]
 fn staging_pid(name: &[u8]) -> Option<i32> {
     let rest = name.strip_prefix(b".psgen-")?;
-    let parts: Vec<&[u8]> = rest.split(|b| *b == b'-').collect();
-    if parts.len() != 3 {
-        return None;
-    }
-    if !parts
-        .iter()
-        .all(|p| !p.is_empty() && p.iter().all(|b| b.is_ascii_digit()))
+    let mut it = rest.split(|b| *b == b'-');
+    let (p0, p1, p2) = (it.next()?, it.next()?, it.next()?);
+    if it.next().is_some()
+        || [p0, p1, p2]
+            .iter()
+            .any(|p| p.is_empty() || !p.iter().all(|b| b.is_ascii_digit()))
     {
         return None;
     }
-    str::parse_u64(parts[0]).and_then(|v| i32::try_from(v).ok())
+    str::parse_u64(p0).and_then(|v| i32::try_from(v).ok())
 }
 
-/// Whether a staging directory still has a live process recorded in it.
-///
-/// The live marker is written by the injector and by each stub before it
-/// execs, so it is the authoritative list of who is using the directory. A
-/// zombie does not count: it holds no files and runs no code, and a parent that
-/// has signalled its children but not yet reaped them would otherwise keep
-/// every directory alive. `stop` already treats a zombie as stopped; this is
-/// the same test, so the two cannot disagree about whether a directory is in
-/// use. An entry from another PID namespace names a process this one cannot
-/// judge, so it counts as live; an entry from another boot is provably dead.
-///
-/// A directory whose owner marker names *this* process is one this process is
-/// still holding open. `SIGKILL` returns before the target has exited, so the
-/// one caller in that position — a run that has just killed its own stubs —
-/// would otherwise sample the marker inside the window and keep a directory it
-/// is entitled to remove. That case waits, bounded, the way `stop` does; a
-/// directory owned by anyone else is answered at once, so a prune never blocks.
+#[inline(never)]
 pub fn staging_busy(dir: &std::path::Path) -> bool {
     let mine = read_owner_marker(dir)
         .map(|o| o.pid == sys::getpid())
@@ -1366,23 +1362,23 @@ pub fn staging_busy(dir: &std::path::Path) -> bool {
     }
 }
 
+#[inline(never)]
+fn markers_any_live(entries: &[Marker], my_ns: u64, my_boot: &[u8]) -> bool {
+    entries.iter().any(|m| {
+        if !ns_matches(m, my_ns) {
+            return true;
+        }
+        if boot_differs(m, my_boot) {
+            return false;
+        }
+        marker_alive(m)
+    })
+}
+
 fn marker_busy(dir: &std::path::Path) -> bool {
     let my_ns = pid_ns_inode();
     let my_boot = util::boot_id();
-    read_live_marker(dir)
-        .map(|entries| {
-            entries.iter().any(|m| {
-                if !ns_matches(m, my_ns) {
-                    // Unknown is not dead.
-                    return true;
-                }
-                if boot_differs(m, &my_boot) {
-                    return false;
-                }
-                marker_alive(m)
-            })
-        })
-        .unwrap_or(false)
+    read_live_marker(dir).is_some_and(|entries| markers_any_live(&entries, my_ns, &my_boot))
 }
 
 /// Whether a marker entry names a process that is still running.
@@ -1449,6 +1445,7 @@ fn shadow_roots() -> Vec<std::path::PathBuf> {
 /// in that marker still exists. An unmarked directory may belong to another
 /// tool, or to a run that crashed before it could write the marker, so it is
 /// left alone.
+#[inline(never)]
 pub fn prune_staging(prep: &Prep) -> usize {
     let mut roots: Vec<std::path::PathBuf> = vec![std::env::temp_dir()];
     for r in shadow_roots() {
@@ -1477,13 +1474,13 @@ pub fn prune_staging(prep: &Prep) -> usize {
 /// caller who asked for `--elevate` knows why they are never reclaimed.
 fn report_foreign(path: &Path, uid: u32) {
     let mut out = Buf::new();
-    out.push_str("psgen: leaving ");
-    out.push_bytes(path.as_os_str().as_bytes());
-    out.push_str(" alone: it is owned by uid ");
-    out.push_u64(uid as u64);
-    out.push_str(", not ");
-    out.push_u64(sys::geteuid() as u64);
-    out.push_str("; the run that made it must stop it\n");
+    sys::buf_push_s(&mut out, "psgen: leaving ");
+    sys::buf_push_b(&mut out, path.as_os_str().as_bytes());
+    sys::buf_push_s(&mut out, " alone: it is owned by uid ");
+    sys::buf_push_u(&mut out, uid as u64);
+    sys::buf_push_s(&mut out, ", not ");
+    sys::buf_push_u(&mut out, sys::geteuid() as u64);
+    sys::buf_push_s(&mut out, "; the run that made it must stop it\n");
     sys::err(out.as_bytes());
 }
 
@@ -1533,32 +1530,11 @@ fn prune_root(root: &Path) -> usize {
         }
         match read_live_marker(&path) {
             Some(entries) => {
-                // A stub is still using this directory while it is alive. A
-                // zombie is not: it holds no files and runs no code, and a
-                // container whose PID 1 does not reap would otherwise keep
-                // every dead run's staging for ever. An entry from another
-                // boot is provably dead; an entry from another namespace is
-                // not judgeable, so it keeps the directory.
-                let busy = entries.iter().any(|m| {
-                    if !ns_matches(m, my_ns) {
-                        return true;
-                    }
-                    if boot_differs(m, &my_boot) {
-                        return false;
-                    }
-                    marker_alive(m)
-                });
-                if busy {
+                if markers_any_live(&entries, my_ns, &my_boot) {
                     continue;
                 }
             }
             None => {
-                // No live marker. A stub writes one before it execs, so a
-                // directory with no marker has no stub using it. If the owner
-                // marker names a dead injector, the run died before any stub
-                // started and the directory is safe to remove. Without an
-                // owner marker it may belong to another tool, so it is left
-                // alone.
                 if read_owner_marker(&path).is_none() {
                     continue;
                 }
@@ -1571,6 +1547,7 @@ fn prune_root(root: &Path) -> usize {
     removed
 }
 
+#[inline(never)]
 fn redirect_stdio() {
     let devnull = sys::open(b"/dev/null", sys::O_RDWR, 0);
     if devnull >= 0 {
@@ -1587,6 +1564,7 @@ fn redirect_stdio() {
     }
 }
 
+#[inline(never)]
 pub fn spawn(rows: &[Proc], args: &Args, prep: &Prep) -> Result<SpawnResult, String> {
     let children = children_of(rows);
     let roots: Vec<usize> = rows
@@ -1597,19 +1575,17 @@ pub fn spawn(rows: &[Proc], args: &Args, prep: &Prep) -> Result<SpawnResult, Str
         .collect();
     let total_nodes = rows.len();
     let self_exe = std::env::current_exe()
-        .map_err(|e| e.to_string())?
+        .map_err(|e| {
+            let mut b = Buf::new();
+            sys::push_io_err(&mut b, &e);
+            buf_to_string(b)
+        })?
         .as_os_str()
         .as_bytes()
         .to_vec();
     let mut tier = prep.tier;
-    // The run tag, allocated before any staging directory exists so the owner
-    // marker can record it. It is a run identifier, not a secret: it travels
-    // in the stub's environment because argv is what `ps aux` renders.
     let nonce = random_hex(8);
 
-    // An optional copy of this binary, used when the exe tier is shadow. It
-    // must live somewhere `stop` can remove, so it sits in its own temp dir
-    // listed in the pidfile next to the others.
     let mut shadow_dir: Option<std::path::PathBuf> = None;
     let mut self_copy: Vec<u8> = Vec::new();
     if tier == ExeTier::Shadow {
@@ -1620,26 +1596,22 @@ pub fn spawn(rows: &[Proc], args: &Args, prep: &Prep) -> Result<SpawnResult, Str
         let made = make_temp_dir_in(Path::new(std::ffi::OsStr::from_bytes(dir)), 9_000, &nonce)
             .ok_or_else(|| {
                 let mut b = Buf::new();
-                b.push_str("cannot create a directory in ");
-                b.push_bytes(dir);
-                b.push_str(" for --shadow-dir");
+                sys::buf_push_s(&mut b, "cannot create a directory in ");
+                sys::buf_push_b(&mut b, dir);
+                sys::buf_push_s(&mut b, " for --shadow-dir");
                 buf_to_string(b)
             });
         let copied = made.and_then(|d| {
             let dst = d.join("psgen-stub");
-            match std::fs::copy(Path::new(std::ffi::OsStr::from_bytes(&self_exe)), &dst) {
-                Ok(_) => {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755));
-                    Ok((d, dst))
-                }
+            match copy_shadow_exe_res(&self_exe, dst.as_os_str().as_bytes()) {
+                Ok(()) => Ok((d, dst)),
                 Err(e) => {
                     let _ = std::fs::remove_dir_all(&d);
                     let mut b = Buf::new();
-                    b.push_str("cannot copy the stub into ");
-                    b.push_bytes(dir);
-                    b.push_str(": ");
-                    b.push_str(&e.to_string());
+                    sys::buf_push_s(&mut b, "cannot copy the stub into ");
+                    sys::buf_push_b(&mut b, dir);
+                    sys::buf_push_s(&mut b, ": ");
+                    sys::push_io_err(&mut b, &e);
                     Err(buf_to_string(b))
                 }
             }
@@ -1657,11 +1629,7 @@ pub fn spawn(rows: &[Proc], args: &Args, prep: &Prep) -> Result<SpawnResult, Str
                 if args.shadow_dir.is_some() {
                     return Err(e);
                 }
-                let mut out = Buf::new();
-                out.push_str("psgen: ");
-                out.push_str(&e);
-                out.push_str("; /proc/PID/exe will point at psgen\n");
-                sys::err(out.as_bytes());
+                sys::err_parts(&[e.as_bytes(), b"; /proc/PID/exe will point at psgen"]);
                 tier = ExeTier::ProcSelf;
             }
         }
@@ -1669,67 +1637,48 @@ pub fn spawn(rows: &[Proc], args: &Args, prep: &Prep) -> Result<SpawnResult, Str
     let bind = tier == ExeTier::Bind;
 
     let max_rss = rows.iter().map(|p| p.rss).max().unwrap_or(0);
-    let mut arena_fd: i32 = -1;
-    if args.mem && max_rss > 0 {
+    let arena_fd = CloseFd(if args.mem && max_rss > 0 {
         let fd = sys::anon_file(b"cache", max_rss * 1024);
         if fd < 0 {
-            if let Some(d) = &shadow_dir {
-                let _ = std::fs::remove_dir_all(d);
-            }
+            remove_opt_dir(&shadow_dir);
             let e = sys::errno();
             let mut b = Buf::new();
-            b.push_str("cannot create the RSS arena (");
-            b.push_u64(max_rss);
-            b.push_str(" KiB): ");
-            push_os_err(&mut b, e);
+            push_cnt(&mut b, "cannot create the RSS arena (", max_rss, " KiB): ");
+            sys::push_errno(&mut b, e);
             return Err(buf_to_string(b));
         }
         let target = sys::dup2(fd, 4);
         if target != 4 {
             let e = sys::errno();
             sys::close(fd);
-            if let Some(d) = &shadow_dir {
-                let _ = std::fs::remove_dir_all(d);
-            }
+            remove_opt_dir(&shadow_dir);
             return Err(err_with_errno("dup2(arena,4): ", e));
         }
         if fd != 4 {
             sys::close(fd);
         }
-        arena_fd = 4;
-    }
+        4
+    } else {
+        -1
+    });
 
     let (status_read, _) = match open_status_pipe(true) {
         Ok(pair) => pair,
         Err(e) => {
-            if arena_fd >= 0 {
-                sys::close(arena_fd);
-            }
-            if let Some(d) = &shadow_dir {
-                let _ = std::fs::remove_dir_all(d);
-            }
+            remove_opt_dir(&shadow_dir);
             return Err(e);
         }
     };
 
-    // Orphaned stub children reparent to this process, so --wait can reap
-    // them instead of leaving zombies under PID 1.
     sys::set_child_subreaper();
-    // Detach this injector into a new session before any root is forked, so a
-    // row without a session flag still leaves the caller's session and terminal:
-    // it inherits this one instead. A row that *is* a session leader (`F_SESSION`,
-    // which `table` renders as `s`) makes itself one in the stub; every other
-    // root joins this session as a process-group leader, so its STAT still has
-    // no `s` and the table's prediction stays true. The call fails harmlessly
-    // when this process is already a session leader, which is the one case
-    // where it is already detached from the caller.
     sys::setsid();
+    let memfd_name = make_memfd_name(&nonce);
     let mut root_pids: Vec<(i32, u64)> = Vec::new();
     let mut all_temps: Vec<std::path::PathBuf> = Vec::new();
     for root in roots {
         let mut nodes = Vec::new();
         subtree(root, &children, &mut nodes);
-        let cfg_fds = match alloc_sealed_cfg_fds(nodes.len(), b"cfg", false) {
+        let cfg_fds = match alloc_sealed_cfg_fds(nodes.len(), &memfd_name, true) {
             Ok(fds) => fds,
             Err(e) => {
                 remove_dirs(&all_temps);
@@ -1738,33 +1687,30 @@ pub fn spawn(rows: &[Proc], args: &Args, prep: &Prep) -> Result<SpawnResult, Str
         };
         let mut fd_of = vec![0i32; rows.len()];
         for (&node, &fd) in nodes.iter().zip(cfg_fds.iter()) {
-            fd_of[node] = fd;
+            if let Some(slot) = fd_of.get_mut(node) {
+                *slot = fd;
+            }
         }
         let mut failed = false;
         let mut root_temps: Vec<std::path::PathBuf> = Vec::new();
-        for node in &nodes {
-            let fd = fd_of[*node];
+        for &node in &nodes {
+            let Some(&fd) = fd_of.get(node) else {
+                continue;
+            };
             let exe = if bind {
-                gen::template_exe(&corpus::CORPUS[rows[*node].tmpl])
+                rows.get(node)
+                    .and_then(|r| corpus::CORPUS.get(r.tmpl))
+                    .map(gen::template_exe)
+                    .unwrap_or_default()
             } else {
                 Vec::new()
             };
-            let need_exe_dir =
-                !exe.is_empty() && !Path::new(std::ffi::OsStr::from_bytes(&exe)).exists();
-            let need_disk_dir = args.disk_mb.unwrap_or(0) > 0;
-            let temp = if need_exe_dir || need_disk_dir {
-                match make_temp_dir(*node, &nonce) {
-                    Some(p) => {
-                        root_temps.push(p.clone());
-                        p.as_os_str().as_bytes().to_vec()
-                    }
-                    None => Vec::new(),
-                }
-            } else {
-                Vec::new()
-            };
+            let need_dir = (!exe.is_empty()
+                && !Path::new(std::ffi::OsStr::from_bytes(&exe)).exists())
+                || args.disk_mb.unwrap_or(0) > 0;
+            let temp = maybe_node_temp(need_dir, node, &nonce, &mut root_temps);
             let cfg = make_config(
-                *node,
+                node,
                 rows,
                 &children,
                 &fd_of,
@@ -1776,10 +1722,7 @@ pub fn spawn(rows: &[Proc], args: &Args, prep: &Prep) -> Result<SpawnResult, Str
                     nonce: &nonce,
                 },
             );
-            // The seal is part of the descriptor's identity, not a nicety: the
-            // stub requires a memfd to be sealed, so an unsealed one would be
-            // refused by the stub it was written for.
-            if !write_config_fd(fd, &cfg) || !sys::fd_add_seals(fd) {
+            if !write_config_fd(fd, &cfg) {
                 failed = true;
                 break;
             }
@@ -1789,8 +1732,12 @@ pub fn spawn(rows: &[Proc], args: &Args, prep: &Prep) -> Result<SpawnResult, Str
             remove_dirs(&root_temps);
             continue;
         }
-        all_temps.extend(root_temps.iter().cloned());
-        let root_cfg_fd = fd_of[root];
+        all_temps.extend(root_temps);
+        let Some(&root_cfg_fd) = fd_of.get(root) else {
+            close_fds(&cfg_fds);
+            continue;
+        };
+        let root_cmd = rows.get(root).map(|r| r.cmd.as_slice()).unwrap_or(b"");
         let pid = sys::fork();
         if pid == 0 {
             sys::close(status_read);
@@ -1801,14 +1748,9 @@ pub fn spawn(rows: &[Proc], args: &Args, prep: &Prep) -> Result<SpawnResult, Str
                 sys::close(root_cfg_fd);
             }
             redirect_stdio();
-            // The nonce goes in the environment, not argv: argv is what
-            // `ps aux` renders and the template command line has to stay
-            // byte-exact.
             let nonce_line = stub::nonce_env_line(&nonce);
             let env = stub::envp_with(&nonce_line);
-            let (buf, argv) = stub::build_argv(&rows[root].cmd);
-            // /proc/self/exe still resolves after the binary is replaced or
-            // deleted; the stored path is only the fallback.
+            let (buf, argv) = stub::build_argv(root_cmd);
             if sys::execve(b"/proc/self/exe", &argv, &env) < 0 {
                 sys::execve(&self_exe, &argv, &env);
             }
@@ -1816,20 +1758,13 @@ pub fn spawn(rows: &[Proc], args: &Args, prep: &Prep) -> Result<SpawnResult, Str
             sys::exit(127);
         }
         if pid > 0 {
-            // The stub sets its own comm only after exec, so the comm read
-            // here is still the parent's. The starttime is stable across exec
-            // and is the identity `--wait` checks.
             root_pids.push((pid, live::read_starttime(pid).unwrap_or(0)));
         }
         close_fds(&cfg_fds);
     }
 
     sys::close(5);
-    if arena_fd >= 0 {
-        sys::close(arena_fd);
-    }
-    // The roots exist now, so a later prune can see that their staging
-    // directories are still in use even after this injector exits.
+    drop(arena_fd);
     write_live_marker(&all_temps, &root_pids, &nonce);
 
     let disk_ms = args.disk_mb.unwrap_or(0).saturating_mul(30);
@@ -1845,71 +1780,51 @@ pub fn spawn(rows: &[Proc], args: &Args, prep: &Prep) -> Result<SpawnResult, Str
     let mut warned = 0usize;
     let mut mismatches: Vec<(i32, u32, u64, u64, u64, u64)> = Vec::new();
     let mut failed_ids: Vec<(u32, i32)> = Vec::new();
-    let mut tty_wanted = 0usize;
+    let tty_wanted = rows.iter().filter(|p| p.flags & corpus::F_TTY != 0).count();
     let mut tty_real = 0usize;
     let mut tty_degraded = 0usize;
     let mut dev_exe = 0usize;
     let mut dev_user = 0usize;
     let mut dev_disk = 0usize;
     let mut dev_mem = 0usize;
-    for p in rows.iter() {
-        if p.flags & corpus::F_TTY != 0 {
-            tty_wanted += 1;
-        }
-    }
     let tol = 128;
-    for (pid, status, id, dev) in &records {
-        if *status == 0 {
-            pids.push(*pid);
-        } else if *status == 2 {
-            pids.push(*pid);
+    for &(pid, status, id, dev) in &records {
+        if status == 0 {
+            pids.push(pid);
+        } else if status == 2 {
+            pids.push(pid);
             warned += 1;
         } else {
             failed += 1;
-            failed_ids.push((*id, *status));
+            failed_ids.push((id, status));
         }
-        if *dev & stub::DEV_TTY != 0 {
+        let row_opt = rows.get(id as usize);
+        if dev & stub::DEV_TTY != 0 {
             tty_degraded += 1;
-        } else if (*id as usize) < rows.len() && rows[*id as usize].flags & corpus::F_TTY != 0 {
+        } else if row_opt.is_some_and(|r| r.flags & corpus::F_TTY != 0) {
             tty_real += 1;
         }
-        if *dev & stub::DEV_EXE != 0 {
-            dev_exe += 1;
-        }
-        if *dev & stub::DEV_USER != 0 {
-            dev_user += 1;
-        }
-        if *dev & stub::DEV_DISK != 0 {
-            dev_disk += 1;
-        }
-        if *dev & (stub::DEV_RSS | stub::DEV_VSZ) != 0 {
-            dev_mem += 1;
-        }
-        // Status 2 is a deviation, not a failure: the row is running with one
-        // part of its setup missing. Only a negative status excludes a row.
-        if args.verify && args.mem && *status >= 0 && (*id as usize) < rows.len() {
-            if let Some((vsz, rss)) = live::read_sizes(*pid) {
-                let want_vsz = rows[*id as usize].vsz;
-                let want_rss = rows[*id as usize].rss;
-                if vsz.abs_diff(want_vsz) > tol || rss.abs_diff(want_rss) > tol {
-                    mismatches.push((*pid, *id, want_vsz, vsz, want_rss, rss));
+        dev_exe += usize::from(dev & stub::DEV_EXE != 0);
+        dev_user += usize::from(dev & stub::DEV_USER != 0);
+        dev_disk += usize::from(dev & stub::DEV_DISK != 0);
+        dev_mem += usize::from(dev & (stub::DEV_RSS | stub::DEV_VSZ) != 0);
+        if args.verify && args.mem && status >= 0 {
+            if let (Some(row), Some((vsz, rss))) = (row_opt, live::read_sizes(pid)) {
+                if vsz.abs_diff(row.vsz) > tol || rss.abs_diff(row.rss) > tol {
+                    mismatches.push((pid, id, row.vsz, vsz, row.rss, rss));
                 }
             }
         }
     }
     let missing = total_nodes.saturating_sub(records.len());
     if pids.is_empty() && !root_pids.is_empty() {
-        // No stub reported, but the roots were forked. Record them so the
-        // pidfile and --wait can still stop the tree, and keep the temps.
         pids.extend(root_pids.iter().map(|(p, _)| *p));
     }
     if let Some(d) = &shadow_dir {
         all_temps.push(d.clone());
     }
     if pids.is_empty() {
-        for t in &all_temps {
-            let _ = std::fs::remove_dir_all(t);
-        }
+        remove_dirs(&all_temps);
         all_temps.clear();
     }
     let mut pidfile_ok = true;
@@ -1918,41 +1833,35 @@ pub fn spawn(rows: &[Proc], args: &Args, prep: &Prep) -> Result<SpawnResult, Str
         pidfile_ok = ok;
         if !ok {
             let mut out = Buf::new();
-            out.push_str("psgen: cannot write pidfile: ");
-            out.push_str(&std::io::Error::from_raw_os_error(errno).to_string());
+            sys::buf_push_s(&mut out, "psgen: cannot write pidfile: ");
+            sys::push_errno(&mut out, errno);
             out.push(b'\n');
             sys::err(out.as_bytes());
         }
     }
-    // Every identity in the markers this run wrote, deduplicated. `pids` only
-    // holds rows that reported; a stub frozen or detached before its status
-    // record is in the marker and nowhere else, so a cleanup keyed on `ident`
-    // alone could not name it.
     let mut ident: Vec<(i32, u64, Vec<u8>)> = pids
         .iter()
         .map(|pid| {
             (
                 *pid,
                 live::read_starttime(*pid).unwrap_or(0),
-                live::read_comm(*pid).unwrap_or_default(),
+                live::read_comm_exact(*pid).unwrap_or_default(),
             )
         })
         .collect();
+    let my_ns = pid_ns_inode();
+    let my_boot = util::boot_id();
     for dir in &all_temps {
         for m in read_live_marker(dir).unwrap_or_default() {
             if m.pid <= 1 || ident.iter().any(|(p, _, _)| *p == m.pid) {
                 continue;
             }
-            if ns_matches(&m, pid_ns_inode()) && !boot_differs(&m, &util::boot_id()) {
+            if ns_matches(&m, my_ns) && !boot_differs(&m, &my_boot) {
                 ident.push((m.pid, m.start, Vec::new()));
             }
         }
     }
     let live_ids: Vec<(i32, u64)> = ident.iter().map(|(pid, start, _)| (*pid, *start)).collect();
-    // The stubs already appended their own lines before they exec'd. This adds
-    // the rows that reported, and never removes a stub that has not reported
-    // yet: a truncating rewrite here erased live stubs from the marker and made
-    // their staging directories prunable.
     write_live_marker(&all_temps, &live_ids, &nonce);
     Ok(SpawnResult {
         pids,
@@ -1983,6 +1892,7 @@ fn current_exe_bytes() -> Vec<u8> {
         .unwrap_or_default()
 }
 
+#[inline(never)]
 pub fn safe_temp_dir(t: &[u8]) -> bool {
     let p = Path::new(std::ffi::OsStr::from_bytes(t));
     if !p.is_absolute() {
@@ -1991,12 +1901,7 @@ pub fn safe_temp_dir(t: &[u8]) -> bool {
     // A FUSE daemon or user-controlled overlay can report any owner and file
     // type. A root run must not write into or execute from a directory whose
     // metadata it cannot trust.
-    if sys::geteuid() == 0
-        && matches!(
-            sys::path_fs_type(t),
-            Some(sys::FUSE_SUPER_MAGIC) | Some(sys::OVERLAYFS_SUPER_MAGIC)
-        )
-    {
+    if sys::geteuid() == 0 && sys::is_untrusted_fs(sys::path_fs_type(t)) {
         return false;
     }
     let meta = match std::fs::symlink_metadata(p) {
@@ -2023,19 +1928,8 @@ pub fn safe_temp_dir(t: &[u8]) -> bool {
     if meta.mode() & 0o022 != 0 {
         return false;
     }
-    let name = match p.file_name().and_then(|n| n.to_str()) {
-        Some(n) => n,
-        None => return false,
-    };
-    let rest = match name.strip_prefix(".psgen-") {
-        Some(r) => r,
-        None => return false,
-    };
-    let parts: Vec<&str> = rest.split('-').collect();
-    parts.len() == 3
-        && parts
-            .iter()
-            .all(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+    p.file_name()
+        .is_some_and(|n| staging_pid(n.as_bytes()).is_some())
 }
 
 /// How `/proc/PID/exe` identifies a stub.
@@ -2049,33 +1943,21 @@ enum ExeKind {
 }
 
 fn exe_identity(pid: i32, me: &[u8]) -> ExeKind {
-    let mut path = b"/proc/".to_vec();
-    let mut b = Buf::new();
-    b.push_u64(pid as u64);
-    path.extend_from_slice(b.as_bytes());
-    path.extend_from_slice(b"/exe");
-    let got = match sys::read_link(&path) {
+    let path = sys::proc_path(pid, "/exe");
+    let got = match sys::read_link(path.as_bytes()) {
         Some(g) => g,
         None => return ExeKind::Other(Vec::new()),
     };
     // A deleted executable is still the same file, which is what the link
     // would have said before the unlink.
-    let deleted = b" (deleted)";
-    let real = if got.len() > deleted.len() && got.ends_with(deleted) {
-        got[..got.len() - deleted.len()].to_vec()
-    } else {
-        got.clone()
-    };
+    let real = got.strip_suffix(b" (deleted)").unwrap_or(&got).to_vec();
     if real == me {
         return ExeKind::Psgen;
     }
-    // A shadow copy is `<staging dir>/psgen-stub`, and the staging directory
-    // name is checked by the same predicate `stop` uses before removing one.
-    if str::basename(&real) == b"psgen-stub" {
-        if let Some(parent) = Path::new(std::ffi::OsStr::from_bytes(&real)).parent() {
-            if safe_temp_dir(parent.as_os_str().as_bytes()) {
-                return ExeKind::Shadow;
-            }
+    // A shadow copy lives inside a staging directory owned by the caller.
+    if let Some(parent) = Path::new(std::ffi::OsStr::from_bytes(&real)).parent() {
+        if safe_temp_dir(parent.as_os_str().as_bytes()) {
+            return ExeKind::Shadow;
         }
     }
     ExeKind::Other(real)
@@ -2098,6 +1980,7 @@ enum LineIdentity {
 /// is not enough on its own: every psgen process shares the `psgen` executable,
 /// so a recycled PID with nothing but an exe match would kill whatever process
 /// now holds it.
+#[inline(never)]
 fn line_identity(pid: i32, header_nonce: &[u8], me: &[u8]) -> LineIdentity {
     if header_nonce.is_empty() {
         // A pidfile written before the header recorded a run nonce. Nothing in
@@ -2184,11 +2067,9 @@ fn resolve_exe(want: &[u8]) -> Vec<u8> {
 }
 
 fn read_cmdline_text(pid: i32) -> Vec<u8> {
-    let mut path = b"/proc/".to_vec();
-    path.extend_from_slice(pid.to_string().as_bytes());
-    path.extend_from_slice(b"/cmdline");
+    let path = sys::proc_path(pid, "/cmdline");
     let mut buf = [0u8; 8192];
-    let n = match sys::read_file(&path, &mut buf) {
+    let n = match sys::read_file(path.as_bytes(), &mut buf) {
         Some(n) => n,
         None => return Vec::new(),
     };
@@ -2214,24 +2095,16 @@ struct StopLine {
 }
 
 fn parse_stop_line(line: &[u8]) -> Option<StopLine> {
-    let fields: Vec<&[u8]> = line.splitn(3, |b| *b == b'\t').collect();
-    let pid = str::parse_i64(fields[0])?;
+    let mut it = line.splitn(3, |&b| b == b'\t');
+    let pid = str::parse_i64(it.next()?)?;
     if pid <= 0 || pid > i32::MAX as i64 {
         return None;
     }
-    let start = if fields.len() >= 2 {
-        // A second field that is present but unparseable is a malformed line,
-        // not a one-field line. Treating it as one-field used to downgrade the
-        // identity check to the executable name and kill an unrelated process.
-        Some(str::parse_u64(fields[1])?)
-    } else {
-        None
+    let start = match it.next() {
+        Some(f) => Some(str::parse_u64(f)?),
+        None => None,
     };
-    let comm = if fields.len() == 3 {
-        fields[2].to_vec()
-    } else {
-        Vec::new()
-    };
+    let comm = it.next().map(|f| f.to_vec()).unwrap_or_default();
     Some(StopLine {
         pid: pid as i32,
         start,
@@ -2249,7 +2122,7 @@ fn crlf_line(text: &[u8]) -> Option<usize> {
     let mut line = 1usize;
     for (i, b) in text.iter().enumerate() {
         if *b == b'\n' {
-            if i > 0 && text[i - 1] == b'\r' {
+            if i > 0 && text.get(i - 1) == Some(&b'\r') {
                 return Some(line);
             }
             line += 1;
@@ -2265,23 +2138,17 @@ fn crlf_line(text: &[u8]) -> Option<usize> {
 /// empty result means the variable is absent, which is the case for every
 /// process psgen did not start.
 fn read_nonce_env(pid: i32) -> Vec<u8> {
-    let mut path = b"/proc/".to_vec();
-    path.extend_from_slice(pid.to_string().as_bytes());
-    path.extend_from_slice(b"/environ");
+    let path = sys::proc_path(pid, "/environ");
     let mut buf = [0u8; 65536];
-    let n = match sys::read_file(&path, &mut buf) {
+    let n = match sys::read_file(path.as_bytes(), &mut buf) {
         Some(n) => n,
         None => return Vec::new(),
     };
     let key = stub::NONCE_ENV.as_bytes();
-    for var in buf[..n].split(|b| *b == 0) {
-        if !str::starts_with(var, key) || var.len() <= key.len() {
-            continue;
+    for var in buf.get(..n).unwrap_or(&[]).split(|b| *b == 0) {
+        if let Some(val) = var.strip_prefix(key).and_then(|r| r.strip_prefix(b"=")) {
+            return val.to_vec();
         }
-        if var[key.len()] != b'=' {
-            continue;
-        }
-        return var[key.len() + 1..].to_vec();
     }
     Vec::new()
 }
@@ -2314,6 +2181,7 @@ struct ParsedPidfile {
 ///
 /// Shared by `stop()` and `live_pidfile_rows()` so both agree on leading
 /// comments, blank lines, and header recognition.
+#[inline(never)]
 fn parse_pidfile(text: &[u8]) -> ParsedPidfile {
     let mut header_boot: Option<Vec<u8>> = None;
     let mut header_nonce: Vec<u8> = Vec::new();
@@ -2328,7 +2196,7 @@ fn parse_pidfile(text: &[u8]) -> ParsedPidfile {
         if raw.is_empty() {
             continue;
         }
-        if raw[0] == b'#' {
+        if raw.first() == Some(&b'#') {
             if !header_seen && !content_seen && is_pidfile_header(raw) {
                 header_boot = Some(crate::version::pidfile_boot_id(raw).unwrap_or_default());
                 header_nonce = crate::version::pidfile_nonce(raw);
@@ -2425,25 +2293,83 @@ fn stop_depth_of(pid: i32, lines: &[StopLine]) -> usize {
     depth
 }
 
+#[inline(never)]
+fn stop_note(quiet: bool, what: &[u8], pid: i32, why: Option<&[u8]>) {
+    if quiet {
+        return;
+    }
+    let mut out = Buf::new();
+    sys::buf_push_s(&mut out, "psgen: ");
+    sys::buf_push_b(&mut out, what);
+    out.push(b' ');
+    sys::buf_push_u(&mut out, pid as u64);
+    if let Some(w) = why {
+        sys::buf_push_s(&mut out, " (");
+        sys::buf_push_b(&mut out, w);
+        out.push(b')');
+    }
+    out.push(b'\n');
+    sys::err(out.as_bytes());
+}
+
+#[inline(never)]
+fn validate_pidfile_text(text: &[u8], is_sidecar: bool, force: bool) -> Result<ParsedPidfile, ()> {
+    if let Some(line) = crlf_line(text) {
+        let mut out = Buf::new();
+        sys::buf_push_s(
+            &mut out,
+            if is_sidecar {
+                "psgen: the recovery sidecar has CRLF line endings (line "
+            } else {
+                "psgen: the pidfile has CRLF line endings (line "
+            },
+        );
+        sys::buf_push_u(&mut out, line as u64);
+        sys::buf_push_s(
+            &mut out,
+            "); convert it to LF (for example with dos2unix) and run stop again\n",
+        );
+        sys::err(out.as_bytes());
+        return Err(());
+    }
+    let parsed = parse_pidfile(text);
+    if parsed.header_boot.is_none() && !force {
+        sys::err(if is_sidecar {
+            b"psgen: recovery sidecar is not a psgen pidfile (no '# psgen' header); use --force to stop anyway\n"
+        } else {
+            b"psgen: not a psgen pidfile (no '# psgen' header); use --force to stop anyway\n"
+        });
+        return Err(());
+    }
+    if let Some(hb) = &parsed.header_boot {
+        let cur = util::boot_id();
+        if !force && (hb.is_empty() || cur.is_empty() || *hb != cur) {
+            sys::err(if is_sidecar {
+                b"psgen: recovery sidecar is from another boot; use --force to ignore\n"
+            } else {
+                b"psgen: pidfile is from another boot; use --force to ignore\n"
+            });
+            return Err(());
+        }
+    }
+    Ok(parsed)
+}
+
 fn sort_stop_lines(lines: &mut [StopLine]) {
-    let mut keys: Vec<(usize, i32)> = lines
-        .iter()
-        .map(|l| (stop_depth_of(l.pid, lines), l.pid))
-        .collect();
-    const GAPS: [usize; 6] = [57, 23, 10, 4, 1, 0];
-    let n = lines.len();
-    for &g in &GAPS {
-        if g == 0 || g >= n {
-            continue;
-        }
-        for i in g..n {
-            let mut j = i;
-            while j >= g && keys[j - g] < keys[j] {
-                keys.swap(j - g, j);
-                lines.swap(j - g, j);
-                j -= g;
-            }
-        }
+    let mut keyed: Vec<(usize, StopLine)> = Vec::with_capacity(lines.len());
+    for l in lines.iter() {
+        keyed.push((
+            stop_depth_of(l.pid, lines),
+            StopLine {
+                pid: l.pid,
+                start: l.start,
+                comm: l.comm.clone(),
+            },
+        ));
+    }
+    crate::json::shell_sort_by(&mut keyed, |a, b| (a.0, a.1.pid) < (b.0, b.1.pid));
+    for (slot, (_, l)) in lines.iter_mut().zip(keyed) {
+        *slot = l;
     }
 }
 
@@ -2460,6 +2386,31 @@ fn sort_stop_lines(lines: &mut [StopLine]) {
 /// signals would report a second stop as having stopped the same processes
 /// again; a zombie leader's process group is still signalled, because it can
 /// hold live members. The count is of distinct PIDs, not of lines.
+#[inline(never)]
+fn stop_skip(skipped: &mut usize, quiet: bool, pid: i32, why: &[u8]) {
+    *skipped += 1;
+    stop_note(quiet, b"skip", pid, Some(why));
+}
+
+#[inline(never)]
+fn stop_fail(failed: &mut usize, quiet: bool, what: &[u8], pid: i32, why: Option<&[u8]>) {
+    *failed += 1;
+    stop_note(quiet, what, pid, why);
+}
+
+#[inline(never)]
+fn stop_out_line(quiet: bool, pre: &str, pid: i32, detail: &[u8]) {
+    if quiet {
+        return;
+    }
+    let mut out = Buf::new();
+    push_cnt(&mut out, pre, pid as u64, " (");
+    sys::buf_push_b(&mut out, detail);
+    sys::buf_push_s(&mut out, ")\n");
+    sys::out(out.as_bytes());
+}
+
+#[inline(never)]
 pub fn stop(path: &[u8], force: bool, plan: bool, quiet: bool) -> i32 {
     let text = match sys::read_file_nofollow_res(path, 1 << 20) {
         Ok(t) => t,
@@ -2469,48 +2420,22 @@ pub fn stop(path: &[u8], force: bool, plan: bool, quiet: bool) -> i32 {
             // pidfile from a permissions problem. Name both the path and the
             // errno; the exit status stays 1 for every read failure.
             let mut out = Buf::new();
-            out.push_str("psgen: cannot read pidfile ");
-            out.push_bytes(path);
-            out.push_str(": ");
-            out.push_str(&e.to_string());
+            sys::buf_push_s(&mut out, "psgen: cannot read pidfile ");
+            sys::buf_push_b(&mut out, path);
+            sys::buf_push_s(&mut out, ": ");
+            sys::push_io_err(&mut out, &e);
             out.push(b'\n');
             sys::err(out.as_bytes());
             return 1;
         }
     };
-    // A CRLF pidfile is what a Windows editor or a pipeline without `dos2unix`
-    // leaves. Every line's last field then ends with `\r`, so no row matches
-    // and the boot id does not either; the run used to report a clean success
-    // with every row still alive. Refusing names the cause instead.
-    if let Some(line) = crlf_line(&text) {
-        let mut out = Buf::new();
-        out.push_str("psgen: the pidfile has CRLF line endings (line ");
-        out.push_u64(line as u64);
-        out.push_str("); convert it to LF (for example with dos2unix) and run stop again\n");
-        sys::err(out.as_bytes());
+    let Ok(parsed) = validate_pidfile_text(&text, false, force) else {
         return 1;
-    }
-    let parsed = parse_pidfile(&text);
-    let header_boot = parsed.header_boot;
+    };
     let mut header_nonce = parsed.header_nonce;
     let mut temp_dirs = parsed.temp_dirs;
     let mut lines = parsed.lines;
     let mut malformed = parsed.malformed;
-    // A file with no psgen header is not a psgen pidfile. Failing open here
-    // signalled whatever a made-up file named, and removed whatever a `# temp`
-    // line named, which is the one check that exists to prevent exactly that.
-    // `--force` stays as the documented escape hatch.
-    if header_boot.is_none() && !force {
-        sys::err(b"psgen: not a psgen pidfile (no '# psgen' header); use --force to stop anyway\n");
-        return 1;
-    }
-    if let Some(hb) = &header_boot {
-        let cur = util::boot_id();
-        if !force && (hb.is_empty() || cur.is_empty() || *hb != cur) {
-            sys::err(b"psgen: pidfile is from another boot; use --force to ignore\n");
-            return 1;
-        }
-    }
     // If the main pidfile has no rows (for example a leftover pending header
     // after a post-spawn write failure) and `<path>.spawned` exists beside it,
     // stop the rows from that recovery sidecar too and remove it once every
@@ -2520,38 +2445,11 @@ pub fn stop(path: &[u8], force: bool, plan: bool, quiet: bool) -> i32 {
         let mut side_path = path.to_vec();
         side_path.extend_from_slice(b".spawned");
         if let Ok(side_text) = sys::read_file_nofollow_res(&side_path, 1 << 20) {
-            if let Some(line) = crlf_line(&side_text) {
-                let mut out = Buf::new();
-                out.push_str("psgen: the recovery sidecar has CRLF line endings (line ");
-                out.push_u64(line as u64);
-                out.push_str(
-                    "); convert it to LF (for example with dos2unix) and run stop again\n",
-                );
-                sys::err(out.as_bytes());
+            let Ok(side) = validate_pidfile_text(&side_text, true, force) else {
                 return 1;
-            }
-            let side = parse_pidfile(&side_text);
-            if side.header_boot.is_none() && !force {
-                sys::err(
-                    b"psgen: recovery sidecar is not a psgen pidfile (no '# psgen' header); use --force to stop anyway\n",
-                );
-                return 1;
-            }
-            if let Some(hb) = &side.header_boot {
-                let cur = util::boot_id();
-                if !force && (hb.is_empty() || cur.is_empty() || *hb != cur) {
-                    sys::err(
-                        b"psgen: recovery sidecar is from another boot; use --force to ignore\n",
-                    );
-                    return 1;
-                }
-            }
+            };
             if !quiet {
-                let mut msg = Buf::new();
-                msg.push_str("psgen: reading recovery sidecar ");
-                msg.push_bytes(&side_path);
-                msg.push(b'\n');
-                sys::err(msg.as_bytes());
+                sys::err_parts(&[b"reading recovery sidecar ", &side_path]);
             }
             header_nonce = side.header_nonce;
             temp_dirs.extend(side.temp_dirs);
@@ -2575,29 +2473,11 @@ pub fn stop(path: &[u8], force: bool, plan: bool, quiet: bool) -> i32 {
     let mut planned = 0usize;
     let mut skipped = 0usize;
     let mut failed = 0usize;
-    let note = |quiet: bool, what: &[u8], pid: i32, why: Option<&[u8]>| {
-        if quiet {
-            return;
-        }
-        let mut out = Buf::new();
-        out.push_str("psgen: ");
-        out.push_bytes(what);
-        out.push(b' ');
-        out.push_u64(pid as u64);
-        if let Some(w) = why {
-            out.push_str(" (");
-            out.push_bytes(w);
-            out.push(b')');
-        }
-        out.push(b'\n');
-        sys::err(out.as_bytes());
-    };
 
     for line in &lines {
         let pid = line.pid;
         if pid == 1 {
-            skipped += 1;
-            note(quiet, b"skip", pid, Some(b"PID 1 is never a psgen stub"));
+            stop_skip(&mut skipped, quiet, pid, b"PID 1 is never a psgen stub");
             continue;
         }
         if pid == sys::getpid() {
@@ -2608,101 +2488,85 @@ pub fn stop(path: &[u8], force: bool, plan: bool, quiet: bool) -> i32 {
         let cur_start = info.as_ref().map(|s| s.starttime);
         let cur_state = info.as_ref().map(|s| s.state).unwrap_or(0);
         if info.is_none() {
-            // Gone, or unreadable. A PID that still has a /proc entry but
-            // cannot be inspected is a failure, not a successful stop.
-            let mut procpath = Buf::new();
-            procpath.push_str("/proc/");
-            procpath.push_u64(pid as u64);
+            let procpath = sys::proc_path(pid, "");
             if Path::new(std::ffi::OsStr::from_bytes(procpath.as_bytes())).exists() {
-                failed += 1;
-                note(quiet, b"cannot read", pid, Some(b"/proc entry unreadable"));
+                stop_fail(
+                    &mut failed,
+                    quiet,
+                    b"cannot read",
+                    pid,
+                    Some(b"/proc entry unreadable"),
+                );
             } else {
-                skipped += 1;
-                note(quiet, b"skip", pid, Some(b"already gone"));
+                stop_skip(&mut skipped, quiet, pid, b"already gone");
             }
             continue;
         }
-        // Identity: three fields check starttime and comm, two check
-        // starttime, and one needs the run nonce from the header, because the
-        // only per-process field it carries is the PID.
         if line.start.is_some() {
             let identical = cur_start == line.start
-                && (line.comm.is_empty() || live::read_comm(pid).as_deref() == Some(&line.comm));
+                && (line.comm.is_empty()
+                    || live::read_comm_exact(pid).as_deref() == Some(&line.comm)
+                    || live::read_comm(pid).as_deref() == Some(&line.comm));
             if !identical {
-                skipped += 1;
-                note(quiet, b"skip", pid, Some(b"identity does not match"));
+                stop_skip(&mut skipped, quiet, pid, b"identity does not match");
                 continue;
             }
         } else {
             match line_identity(pid, &header_nonce, &me) {
                 LineIdentity::Same => {}
                 LineIdentity::Unidentifiable(why) => {
-                    // Refusing is the only safe answer: every psgen process
-                    // matches its own executable, so signalling on that alone
-                    // would hit whatever now holds a recycled PID.
-                    failed += 1;
-                    note(quiet, b"cannot identify", pid, Some(why.as_bytes()));
+                    stop_fail(
+                        &mut failed,
+                        quiet,
+                        b"cannot identify",
+                        pid,
+                        Some(why.as_bytes()),
+                    );
                     continue;
                 }
             }
         }
-        // A zombie is already dead, but its process group is not: an init that
-        // does not reap holds the leader's /proc entry while its children keep
-        // running. The group is signalled below for a leader whether it is a
-        // zombie or not, and only the signal to the body is skipped.
         let zombie = cur_state == b'Z';
         let leader = info.as_ref().map(|s| s.pgrp == pid as i64).unwrap_or(false);
         if plan {
-            // A plan is a prediction of the real stop. Check that the real
-            // signal would be permitted; otherwise `--plan` reports success
-            // for a process the caller cannot stop.
             if !zombie && !sys::kill(pid, 0) {
-                let err = sys::last_error().raw_os_error();
-                if err == Some(libc::ESRCH) {
-                    skipped += 1;
-                    note(quiet, b"skip", pid, Some(b"already gone"));
-                    continue;
+                let err = sys::errno();
+                if err == libc::ESRCH {
+                    stop_skip(&mut skipped, quiet, pid, b"already gone");
+                } else {
+                    stop_fail(
+                        &mut failed,
+                        quiet,
+                        b"cannot signal",
+                        pid,
+                        (err == libc::EPERM).then_some(b"permission denied".as_slice()),
+                    );
                 }
-                if err == Some(libc::EPERM) {
-                    failed += 1;
-                    note(quiet, b"cannot signal", pid, Some(b"permission denied"));
-                    continue;
-                }
-                failed += 1;
-                note(quiet, b"cannot signal", pid, None);
                 continue;
             }
             if zombie {
-                // The real run signals a zombie leader's group before it
-                // decides the row is dead, so the plan must say the same rather
-                // than predict a no-op the real run does not perform.
-                if leader && !sys::kill(-pid, 0) {
-                    let err = sys::last_error().raw_os_error();
-                    if err == Some(libc::EPERM) {
-                        failed += 1;
-                        note(quiet, b"cannot signal", pid, Some(b"process group"));
-                        continue;
-                    }
+                if leader && !sys::kill(-pid, 0) && sys::errno() == libc::EPERM {
+                    stop_fail(
+                        &mut failed,
+                        quiet,
+                        b"cannot signal",
+                        pid,
+                        Some(b"process group"),
+                    );
+                    continue;
                 }
-                if !quiet {
-                    let mut out = Buf::new();
-                    out.push_str("would skip ");
-                    out.push_u64(pid as u64);
-                    out.push_str(" (already a zombie; its process group is signalled first)\n");
-                    sys::out(out.as_bytes());
-                }
+                stop_out_line(
+                    quiet,
+                    "would skip ",
+                    pid,
+                    b"already a zombie; its process group is signalled first",
+                );
                 skipped += 1;
                 continue;
             }
             if !quiet {
                 let comm = live::read_comm(pid).unwrap_or_default();
-                let mut out = Buf::new();
-                out.push_str("would signal ");
-                out.push_u64(pid as u64);
-                out.push_str(" (");
-                out.push_bytes(&comm);
-                out.push_str(")\n");
-                sys::out(out.as_bytes());
+                stop_out_line(false, "would signal ", pid, &comm);
             }
             if !named.contains(&pid) {
                 named.push(pid);
@@ -2710,61 +2574,37 @@ pub fn stop(path: &[u8], force: bool, plan: bool, quiet: bool) -> i32 {
             }
             continue;
         }
-        let pfd = sys::pidfd_open(pid);
-        // Re-verify identity after opening the pidfd (or right before kill if
-        // pidfd_open is unavailable) so a PID recycled between the first
-        // `/proc` read and the signal is not hit.
+        let pfd = CloseFd(sys::pidfd_open(pid));
         let post = live::read_stat(pid);
         if post.as_ref().map(|s| s.starttime) != cur_start {
-            if pfd >= 0 {
-                sys::close(pfd);
-            }
-            skipped += 1;
-            note(quiet, b"skip", pid, Some(b"already gone"));
+            stop_skip(&mut skipped, quiet, pid, b"already gone");
             continue;
         }
-        // A leader's PID is its PGID, so its group kill reaches children that
-        // never wrote a status record. For a non-leader the group signal would
-        // address a stale group, so signal the process itself.
         let leader = post.as_ref().map(|s| s.pgrp == pid as i64).unwrap_or(false);
         let mut delivered = false;
         if leader {
-            // The group signal comes before the zombie check on purpose: a
-            // zombie leader whose init does not reap it still heads a group
-            // with live members, and `kill(-pid)` is the only signal that
-            // reaches them.
             if sys::kill(-pid, sys::SIGKILL) {
                 delivered = true;
-            } else if sys::last_error().raw_os_error() != Some(libc::ESRCH) {
-                if pfd >= 0 {
-                    sys::close(pfd);
-                }
-                failed += 1;
-                note(quiet, b"cannot signal", pid, Some(b"process group"));
+            } else if sys::errno() != libc::ESRCH {
+                stop_fail(
+                    &mut failed,
+                    quiet,
+                    b"cannot signal",
+                    pid,
+                    Some(b"process group"),
+                );
                 continue;
             }
         }
         if zombie {
-            // Already dead. Its /proc entry outlives it while an init that does
-            // not reap holds it, and a signal to the body is a no-op; a group
-            // signal above has already been delivered. The row is not counted
-            // as stopped: its own death is not this call's doing.
-            if pfd >= 0 {
-                sys::close(pfd);
-            }
-            skipped += 1;
-            note(quiet, b"skip", pid, Some(b"already a zombie"));
+            stop_skip(&mut skipped, quiet, pid, b"already a zombie");
             continue;
         }
         if !delivered {
-            if pfd >= 0 {
-                // The pidfd pins the process, so the signal cannot land on a
-                // reused PID.
-                delivered = sys::pidfd_send_signal(pfd, sys::SIGKILL);
-                if !delivered && sys::last_error().raw_os_error() == Some(libc::ESRCH) {
-                    sys::close(pfd);
-                    skipped += 1;
-                    note(quiet, b"skip", pid, Some(b"already gone"));
+            if pfd.0 >= 0 {
+                delivered = sys::pidfd_send_signal(pfd.0, sys::SIGKILL);
+                if !delivered && sys::errno() == libc::ESRCH {
+                    stop_skip(&mut skipped, quiet, pid, b"already gone");
                     continue;
                 }
             }
@@ -2772,17 +2612,12 @@ pub fn stop(path: &[u8], force: bool, plan: bool, quiet: bool) -> i32 {
                 delivered = sys::kill(pid, sys::SIGKILL);
             }
         }
-        if pfd >= 0 {
-            sys::close(pfd);
-        }
         if delivered {
             signalled.push((pid, cur_start.unwrap_or(0)));
-        } else if sys::last_error().raw_os_error() == Some(libc::ESRCH) {
-            skipped += 1;
-            note(quiet, b"skip", pid, Some(b"already gone"));
+        } else if sys::errno() == libc::ESRCH {
+            stop_skip(&mut skipped, quiet, pid, b"already gone");
         } else {
-            failed += 1;
-            note(quiet, b"cannot signal", pid, None);
+            stop_fail(&mut failed, quiet, b"cannot signal", pid, None);
         }
     }
 
@@ -2798,12 +2633,12 @@ pub fn stop(path: &[u8], force: bool, plan: bool, quiet: bool) -> i32 {
         // gone or a zombie, so "stopped N" is true when it is printed.
         let deadline = sys::monotonic_ns().saturating_add(2_000_000_000);
         loop {
-            let mut left = 0usize;
-            for (pid, start) in &signalled {
-                if live::read_starttime(*pid) == Some(*start) && live::alive(*pid) {
-                    left += 1;
-                }
-            }
+            let left = signalled
+                .iter()
+                .filter(|(pid, start)| {
+                    live::read_starttime(*pid) == Some(*start) && live::alive(*pid)
+                })
+                .count();
             if left == 0 || sys::monotonic_ns() >= deadline {
                 break;
             }
@@ -2812,7 +2647,7 @@ pub fn stop(path: &[u8], force: bool, plan: bool, quiet: bool) -> i32 {
         for (pid, start) in &signalled {
             if live::read_starttime(*pid) == Some(*start) && live::alive(*pid) {
                 failed += 1;
-                note(
+                stop_note(
                     quiet,
                     b"still running",
                     *pid,
@@ -2825,12 +2660,11 @@ pub fn stop(path: &[u8], force: bool, plan: bool, quiet: bool) -> i32 {
     }
 
     if failed == 0 && !plan {
-        for t in &temp_dirs {
-            let p = Path::new(std::ffi::OsStr::from_bytes(t));
-            if !staging_busy(p) && safe_temp_dir(t) {
-                let _ = sys::remove_staging_dir(p);
-            }
-        }
+        let paths: Vec<std::path::PathBuf> = temp_dirs
+            .iter()
+            .map(|t| std::path::PathBuf::from(std::ffi::OsStr::from_bytes(t)))
+            .collect();
+        cleanup_unbusy_temps(&paths);
         if let Some(side) = &used_sidecar {
             let _ = std::fs::remove_file(Path::new(std::ffi::OsStr::from_bytes(side)));
         }
@@ -2838,35 +2672,28 @@ pub fn stop(path: &[u8], force: bool, plan: bool, quiet: bool) -> i32 {
     // The noun matters: an older message said "processes" while counting
     // pidfile lines, so one process named five times read as five.
     let mut out = Buf::new();
-    if plan {
-        out.push_str("would stop ");
-        out.push_u64(planned as u64);
-    } else {
-        out.push_str("stopped ");
-        out.push_u64(stopped as u64);
-    }
-    out.push_str(if (if plan { planned } else { stopped }) == 1 {
-        " process"
-    } else {
-        " processes"
-    });
+    let count = if plan { planned } else { stopped };
+    push_cnt(
+        &mut out,
+        if plan { "would stop " } else { "stopped " },
+        count as u64,
+        if count == 1 { " process" } else { " processes" },
+    );
     let missed = skipped + malformed;
     if missed > 0 {
-        out.push_str(", skipped ");
-        out.push_u64(missed as u64);
-        out.push_str(if missed == 1 { " line" } else { " lines" });
+        push_cnt(
+            &mut out,
+            ", skipped ",
+            missed as u64,
+            if missed == 1 { " line" } else { " lines" },
+        );
     }
     if failed > 0 {
-        out.push_str(", failed ");
-        out.push_u64(failed as u64);
+        push_cnt(&mut out, ", failed ", failed as u64, "");
     }
     out.push(b'\n');
     sys::out(out.as_bytes());
-    if failed > 0 {
-        1
-    } else {
-        0
-    }
+    i32::from(failed > 0)
 }
 
 /// Tree node specification for spawning matched decoy processes.
@@ -2887,15 +2714,24 @@ pub struct DecoyNodeSpec {
     pub vsz_kb: u32,
     pub vm_lck_kb: u32,
     pub rss_shmem_kb: u32,
+    pub rss_file_kb: u32,
     pub environ: Vec<Vec<u8>>,
+    pub env_nul_len: u32,
     pub thread_comms: Vec<Vec<u8>>,
+    pub thread_wchans: Vec<u8>,
     pub fd_specs: Vec<(i32, Vec<u8>)>,
+    pub map_files: Vec<Vec<u8>>,
     pub wchan_mode: u8,
     pub non_dumpable: bool,
     pub no_new_privs: bool,
     pub seccomp_filters: u8,
     pub ptrace_children: bool,
+    pub session_leader: bool,
+    pub has_tty: bool,
     pub decoy_token: Vec<u8>,
+    pub token_placements_mask: u8,
+    pub execfn_mode: u8,
+    pub execfn_fd: i32,
     pub jitter_ms: u32,
     pub children: Vec<DecoyNodeSpec>,
 }
@@ -2913,6 +2749,9 @@ pub struct DecoySpawnOpts {
     pub quiet: bool,
     pub wait: bool,
     pub bind_exe: bool,
+    pub same_session: bool,
+    pub label_decoys: usize,
+    pub interleave_cmd: Option<String>,
 }
 
 impl Default for DecoySpawnOpts {
@@ -2927,27 +2766,23 @@ impl Default for DecoySpawnOpts {
             quiet: true,
             wait: false,
             bind_exe: false,
+            same_session: false,
+            label_decoys: 0,
+            interleave_cmd: None,
         }
     }
 }
 
 /// Parse a symbolic `--wchan` mode name into the numeric `stub::Config::wchan_mode`.
 pub fn parse_wchan_mode(name: &str) -> Option<u8> {
-    if name.eq_ignore_ascii_case("pause") {
-        Some(0)
-    } else if name.eq_ignore_ascii_case("epoll") || name.eq_ignore_ascii_case("epoll_wait") {
-        Some(1)
-    } else if name.eq_ignore_ascii_case("poll") {
-        Some(2)
-    } else if name.eq_ignore_ascii_case("nanosleep") || name.eq_ignore_ascii_case("sleep") {
-        Some(3)
-    } else if name.eq_ignore_ascii_case("futex") {
-        Some(4)
-    } else if name.eq_ignore_ascii_case("read") || name.eq_ignore_ascii_case("pipe_read") {
-        Some(5)
-    } else {
-        None
+    const TABLE: &str =
+        "pause|epoll,epoll_wait|poll|nanosleep,sleep|futex|read,pipe_read|wait4,wait,do_wait";
+    for (mode, group) in TABLE.split('|').enumerate() {
+        if group.split(',').any(|k| name.eq_ignore_ascii_case(k)) {
+            return Some(mode as u8);
+        }
     }
+    None
 }
 
 fn contains_ascii_ci(hay: &str, needle: &str) -> bool {
@@ -2959,32 +2794,37 @@ fn contains_ascii_ci(hay: &str, needle: &str) -> bool {
     h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
 }
 
-fn wchan_mode_from_profile(wchan: &str, syscall: &str) -> u8 {
-    if contains_ascii_ci(wchan, "ep_poll")
-        || contains_ascii_ci(wchan, "epoll")
-        || contains_ascii_ci(syscall, "epoll")
-    {
-        1
-    } else if contains_ascii_ci(wchan, "poll")
-        || syscall.eq_ignore_ascii_case("poll")
-        || syscall.eq_ignore_ascii_case("ppoll")
-        || contains_ascii_ci(syscall, "select")
-    {
-        2
-    } else if contains_ascii_ci(wchan, "nanosleep")
-        || contains_ascii_ci(wchan, "hrtimer")
-        || contains_ascii_ci(syscall, "nanosleep")
-    {
-        3
-    } else if contains_ascii_ci(wchan, "futex") || contains_ascii_ci(syscall, "futex") {
-        4
-    } else if contains_ascii_ci(wchan, "pipe_read") || syscall.eq_ignore_ascii_case("read") {
-        5
-    } else {
-        0
-    }
+fn any_ci(hay: &str, csv: &str) -> bool {
+    !csv.is_empty() && csv.split(',').any(|p| contains_ascii_ci(hay, p))
 }
 
+#[inline(never)]
+fn wchan_mode_from_profile(wchan: &str, syscall: &str) -> u8 {
+    const RULES: &str = "\
+6|do_wait|wait4,waitid|\n\
+1|ep_poll,epoll|epoll|\n\
+2|poll|select|poll,ppoll\n\
+3|nanosleep,hrtimer|nanosleep|\n\
+4|futex|futex|\n\
+5|pipe_read||read";
+    for line in RULES.lines() {
+        let mut p = line.split('|');
+        let (Some(m), Some(wc_sub), Some(sc_sub), Some(sc_eq)) =
+            (p.next(), p.next(), p.next(), p.next())
+        else {
+            continue;
+        };
+        if any_ci(wchan, wc_sub)
+            || any_ci(syscall, sc_sub)
+            || (!sc_eq.is_empty() && sc_eq.split(',').any(|k| syscall.eq_ignore_ascii_case(k)))
+        {
+            return m.as_bytes().first().map_or(0, |b| b - b'0');
+        }
+    }
+    0
+}
+
+#[inline(never)]
 fn clamp_no_nul(src: &[u8], cap: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(src.len().min(cap));
     for &b in src {
@@ -2999,6 +2839,7 @@ fn clamp_no_nul(src: &[u8], cap: usize) -> Vec<u8> {
     out
 }
 
+#[inline(never)]
 fn push_nul_bounded(buf: &mut Vec<u8>, entry: &[u8], cap: usize) -> bool {
     let clean_len = entry.iter().filter(|&&b| b != 0).count();
     if buf.len().saturating_add(clean_len).saturating_add(1) > cap {
@@ -3043,36 +2884,49 @@ fn serialize_cmd(argv: &[Vec<u8>], comm: &[u8], raw_nuls: Option<usize>) -> Vec<
     out
 }
 
-fn serialize_env_block(env: &[Vec<u8>]) -> Vec<u8> {
-    const CAP: usize = 65536;
+#[inline(never)]
+fn serialize_nul_items(items: &[Vec<u8>], limit: usize, cap: usize, mode: u8) -> Vec<u8> {
     let mut out = Vec::new();
-    for item in env {
-        if item.starts_with(b"PSGEN_NONCE=") {
-            continue;
-        }
-        if item.is_empty() {
-            continue;
-        }
-        if !push_nul_bounded(&mut out, item, CAP) {
+    for item in items.iter().take(limit) {
+        let owned;
+        let slice: &[u8] = match mode {
+            0 => {
+                if item.is_empty() || item.starts_with(b"PSGEN_NONCE=") {
+                    continue;
+                }
+                item
+            }
+            1 => {
+                owned = clamp_no_nul(item, 15);
+                if owned.is_empty() {
+                    continue;
+                }
+                &owned
+            }
+            _ => {
+                if item.first() != Some(&b'/') {
+                    continue;
+                }
+                item
+            }
+        };
+        if !push_nul_bounded(&mut out, slice, cap) {
             break;
         }
     }
     out
 }
 
+fn serialize_env_block(env: &[Vec<u8>]) -> Vec<u8> {
+    serialize_nul_items(env, usize::MAX, 65536, 0)
+}
+
 fn serialize_thread_comms(comms: &[Vec<u8>]) -> Vec<u8> {
-    const CAP: usize = 4096;
-    let mut out = Vec::new();
-    for comm in comms.iter().take(64) {
-        let trimmed = clamp_no_nul(comm, 15);
-        if trimmed.is_empty() {
-            continue;
-        }
-        if !push_nul_bounded(&mut out, &trimmed, CAP) {
-            break;
-        }
-    }
-    out
+    serialize_nul_items(comms, 64, 4096, 1)
+}
+
+fn serialize_map_files(files: &[Vec<u8>]) -> Vec<u8> {
+    serialize_nul_items(files, 32, 16384, 2)
 }
 
 fn serialize_fd_specs(specs: &[(i32, Vec<u8>)]) -> Vec<u8> {
@@ -3084,9 +2938,9 @@ fn serialize_fd_specs(specs: &[(i32, Vec<u8>)]) -> Vec<u8> {
             continue;
         }
         line.v.clear();
-        line.push_u64(*fd as u64);
+        sys::buf_push_u(&mut line, *fd as u64);
         line.push(b':');
-        line.push_bytes(kind);
+        sys::buf_push_b(&mut line, kind);
         if !push_nul_bounded(&mut out, line.as_bytes(), CAP) {
             break;
         }
@@ -3094,55 +2948,319 @@ fn serialize_fd_specs(specs: &[(i32, Vec<u8>)]) -> Vec<u8> {
     out
 }
 
-fn profile_tree_has_token(p: &crate::profile::Profile) -> bool {
-    p.memory.token_present || p.children.iter().any(profile_tree_has_token)
-}
-
-fn map_profile_fd_kind(fd: i32, target: &str) -> Option<Vec<u8>> {
+#[inline(never)]
+fn map_profile_fd_kind(
+    fd: i32,
+    target: &str,
+    shared_groups: &mut Vec<(String, usize)>,
+) -> Option<(Vec<u8>, bool)> {
     if !(0..=1024).contains(&fd) {
         return None;
     }
+    if target.starts_with("/dev/pts/") {
+        return Some((Vec::new(), true));
+    }
     if target == "/dev/null" {
-        Some(b"null".to_vec())
-    } else if target.starts_with("pipe:") {
-        Some(b"pipe".to_vec())
-    } else if target.starts_with("socket:") {
-        Some(b"socket".to_vec())
-    } else if target.contains("eventfd") {
-        Some(b"eventfd".to_vec())
-    } else if let Some(rest) = target.strip_prefix("/memfd:") {
+        return Some((b"null".to_vec(), false));
+    }
+    for prefix in "pipe:|socket:".split('|') {
+        if target.starts_with(prefix) {
+            let grp = intern_shared_group(shared_groups, target);
+            let mut b = Buf::new();
+            sys::buf_push_s(&mut b, prefix);
+            sys::buf_push_u(&mut b, grp as u64);
+            return Some((b.v, false));
+        }
+    }
+    for pair in "eventpoll:epoll|timerfd:timerfd|signalfd:signalfd|eventfd:eventfd".split('|') {
+        if let Some((needle, kind)) = pair.split_once(':') {
+            if target.contains(needle) {
+                return Some((kind.as_bytes().to_vec(), false));
+            }
+        }
+    }
+    if let Some(rest) = target.strip_prefix("/memfd:") {
         let lbl = rest.strip_suffix(" (deleted)").unwrap_or(rest);
         let clean = clamp_no_nul(lbl.as_bytes(), 64);
         let mut kind = b"memfd:".to_vec();
-        if clean.is_empty() {
-            kind.extend_from_slice(b"anon");
-        } else {
-            kind.extend_from_slice(&clean);
-        }
-        Some(kind)
-    } else if fd <= 2 {
-        Some(b"null".to_vec())
-    } else {
-        None
+        kind.extend_from_slice(if clean.is_empty() { b"anon" } else { &clean });
+        return Some((kind, false));
     }
+    if target.starts_with('/')
+        && !"/dev/|/proc/|/sys/"
+            .split('|')
+            .any(|p| target.starts_with(p))
+        && !target.ends_with(" (deleted)")
+    {
+        let grp = intern_shared_group(shared_groups, target);
+        let mut b = Buf::new();
+        sys::buf_push_s(&mut b, "file:");
+        sys::buf_push_u(&mut b, grp as u64);
+        b.push(b':');
+        sys::buf_push_b(&mut b, &clamp_no_nul(target.as_bytes(), 256));
+        return Some((b.v, false));
+    }
+    (fd <= 2).then(|| (b"null".to_vec(), false))
+}
+
+fn intern_shared_group(groups: &mut Vec<(String, usize)>, key: &str) -> usize {
+    if let Some((_, id)) = groups.iter().find(|(k, _)| k == key) {
+        return *id;
+    }
+    let id = groups.len();
+    groups.push((String::from(key), id));
+    id
+}
+
+fn extract_profile_map_files(maps: &[String], exe: &str) -> Vec<Vec<u8>> {
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    for line in maps {
+        let Some(slash) = line.find('/') else {
+            continue;
+        };
+        let path = line[slash..].trim_end();
+        if path.is_empty()
+            || path == exe
+            || "/dev/|/proc/|/sys/|/memfd:"
+                .split('|')
+                .any(|p| path.starts_with(p))
+            || path.ends_with(" (deleted)")
+        {
+            continue;
+        }
+        let pb = clamp_no_nul(path.as_bytes(), 512);
+        if pb.is_empty() || out.iter().any(|x| x == &pb) {
+            continue;
+        }
+        out.push(pb);
+        if out.len() >= 32 {
+            break;
+        }
+    }
+    out
+}
+
+fn parse_execfn_mode(at_execfn: Option<&str>) -> (u8, i32) {
+    let Some(v) = at_execfn else {
+        return (stub::EXECFN_PATH, -1);
+    };
+    if v.is_empty() {
+        return (stub::EXECFN_EMPTY, -1);
+    }
+    let rest = v
+        .strip_prefix("/dev/fd/")
+        .or_else(|| v.strip_prefix("/proc/self/fd/"));
+    if let Some(num) = rest {
+        if let Some(fd) = str::parse_u64(num.as_bytes()) {
+            if fd <= 1024 {
+                return (stub::EXECFN_DEVFD, fd as i32);
+            }
+        }
+    }
+    (stub::EXECFN_PATH, -1)
+}
+
+fn token_placements_to_mask(placements: &[String]) -> u8 {
+    let mut mask = 0u8;
+    for p in placements {
+        if p == "anon" {
+            mask |= stub::TOK_PLACE_ANON;
+        } else if p == "heap" {
+            mask |= stub::TOK_PLACE_HEAP;
+        } else if p == "stack" {
+            mask |= stub::TOK_PLACE_STACK;
+        }
+    }
+    mask
+}
+
+/// Generate a deterministic decoy token matching optional target length and
+/// `ProfileMemory::token_charset`, honoring an optional `--decoy-token` prefix
+/// when length allows, and guaranteed never to hash to `avoid_sha256`.
+#[inline(never)]
+pub fn make_shaped_decoy_token(
+    prefix_override: Option<&str>,
+    len: Option<u32>,
+    charset: Option<&str>,
+    avoid_sha256: Option<&str>,
+    rng: &mut crate::rng::Rng,
+) -> Vec<u8> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    const ALNUM: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let (charset_pfx, kind) = match charset {
+        Some(cs) if cs.starts_with("prefix:") => {
+            let rest = &cs["prefix:".len()..];
+            match rest.rfind(':') {
+                Some(idx) => (Some(&rest[..idx]), &rest[idx + 1..]),
+                None => (None, "hex"),
+            }
+        }
+        Some(cs) => (None, cs),
+        None => (None, "hex"),
+    };
+    let target_len = match len {
+        Some(l) if l > 0 => (l as usize).min(4096),
+        _ => {
+            let base = prefix_override.map(|s| s.len()).unwrap_or(0);
+            if base < 32 {
+                32
+            } else {
+                base + 16
+            }
+        }
+    };
+    let ov_ok = prefix_override.filter(|ov| !ov.is_empty() && ov.len() + 4 <= target_len);
+    let effective_pfx: &[u8] = match (charset_pfx, ov_ok) {
+        (Some(_), Some(ov)) => ov.as_bytes(),
+        (Some(cp), None) if cp.len() < target_len => cp.as_bytes(),
+        (None, Some(ov)) if charset.is_none() => ov.as_bytes(),
+        _ => b"",
+    };
+    let alpha: &[u8] = match kind {
+        "alnum" | "ascii" => ALNUM,
+        "base64" => B64,
+        _ => HEX,
+    };
+    let mut out = vec![0u8; target_len];
+    let pfx_len = effective_pfx.len().min(target_len);
+    for _ in 0..8 {
+        if let (Some(dst), Some(src)) = (out.get_mut(..pfx_len), effective_pfx.get(..pfx_len)) {
+            dst.copy_from_slice(src);
+        }
+        if let Some(tail) = out.get_mut(pfx_len..) {
+            for slot in tail {
+                let idx = rng.below(alpha.len() as u64) as usize;
+                *slot = alpha.get(idx).copied().unwrap_or(b'0');
+            }
+        }
+        if let Some(avoid) = avoid_sha256 {
+            if crate::sha256::hash_hex(&out) == avoid {
+                continue;
+            }
+        }
+        break;
+    }
+    out
+}
+
+#[inline(never)]
+fn fill_redacted_string(
+    raw: &str,
+    default_tok: &str,
+    charset: Option<&str>,
+    avoid_sha256: Option<&str>,
+    rng: &mut crate::rng::Rng,
+) -> Vec<u8> {
+    if !raw.contains("<REDACTED") {
+        return raw.as_bytes().to_vec();
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(pos) = rest.find("<REDACTED") {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + "<REDACTED".len()..];
+        if let Some(after_len) = after.strip_prefix(":len=") {
+            if let Some(close) = after_len.find('>') {
+                let num_s = &after_len[..close];
+                if let Some(want) = str::parse_u64(num_s.as_bytes()) {
+                    let n = (want as usize).min(4096);
+                    let tok = if n == default_tok.len() {
+                        String::from(default_tok)
+                    } else {
+                        let bytes = make_shaped_decoy_token(
+                            None,
+                            Some(n as u32),
+                            charset,
+                            avoid_sha256,
+                            rng,
+                        );
+                        String::from_utf8_lossy(&bytes).into_owned()
+                    };
+                    out.push_str(&tok);
+                    rest = &after_len[close + 1..];
+                    continue;
+                }
+            }
+        }
+        if let Some(after_close) = after.strip_prefix('>') {
+            out.push_str(default_tok);
+            rest = after_close;
+            continue;
+        }
+        out.push_str("<REDACTED");
+        rest = after;
+    }
+    out.push_str(rest);
+    out.into_bytes()
 }
 
 /// Convert a captured or parsed `Profile` tree into a `DecoyNodeSpec` tree at
-/// the requested fidelity `level` (1..=6).
+/// the requested fidelity `level` (1..=6). Walks upward through captured
+/// `parent`/`tracer` ancestors so the decoy tree preserves real parent-child
+/// and supervisor-tracer topology instead of flattening to `PPid=1`.
 pub fn profile_to_decoy_tree(
     p: &crate::profile::Profile,
     level: u8,
     decoy_token: Option<&[u8]>,
     jitter_ms: u32,
 ) -> DecoyNodeSpec {
-    profile_to_decoy_inner(
-        p,
-        level,
-        decoy_token,
-        jitter_ms,
-        true,
-        profile_tree_has_token(p),
-    )
+    let mut chain: Vec<(&crate::profile::Profile, bool)> = Vec::new();
+    let mut cur = p;
+    let mut is_tracer_link = false;
+    for _ in 0..16 {
+        chain.push((cur, is_tracer_link));
+        if let Some(parent) = cur.parent.as_deref() {
+            is_tracer_link = cur.status.tracer_pid != 0
+                && (cur.status.tracer_pid == parent.identity.pid || cur.tracer.is_none());
+            cur = parent;
+        } else if let Some(tracer) = cur.tracer.as_deref() {
+            is_tracer_link = true;
+            cur = tracer;
+        } else {
+            break;
+        }
+    }
+    if chain.len() == 1 {
+        return profile_to_decoy_inner(p, level, decoy_token, jitter_ms, true);
+    }
+    let self_spec = profile_to_decoy_inner(p, level, decoy_token, 0, false);
+    let mut wrapped = self_spec;
+    let mut child_pid = p.identity.pid;
+    let mut child_tracer = p.status.tracer_pid;
+    let mut prev_was_tracer_link = chain.first().is_some_and(|c| c.1);
+    for (idx, &(anc, next_tracer_link)) in chain.iter().enumerate().skip(1) {
+        let is_top = idx + 1 == chain.len();
+        let mut anc_spec =
+            profile_to_decoy_inner(anc, level, None, if is_top { jitter_ms } else { 0 }, is_top);
+        let traced_by_anc =
+            prev_was_tracer_link || (child_tracer != 0 && child_tracer == anc.identity.pid);
+        if traced_by_anc {
+            anc_spec.ptrace_children = true;
+        }
+        if anc_spec.wchan_mode == 0 || contains_ascii_ci(&anc.syscall.wchan, "wait") {
+            anc_spec.wchan_mode = stub::WCHAN_WAIT4;
+        }
+        // Avoid duplicating child if ancestor.children already contained it.
+        if let Some(pos) = anc
+            .children
+            .iter()
+            .position(|c| c.identity.pid == child_pid)
+        {
+            if let Some(slot) = anc_spec.children.get_mut(pos) {
+                *slot = wrapped;
+            } else {
+                anc_spec.children.push(wrapped);
+            }
+        } else {
+            anc_spec.children.push(wrapped);
+        }
+        wrapped = anc_spec;
+        child_pid = anc.identity.pid;
+        child_tracer = anc.status.tracer_pid;
+        prev_was_tracer_link = next_tracer_link;
+    }
+    wrapped
 }
 
 fn profile_to_decoy_inner(
@@ -3151,7 +3269,6 @@ fn profile_to_decoy_inner(
     decoy_token: Option<&[u8]>,
     jitter_ms: u32,
     is_root: bool,
-    tree_has_tok: bool,
 ) -> DecoyNodeSpec {
     let raw_comm = if !p.identity.comm.is_empty() {
         p.identity.comm.as_bytes()
@@ -3161,9 +3278,44 @@ fn profile_to_decoy_inner(
         b"worker"
     };
     let comm = clamp_no_nul(raw_comm, 15);
+    let tok_seed = (p.identity.pid as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ (p.identity.starttime.rotate_left(13))
+        ^ decoy_token
+            .map(|t| t.iter().fold(0u64, |a, &b| a.wrapping_mul(31) ^ b as u64))
+            .unwrap_or(0x55aa);
+    let mut tok_rng = crate::rng::Rng::new(tok_seed);
+    let effective_tok_bytes: Vec<u8> = match decoy_token {
+        Some(t) if !t.is_empty() => match p.memory.token_len {
+            Some(want_len) if t.len() != want_len as usize => make_shaped_decoy_token(
+                core::str::from_utf8(t).ok(),
+                Some(want_len),
+                p.memory.token_charset.as_deref(),
+                p.memory.token_sha256.as_deref(),
+                &mut tok_rng,
+            ),
+            _ => t[..t.len().min(4096)].to_vec(),
+        },
+        None if p.memory.token_present
+            || p.identity.argv.iter().any(|a| a.contains("<REDACTED"))
+            || p.environ.iter().any(|e| e.contains("<REDACTED")) =>
+        {
+            make_shaped_decoy_token(
+                None,
+                p.memory.token_len,
+                p.memory.token_charset.as_deref(),
+                p.memory.token_sha256.as_deref(),
+                &mut tok_rng,
+            )
+        }
+        _ => Vec::new(),
+    };
+    let tok_str = String::from_utf8_lossy(&effective_tok_bytes).into_owned();
+    let cs = p.memory.token_charset.as_deref();
+    let avoid = p.memory.token_sha256.as_deref();
+
     let mut argv: Vec<Vec<u8>> = Vec::with_capacity(p.identity.argv.len().max(1));
     for a in &p.identity.argv {
-        argv.push(a.as_bytes().to_vec());
+        argv.push(fill_redacted_string(a, &tok_str, cs, avoid, &mut tok_rng));
     }
     if argv.is_empty() {
         argv.push(comm.clone());
@@ -3177,6 +3329,10 @@ fn profile_to_decoy_inner(
                 Vec::new()
             }
         });
+    let self_sid = sys::getsid(0);
+    let session_leader = p.identity.sid > 0
+        && (p.identity.sid == p.identity.pid
+            || (is_root && self_sid > 0 && p.identity.sid != self_sid));
 
     let mut spec = DecoyNodeSpec {
         comm: comm.clone(),
@@ -3187,13 +3343,23 @@ fn profile_to_decoy_inner(
         user,
         rss_kb: 0,
         vsz_kb: 0,
+        session_leader,
         jitter_ms: if is_root { jitter_ms } else { 0 },
         ..DecoyNodeSpec::default()
     };
 
+    let default_wc = if level >= 3 {
+        wchan_mode_from_profile(&p.syscall.wchan, &p.syscall.syscall)
+    } else {
+        0
+    };
+    let worker_wc = if default_wc == stub::WCHAN_WAIT4 {
+        4
+    } else {
+        default_wc
+    };
+
     if level >= 3 {
-        // Exclude the main thread (tid == pid) so the spawned extra threads
-        // plus main thread yield the exact thread count N (not N+1).
         let mut extras: Vec<Vec<u8>> = Vec::new();
         let has_main = p.task.iter().any(|t| t.tid == p.identity.pid);
         for (i, t) in p.task.iter().enumerate() {
@@ -3212,18 +3378,13 @@ fn profile_to_decoy_inner(
                 extras.resize((total_threads - 1).min(64) as usize, comm.clone());
             }
         }
+        spec.thread_wchans = vec![worker_wc; extras.len()];
         spec.thread_comms = extras;
 
         spec.children.reserve(p.children.len());
         for c in &p.children {
-            spec.children.push(profile_to_decoy_inner(
-                c,
-                level,
-                decoy_token,
-                0,
-                false,
-                tree_has_tok,
-            ));
+            spec.children
+                .push(profile_to_decoy_inner(c, level, decoy_token, 0, false));
         }
     }
 
@@ -3241,6 +3402,9 @@ fn profile_to_decoy_inner(
         } else if p.identity.exe.starts_with('/') && p.identity.exe != "<redacted>" {
             spec.exe = clamp_no_nul(p.identity.exe.as_bytes(), 4096);
         }
+        let (ef_mode, ef_fd) = parse_execfn_mode(p.auxv.at_execfn.as_deref());
+        spec.execfn_mode = ef_mode;
+        spec.execfn_fd = ef_fd;
 
         if p.identity.cwd.starts_with('/') && p.identity.cwd != "<redacted>" {
             spec.cwd = clamp_no_nul(p.identity.cwd.as_bytes(), 4096);
@@ -3248,40 +3412,71 @@ fn profile_to_decoy_inner(
 
         for e in &p.environ {
             if !e.starts_with("PSGEN_NONCE=") {
-                spec.environ.push(e.as_bytes().to_vec());
+                spec.environ
+                    .push(fill_redacted_string(e, &tok_str, cs, avoid, &mut tok_rng));
             }
         }
+        if spec.environ.is_empty()
+            && (p.environ_all_nul || p.environ_raw_len > 0 || p.stat.env_end > p.stat.env_start)
+        {
+            let span = if p.environ_raw_len > 0 {
+                p.environ_raw_len
+            } else {
+                p.stat.env_end.saturating_sub(p.stat.env_start)
+            };
+            spec.env_nul_len = span.clamp(1, 65_536) as u32;
+        }
 
+        let mut shared_groups: Vec<(String, usize)> = Vec::new();
         for fd_entry in &p.fds {
-            if let Some(kind) = map_profile_fd_kind(fd_entry.fd, &fd_entry.target) {
-                spec.fd_specs.push((fd_entry.fd, kind));
+            if let Some((kind, is_tty)) =
+                map_profile_fd_kind(fd_entry.fd, &fd_entry.target, &mut shared_groups)
+            {
+                if is_tty {
+                    spec.has_tty = true;
+                } else if !kind.is_empty() {
+                    spec.fd_specs.push((fd_entry.fd, kind));
+                }
             }
         }
 
-        spec.wchan_mode = wchan_mode_from_profile(&p.syscall.wchan, &p.syscall.syscall);
+        spec.map_files = extract_profile_map_files(&p.memory.maps, &p.identity.exe);
+        spec.wchan_mode = if !spec.children.is_empty() && default_wc == 0 {
+            stub::WCHAN_WAIT4
+        } else {
+            default_wc
+        };
+        // Strictly match target dumpable, NoNewPrivs, and Seccomp_filters delta
+        // instead of forcing opacity inversion at higher decoy levels.
         spec.non_dumpable = p.dumpable == Some(false);
-        spec.no_new_privs = p.status.no_new_privs != 0;
-        let filters = if p.status.seccomp_filters > 0 {
-            p.status.seccomp_filters.min(8) as u8
+        let target_sf = if p.status.seccomp_filters > 0 {
+            p.status.seccomp_filters
         } else if p.status.seccomp == 2 {
             1
         } else {
             0
         };
-        spec.seccomp_filters = filters;
+        let delta_sf = target_sf.saturating_sub(sys::self_seccomp_filters()).min(8) as u8;
+        spec.seccomp_filters = delta_sf;
+        spec.no_new_privs = p.status.no_new_privs != 0 || delta_sf > 0;
         spec.ptrace_children = p.children.iter().any(|c| c.status.tracer_pid != 0);
-        spec.rss_kb = (p.stat.rss.saturating_mul(sys::page_kb())).min(8192) as u32;
+        let target_rss_kb = (p.stat.rss.saturating_mul(sys::page_kb())).min(8192) as u32;
+        spec.rss_kb = target_rss_kb;
+        spec.rss_file_kb = if !spec.map_files.is_empty() {
+            target_rss_kb
+        } else {
+            0
+        };
         spec.vsz_kb = (p.stat.vsize / 1024).min(65536) as u32;
         spec.vm_lck_kb = p.status.vm_lck.unwrap_or(0).min(64) as u32;
         spec.rss_shmem_kb = p.status.rss_shmem.unwrap_or(0).min(512) as u32;
     }
 
-    if level >= 5 {
-        if let Some(tok) = decoy_token {
-            let place = p.memory.token_present || (!tree_has_tok && is_root);
-            if place && !tok.is_empty() {
-                spec.decoy_token = tok[..tok.len().min(4096)].to_vec();
-            }
+    if level >= 5 && p.memory.token_present && !effective_tok_bytes.is_empty() {
+        let mask = token_placements_to_mask(&p.memory.token_placements);
+        if p.memory.token_placements.is_empty() || mask != 0 {
+            spec.decoy_token = effective_tok_bytes[..effective_tok_bytes.len().min(4096)].to_vec();
+            spec.token_placements_mask = mask;
         }
     }
 
@@ -3316,6 +3511,7 @@ fn decoy_rng_next(state: &mut u64) -> u64 {
     x
 }
 
+#[inline(never)]
 fn sleep_jitter_ms(jitter_ms: u32, rng: &mut u64) {
     if jitter_ms == 0 {
         return;
@@ -3326,6 +3522,7 @@ fn sleep_jitter_ms(jitter_ms: u32, rng: &mut u64) {
     }
 }
 
+#[inline(never)]
 fn run_churn_batch(count: u32, rng: &mut u64) {
     if count == 0 {
         return;
@@ -3401,7 +3598,68 @@ fn decoy_stub_exe_paths() -> Result<(Vec<u8>, Vec<u8>), String> {
     Ok((b"/proc/self/exe".to_vec(), fallback))
 }
 
+#[inline(never)]
+fn copy_shadow_exe_res(src: &[u8], dst: &[u8]) -> Result<(), std::io::Error> {
+    let bytes = std::fs::read(Path::new(std::ffi::OsStr::from_bytes(src)))?;
+    let fd = sys::open(
+        dst,
+        sys::O_WRONLY | sys::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0o755,
+    );
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let ok = sys::write_fd(fd, &bytes);
+    let err = std::io::Error::last_os_error();
+    let _ = unsafe { libc::fchmod(fd, 0o755) };
+    sys::close(fd);
+    if ok {
+        Ok(())
+    } else {
+        Err(err)
+    }
+}
+
+fn copy_shadow_exe(src: &[u8], dst: &[u8]) -> bool {
+    copy_shadow_exe_res(src, dst).is_ok()
+}
+
+fn ensure_shadow_copy(
+    exe: &[u8],
+    fallback_exe: &[u8],
+    nonce: &[u8],
+    idx: usize,
+    cache: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    temps: &mut Vec<std::path::PathBuf>,
+) -> Vec<u8> {
+    let base = str::basename(exe);
+    if base.is_empty()
+        || base == b"."
+        || base == b".."
+        || base.iter().any(|&b| b < 0x20 || b == 0x7f || b == b'/')
+    {
+        return Vec::new();
+    }
+    if let Some((_, existing)) = cache.iter().find(|(b, _)| b.as_slice() == base) {
+        return existing.clone();
+    }
+    let Some(dir) = make_temp_dir(idx, nonce) else {
+        return Vec::new();
+    };
+    let mut dst = dir.as_os_str().as_bytes().to_vec();
+    dst.push(b'/');
+    dst.extend_from_slice(base);
+    if !copy_shadow_exe(fallback_exe, &dst) {
+        let _ = sys::remove_staging_dir(&dir);
+        return Vec::new();
+    }
+    temps.push(dir);
+    cache.push((base.to_vec(), dst.clone()));
+    dst
+}
+
 #[allow(clippy::too_many_arguments)]
+#[inline(never)]
 fn make_decoy_config(
     idx: usize,
     nodes: &[&DecoyNodeSpec],
@@ -3411,6 +3669,8 @@ fn make_decoy_config(
     arena_fd: i32,
     nonce: &[u8],
     temp: &[u8],
+    self_copy: &[u8],
+    can_bind_exe: bool,
     global_id: u32,
 ) -> stub::Config {
     let n = nodes[idx];
@@ -3423,31 +3683,31 @@ fn make_decoy_config(
             c
         }
     };
-    let use_bind = opts.bind_exe && !n.exe_memfd && !n.exe.is_empty();
+    let use_exe = opts.bind_exe && !n.exe_memfd && !n.exe.is_empty();
+    let use_bind = use_exe && can_bind_exe;
+    let wait_tracer = nodes
+        .iter()
+        .zip(children.iter())
+        .any(|(p, ch)| p.ptrace_children && ch.contains(&idx));
     let mut flags: u32 = 0;
-    if idx == 0 {
-        flags |= stub::F_ROOT;
-    }
-    if opts.clean_env {
-        flags |= stub::F_CLEAN_ENV;
-    }
-    if n.exe_memfd {
-        flags |= stub::F_EXE_MEMFD;
-    }
-    if n.non_dumpable {
-        flags |= stub::F_NON_DUMPABLE;
-    }
-    if n.no_new_privs {
-        flags |= stub::F_NO_NEW_PRIVS;
-    }
-    if n.ptrace_children {
-        flags |= stub::F_PTRACE_CHILDREN;
-    }
-    if (0..nodes.len()).any(|p| nodes[p].ptrace_children && children[p].contains(&idx)) {
-        flags |= stub::F_WAIT_TRACER;
-    }
-    if use_bind && sys::geteuid() != 0 {
-        flags |= stub::F_USERNS;
+    for &(cond, bit) in &[
+        (idx == 0, stub::F_ROOT),
+        (opts.clean_env, stub::F_CLEAN_ENV),
+        (
+            !opts.same_session && n.session_leader,
+            corpus::F_SESSION as u32,
+        ),
+        (n.has_tty, corpus::F_TTY as u32),
+        (n.exe_memfd, stub::F_EXE_MEMFD),
+        (n.non_dumpable, stub::F_NON_DUMPABLE),
+        (n.no_new_privs, stub::F_NO_NEW_PRIVS),
+        (n.ptrace_children, stub::F_PTRACE_CHILDREN),
+        (wait_tracer, stub::F_WAIT_TRACER),
+        (use_bind && sys::geteuid() != 0, stub::F_USERNS),
+    ] {
+        if cond {
+            flags |= bit;
+        }
     }
     stub::Config {
         flags,
@@ -3468,7 +3728,11 @@ fn make_decoy_config(
         user: clamp_no_nul(&n.user, 64),
         temp: temp.to_vec(),
         disk_kb: 0,
-        self_copy: Vec::new(),
+        self_copy: if use_exe {
+            self_copy.to_vec()
+        } else {
+            Vec::new()
+        },
         nonce: nonce.to_vec(),
         child_fds,
         keep_fds,
@@ -3482,30 +3746,47 @@ fn make_decoy_config(
         id: global_id,
         cwd: clamp_no_nul(&n.cwd, 4096),
         env_block: serialize_env_block(&n.environ),
+        env_nul_len: n.env_nul_len,
         memfd_label: clamp_no_nul(&n.memfd_label, 240),
-        decoy_token: n.decoy_token[..n.decoy_token.len().min(4096)].to_vec(),
+        decoy_token: n
+            .decoy_token
+            .get(..n.decoy_token.len().min(4096))
+            .unwrap_or(&[])
+            .to_vec(),
+        token_placements_mask: n.token_placements_mask,
         thread_comms: serialize_thread_comms(&n.thread_comms),
+        thread_wchans: n
+            .thread_wchans
+            .get(..n.thread_wchans.len().min(64))
+            .unwrap_or(&[])
+            .to_vec(),
         fd_specs: serialize_fd_specs(&n.fd_specs),
+        map_files: serialize_map_files(&n.map_files),
         wchan_mode: n.wchan_mode,
         seccomp_filters: n.seccomp_filters.min(8),
-        jitter_ms: 0,
+        execfn_mode: n.execfn_mode,
+        execfn_fd: n.execfn_fd,
+        jitter_ms: n.jitter_ms.max(opts.jitter_ms).min(50),
         vm_lck_kb: n.vm_lck_kb.min(64),
         rss_shmem_kb: n.rss_shmem_kb.min(512),
+        rss_file_kb: n.rss_file_kb.min(8192),
     }
 }
 
-struct CloseFd(i32);
-impl Drop for CloseFd {
-    fn drop(&mut self) {
-        if self.0 >= 0 {
-            sys::close(self.0);
+fn close_unneeded_fds_above(first: i32, keep: &[i32]) {
+    let max_keep = keep.iter().copied().max().unwrap_or(first - 1);
+    for fd in first..=max_keep {
+        if !keep.contains(&fd) {
+            sys::close(fd);
         }
     }
+    sys::close_range_from((max_keep + 1).max(first));
 }
 
 /// Spawn one or more arbitrary-depth decoy process trees with clean-env
 /// authentication, seeded startup jitter, optional churn workers, and 3-field
 /// pidfile recording compatible with `psgen stop`.
+#[inline(never)]
 pub fn spawn_decoy_trees(
     trees: &[DecoyNodeSpec],
     opts: &DecoySpawnOpts,
@@ -3525,6 +3806,7 @@ pub fn spawn_decoy_trees(
     }
 
     let (primary_exe, fallback_exe) = decoy_stub_exe_paths()?;
+    let can_bind_exe = opts.bind_exe && probe::caps().can_spoof_exe();
     let mut total_nodes = 0usize;
     let mut max_rss = 0u64;
     for t in trees {
@@ -3547,12 +3829,12 @@ pub fn spawn_decoy_trees(
         -1
     });
 
-    let mut memfd_name = b"pg:".to_vec();
-    memfd_name.extend_from_slice(&nonce);
+    let memfd_name = make_memfd_name(&nonce);
 
     let mut pids: Vec<i32> = Vec::with_capacity(total_nodes);
     let mut root_pids: Vec<(i32, u64)> = Vec::with_capacity(trees.len());
     let mut all_temps: Vec<std::path::PathBuf> = Vec::new();
+    let mut shadow_cache: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut next_id: u32 = 0;
 
     let churn_per_tree = opts.churn / (trees.len() as u32);
@@ -3563,8 +3845,7 @@ pub fn spawn_decoy_trees(
         let mut children: Vec<Vec<usize>> = Vec::new();
         flatten_decoy_tree(tree, &mut nodes, &mut children);
 
-        let cfg_name: &[u8] = if opts.clean_env { &memfd_name } else { b"cfg" };
-        let fd_of = match alloc_sealed_cfg_fds(nodes.len(), cfg_name, opts.clean_env) {
+        let fd_of = match alloc_sealed_cfg_fds(nodes.len(), &memfd_name, true) {
             Ok(fds) => fds,
             Err(err) => {
                 remove_dirs(&all_temps);
@@ -3575,34 +3856,47 @@ pub fn spawn_decoy_trees(
         let mut root_temps: Vec<std::path::PathBuf> = Vec::new();
         let mut root_cmd = Vec::new();
         let mut root_env_block = Vec::new();
+        let mut root_env_nul_len = 0u32;
         let mut write_ok = true;
 
-        for i in 0..nodes.len() {
-            let n = nodes[i];
-            let need_dir = opts.bind_exe
+        for (i, &n) in nodes.iter().enumerate() {
+            let need_dir = can_bind_exe
                 && !n.exe_memfd
                 && !n.exe.is_empty()
                 && !Path::new(std::ffi::OsStr::from_bytes(&n.exe)).exists();
-            let temp = if need_dir {
-                match make_temp_dir(next_id as usize, &nonce) {
-                    Some(p) => {
-                        root_temps.push(p.clone());
-                        p.as_os_str().as_bytes().to_vec()
-                    }
-                    None => Vec::new(),
-                }
+            let temp = maybe_node_temp(need_dir, next_id as usize, &nonce, &mut root_temps);
+            let shadow_copy = if opts.bind_exe && !n.exe_memfd && !n.exe.is_empty() {
+                ensure_shadow_copy(
+                    &n.exe,
+                    &fallback_exe,
+                    &nonce,
+                    (next_id as usize).wrapping_add(100_000),
+                    &mut shadow_cache,
+                    &mut all_temps,
+                )
             } else {
                 Vec::new()
             };
             let cfg = make_decoy_config(
-                i, &nodes, &children, &fd_of, opts, arena_fd.0, &nonce, &temp, next_id,
+                i,
+                &nodes,
+                &children,
+                &fd_of,
+                opts,
+                arena_fd.0,
+                &nonce,
+                &temp,
+                &shadow_copy,
+                can_bind_exe,
+                next_id,
             );
             if i == 0 {
                 root_cmd = cfg.cmd.clone();
                 root_env_block = cfg.env_block.clone();
+                root_env_nul_len = cfg.env_nul_len;
             }
             next_id = next_id.wrapping_add(1);
-            if !write_config_fd(fd_of[i], &cfg) || !sys::fd_add_seals(fd_of[i]) {
+            if !fd_of.get(i).is_some_and(|&fd| write_config_fd(fd, &cfg)) {
                 write_ok = false;
                 break;
             }
@@ -3639,15 +3933,20 @@ pub fn spawn_decoy_trees(
                     sys::exit(127);
                 }
                 sys::close(arena_fd.0);
+            } else {
+                sys::close(4);
             }
             if sys::dup2(status_write.0, 5) != 5 {
                 sys::exit(127);
             }
             sys::close(status_write.0);
             redirect_stdio();
+            // Close any stray inherited pipe fds (e.g. caller `| tee`) while
+            // keeping child config fds (`fd_of[1..]`).
+            close_unneeded_fds_above(6, &fd_of[1..]);
             let (argv_buf, argv) = stub::build_argv(&root_cmd);
             let (_env_keep, env) = if opts.clean_env {
-                stub::build_envp_clean(&root_env_block)
+                stub::build_envp_for_decoy(&root_env_block, root_env_nul_len)
             } else {
                 let nonce_line = stub::nonce_env_line(&nonce);
                 let env = stub::envp_with(&nonce_line);
@@ -3729,15 +4028,55 @@ pub fn spawn_decoy_trees(
             sys::nanosleep(0, 20_000_000);
         }
         let _ = sys::reap_children_nonblock();
-        for t in &all_temps {
-            if !staging_busy(t) && safe_temp_dir(t.as_os_str().as_bytes()) {
-                let _ = sys::remove_staging_dir(t);
-            }
-        }
+        cleanup_unbusy_temps(&all_temps);
     }
 
     let _ = sys::reap_children_nonblock();
     Ok(pids)
+}
+
+/// Spawn `count` clean label-only decoys (exact `comm`, clean env, closed pipe
+/// fds, no leaked secrets) replacing ad-hoc `sleep 1800` loops.
+pub fn spawn_label_decoys(
+    label: &str,
+    comm: &str,
+    count: usize,
+    opts: &DecoySpawnOpts,
+) -> Result<Vec<i32>, String> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let comm_bytes = if comm.is_empty() {
+        clamp_no_nul(label.as_bytes(), 15)
+    } else {
+        clamp_no_nul(comm.as_bytes(), 15)
+    };
+    let arg0 = if label.is_empty() {
+        comm_bytes.clone()
+    } else {
+        label.as_bytes().to_vec()
+    };
+    let mut specs = Vec::with_capacity(count);
+    for _ in 0..count {
+        specs.push(DecoyNodeSpec {
+            comm: comm_bytes.clone(),
+            argv: vec![arg0.clone()],
+            wchan_mode: 0,
+            session_leader: !opts.same_session,
+            ..DecoyNodeSpec::default()
+        });
+    }
+    let sub = DecoySpawnOpts {
+        clean_env: true,
+        bind_exe: false,
+        pidfile: None,
+        wait: false,
+        churn: 0,
+        label_decoys: 0,
+        interleave_cmd: None,
+        ..opts.clone()
+    };
+    spawn_decoy_trees(&specs, &sub)
 }
 
 pub fn make_decoy_token(prefix: &str, rng: &mut crate::rng::Rng) -> Vec<u8> {
@@ -3753,6 +4092,7 @@ pub fn make_decoy_token(prefix: &str, rng: &mut crate::rng::Rng) -> Vec<u8> {
     out
 }
 
+#[inline(never)]
 fn maybe_prepend_exec(cmd: &str) -> String {
     let t = cmd.trim();
     if t.is_empty()
@@ -3761,41 +4101,33 @@ fn maybe_prepend_exec(cmd: &str) -> String {
         || t.bytes()
             .any(|b| matches!(b, b';' | b'|' | b'&' | b'\n' | b'(' | b')' | b'`'))
     {
-        return cmd.to_string();
+        return String::from(cmd);
     }
-    let bytes = t.as_bytes();
-    let mut pos = 0usize;
-    while pos < bytes.len() {
-        let start = pos;
-        while pos < bytes.len() && !bytes[pos].is_ascii_whitespace() {
-            pos += 1;
-        }
-        let tok = &t[start..pos];
-        let is_env = tok.find('=').map(|eq| {
-            eq > 0
+    let mut rest = t;
+    while !rest.is_empty() {
+        let off = t.len() - rest.len();
+        let tok_len = rest
+            .find(|c: char| c.is_ascii_whitespace())
+            .unwrap_or(rest.len());
+        let tok = &rest[..tok_len];
+        let is_env = tok.split_once('=').is_some_and(|(k, _)| {
+            !k.is_empty()
                 && !tok.contains('\'')
                 && !tok.contains('"')
-                && tok.as_bytes()[..eq]
-                    .iter()
-                    .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
-        }) == Some(true);
+                && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        });
         if !is_env {
             if tok == "exec" {
-                return cmd.to_string();
+                return String::from(cmd);
             }
-            let mut out = String::with_capacity(t.len() + 5);
-            out.push_str(&t[..start]);
-            out.push_str("exec ");
-            out.push_str(&t[start..]);
-            return out;
+            return crate::json::cat3(&t[..off], "exec ", &t[off..]);
         }
-        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
-            pos += 1;
-        }
+        rest = rest[tok_len..].trim_start();
     }
-    cmd.to_string()
+    String::from(cmd)
 }
 
+#[inline(never)]
 fn spawn_shell_child(cmd: &str, duration: u32, extra_env: Option<&[u8]>) -> Result<i32, String> {
     let sh = b"/bin/sh\0";
     let dash_c = b"-c\0";
@@ -3804,12 +4136,13 @@ fn spawn_shell_child(cmd: &str, duration: u32, extra_env: Option<&[u8]>) -> Resu
     cmd_c.push(0);
 
     let mut env_block = Vec::new();
+    let mut entry = Vec::new();
     for (k, v) in std::env::vars_os() {
         let kb = k.as_bytes();
         if kb == stub::NONCE_ENV.as_bytes() {
             continue;
         }
-        let mut entry = Vec::with_capacity(kb.len() + v.as_bytes().len() + 1);
+        entry.clear();
         entry.extend_from_slice(kb);
         entry.push(b'=');
         entry.extend_from_slice(v.as_bytes());
@@ -3828,6 +4161,7 @@ fn spawn_shell_child(cmd: &str, duration: u32, extra_env: Option<&[u8]>) -> Resu
     if pid == 0 {
         sys::setsid();
         redirect_stdio();
+        sys::close_range_from(3);
         if duration > 0 {
             sys::alarm(duration);
         }
@@ -3848,6 +4182,7 @@ fn spawn_shell_child(cmd: &str, duration: u32, extra_env: Option<&[u8]>) -> Resu
 /// Spawn `count` live decoy processes via an external `masker_cmd` shell command
 /// template, applying seeded startup jitter and optional deterministic decoy
 /// tokens (`{DECOY_TOKEN}` / `PSGEN_DECOY_TOKEN` and `{DURATION}`).
+#[inline(never)]
 pub fn spawn_masker_decoys(
     masker_cmd: &str,
     count: usize,
@@ -3893,6 +4228,26 @@ fn kill_pids_now(pids: &[i32]) {
     let _ = sys::reap_children_nonblock();
 }
 
+/// Split `trees` at a seeded random rank in `[20%..80%]` and interleave
+/// `target_cmd` with jitter and churn on both sides.
+#[inline(never)]
+pub fn spawn_decoy_trees_interleaved(
+    trees: &[DecoyNodeSpec],
+    target_cmd: &str,
+    opts: &DecoySpawnOpts,
+) -> Result<(Vec<i32>, i32, Vec<i32>), String> {
+    let mut rng = opts.seed ^ 0x94d0_49bb_1331_11eb;
+    let n = trees.len();
+    let split = if n <= 1 {
+        0
+    } else {
+        let lo = (n / 5).max(1);
+        let hi = ((n * 4) / 5).max(lo).min(n - 1);
+        lo + (decoy_rng_next(&mut rng) as usize % (hi - lo + 1))
+    };
+    spawn_interleaved_target(&trees[..split], target_cmd, &trees[split..], opts)
+}
+
 /// Spawn `prefix` decoy trees, then `target_cmd`, then `suffix` decoy trees so
 /// the target's `starttime` and PID sit naturally inside the decoy distribution.
 pub fn spawn_interleaved_target(
@@ -3907,11 +4262,16 @@ pub fn spawn_interleaved_target(
     let _ = sys::prctl_set_subreaper();
     let mut rng = opts.seed ^ 0x2545_f491_4f6c_dd1d;
 
-    let half_churn = opts.churn / 2;
+    let total_trees = prefix.len() + suffix.len();
+    let pre_churn = (opts.churn as usize * prefix.len())
+        .checked_div(total_trees)
+        .map(|n| n as u32)
+        .unwrap_or(opts.churn / 2);
     let mut sub_opts = DecoySpawnOpts {
         pidfile: None,
         wait: false,
-        churn: half_churn,
+        churn: pre_churn,
+        interleave_cmd: None,
         ..opts.clone()
     };
     let prefix_pids = spawn_decoy_trees(prefix, &sub_opts)?;
@@ -3924,10 +4284,37 @@ pub fn spawn_interleaved_target(
             return Err(e);
         }
     };
-    sys::nanosleep(0, 40_000_000);
-    sleep_jitter_ms(opts.jitter_ms, &mut rng);
+    // Wait briefly for a multi-process target tree (e.g. supervisor -> payload)
+    // to fork its child before starting suffix decoys so suffix spawns do not
+    // interleave inside the target's own parent->child PID pair.
+    if prefix
+        .iter()
+        .chain(suffix.iter())
+        .any(|t| !t.children.is_empty())
+    {
+        let mut cpath = Buf::new();
+        cpath.push_str("/proc/");
+        cpath.push_u64(target_pid as u64);
+        cpath.push_str("/task/");
+        cpath.push_u64(target_pid as u64);
+        cpath.push_str("/children");
+        let mut buf = [0u8; 64];
+        for _ in 0..50 {
+            if let Some(n) = sys::read_file(cpath.as_bytes(), &mut buf) {
+                if buf
+                    .get(..n)
+                    .is_some_and(|s| s.iter().any(|b| b.is_ascii_digit()))
+                {
+                    break;
+                }
+            }
+            sys::nanosleep(0, 5_000_000);
+        }
+    }
+    // Seeded jitter after target launch instead of a fixed 40ms gap.
+    sleep_jitter_ms(opts.jitter_ms.max(5), &mut rng);
 
-    sub_opts.churn = opts.churn.saturating_sub(half_churn);
+    sub_opts.churn = opts.churn.saturating_sub(pre_churn);
     sub_opts.seed = opts.seed ^ 0x517c_c1b7_2722_0a95;
     let suffix_pids = match spawn_decoy_trees(suffix, &sub_opts) {
         Ok(pids) => pids,
@@ -4362,6 +4749,7 @@ mod tests {
             quiet: true,
             wait: false,
             bind_exe: false,
+            ..DecoySpawnOpts::default()
         };
         let pids = spawn_decoy_trees(&[root_spec], &opts).expect("spawn decoy tree");
         let _guard = PidGuard(pids.clone());
@@ -4672,13 +5060,21 @@ mod tests {
         if !has_built_psgen_bin() {
             return;
         }
+        let dir = std::env::temp_dir().join(format!(".psgen-mempar-{}", sys::getpid()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ro_file = dir.join("shared-rss.dat");
+        std::fs::write(&ro_file, vec![0x33u8; 2 * 1024 * 1024]).unwrap();
+
         let spec = DecoyNodeSpec {
             comm: b"mem-par".to_vec(),
             argv: vec![b"mem-par".to_vec()],
             rss_kb: 2048,
+            rss_file_kb: 2048,
             vsz_kb: 16384,
             vm_lck_kb: 16,
             rss_shmem_kb: 64,
+            map_files: vec![ro_file.as_os_str().as_bytes().to_vec()],
             wchan_mode: 0,
             ..DecoyNodeSpec::default()
         };
@@ -4695,6 +5091,7 @@ mod tests {
         let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
         let vm_lck = parse_status_kb_field(&status, "VmLck:");
         let rss_shmem = parse_status_kb_field(&status, "RssShmem:");
+        let rss_anon = parse_status_kb_field(&status, "RssAnon:");
         let vm_rss = parse_status_kb_field(&status, "VmRSS:");
         let vm_size = parse_status_kb_field(&status, "VmSize:");
 
@@ -4705,6 +5102,10 @@ mod tests {
         assert!(
             vm_rss >= 1900,
             "expected VmRSS >= 1900 kB, got {vm_rss}\n{status}"
+        );
+        assert!(
+            rss_anon < 1024,
+            "expected zero-burn low RssAnon < 1024 kB, got {rss_anon}\n{status}"
         );
         assert!(
             vm_size >= 16000,
@@ -4730,6 +5131,11 @@ mod tests {
             !maps.contains("memfd:cache"),
             "clean_env decoy leaked memfd:cache into maps:\n{maps}"
         );
+        assert!(
+            maps.contains("shared-rss.dat"),
+            "expected shared-rss.dat in maps:\n{maps}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4806,10 +5212,180 @@ mod tests {
             sys::getpid(),
             "target PPid must match psgen PID"
         );
+        let mut seen_comm = None;
+        for _ in 0..40 {
+            seen_comm = live::read_comm(tgt);
+            if seen_comm.as_deref() == Some(&b"sleep"[..]) {
+                break;
+            }
+            sys::nanosleep(0, 5_000_000);
+        }
         assert_eq!(
-            live::read_comm(tgt).as_deref(),
+            seen_comm.as_deref(),
             Some(&b"sleep"[..]),
             "expected /bin/sh to exec sleep directly"
         );
+    }
+
+    #[test]
+    fn live_track_c_fidelity_comm_spaces_nul_env_redacted_dumpable_maps_and_parent_tree() {
+        if !has_built_psgen_bin() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!(".psgen-trackc-{}", sys::getpid()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("trackc.pid");
+        let pf_bytes = pidfile.as_os_str().as_bytes().to_vec();
+        let map_file = dir.join("shared-lib.dat");
+        std::fs::write(&map_file, vec![0x42u8; 16384]).unwrap();
+
+        // Build a dumpable profile with trailing-space comm, all-NUL environ,
+        // <REDACTED:len=16> in argv, anon-only token placement, a captured
+        // parent supervisor, and a readable regular map file.
+        let mut parent_p = crate::profile::synthetic_default_profile("sup-parent", false);
+        parent_p.identity.pid = 700;
+        parent_p.identity.comm = "sup-parent".to_string();
+        parent_p.dumpable = Some(true);
+        parent_p.status.no_new_privs = 0;
+        parent_p.status.seccomp = 0;
+        parent_p.status.seccomp_filters = sys::self_seccomp_filters();
+        parent_p.syscall.wchan = "do_wait".to_string();
+        parent_p.memory.token_present = false;
+
+        let mut leaf_p = crate::profile::synthetic_default_profile("ci-runner", false);
+        leaf_p.identity.pid = 701;
+        leaf_p.identity.ppid = 700;
+        leaf_p.identity.comm = "ci-runner      ".to_string(); // exact 15B space-padded
+        leaf_p.identity.argv = vec!["ci-runner".to_string(), "<REDACTED:len=16>".to_string()];
+        leaf_p.dumpable = Some(true);
+        leaf_p.status.no_new_privs = 0;
+        leaf_p.status.seccomp = 0;
+        leaf_p.status.seccomp_filters = sys::self_seccomp_filters();
+        leaf_p.environ.clear();
+        leaf_p.environ_raw_len = 64;
+        leaf_p.environ_all_nul = true;
+        leaf_p.memory.token_present = true;
+        leaf_p.memory.token_len = Some(16);
+        leaf_p.memory.token_charset = Some("hex".to_string());
+        leaf_p.memory.token_placements = vec!["anon".to_string()];
+        leaf_p.memory.maps = vec![format!(
+            "7f0000000000-7f0000004000 r--p 00000000 00:00 1 {}",
+            map_file.display()
+        )];
+        leaf_p.parent = Some(Box::new(parent_p));
+
+        let spec = profile_to_decoy_tree(&leaf_p, 6, None, 0);
+        assert_eq!(spec.comm, b"sup-parent");
+        assert_eq!(spec.wchan_mode, stub::WCHAN_WAIT4);
+        assert_eq!(spec.children.len(), 1);
+        let cspec = &spec.children[0];
+        assert_eq!(cspec.comm, b"ci-runner      ");
+        assert!(!cspec.non_dumpable, "dumpable target must not invert");
+        assert!(!cspec.no_new_privs, "nnp=0 target with delta=0 must stay 0");
+        assert_eq!(cspec.seccomp_filters, 0);
+        assert_eq!(cspec.env_nul_len, 64);
+        assert_eq!(cspec.token_placements_mask, stub::TOK_PLACE_ANON);
+        assert_eq!(cspec.decoy_token.len(), 16);
+        let arg1 = String::from_utf8_lossy(&cspec.argv[1]);
+        assert!(
+            !arg1.contains("<REDACTED"),
+            "redacted marker leaked: {arg1}"
+        );
+        assert_eq!(arg1.len(), 16);
+        let tok_copy = cspec.decoy_token.clone();
+
+        let opts = DecoySpawnOpts {
+            duration: 30,
+            pidfile: Some(pf_bytes.clone()),
+            clean_env: true,
+            bind_exe: false,
+            ..DecoySpawnOpts::default()
+        };
+        let pids = spawn_decoy_trees(&[spec], &opts).expect("spawn track c tree");
+        let _guard = PidGuard(pids.clone());
+        assert_eq!(pids.len(), 2, "expected parent + child pids: {pids:?}");
+
+        let (sup_pid, leaf_pid) =
+            if live::read_comm_exact(pids[0]).as_deref() == Some(b"sup-parent") {
+                (pids[0], pids[1])
+            } else {
+                (pids[1], pids[0])
+            };
+
+        // 1. Exact 15B trailing-space comm preserved.
+        assert_eq!(
+            live::read_comm_exact(leaf_pid).as_deref(),
+            Some(&b"ci-runner      "[..])
+        );
+        // 2. Parent->child PPid preserved (NOT reparented to PPid=1).
+        let leaf_stat = live::read_stat(leaf_pid).expect("leaf stat");
+        assert_eq!(leaf_stat.ppid as i32, sup_pid);
+        // 3. Dumpable preserved (readable /proc/<pid>/environ and NoNewPrivs: 0).
+        let env_raw = std::fs::read(format!("/proc/{leaf_pid}/environ")).unwrap();
+        assert_eq!(env_raw.len(), 64, "expected 64B all-NUL environ");
+        assert!(
+            env_raw.iter().all(|&b| b == 0),
+            "expected all-NUL environ, got {env_raw:?}"
+        );
+        let status = std::fs::read_to_string(format!("/proc/{leaf_pid}/status")).unwrap();
+        assert!(status.contains("NoNewPrivs:\t0\n"), "{status}");
+        // 3b. Redacted argv marker was substituted with exact 16-byte token (never literal <REDACTED>).
+        let cmd_raw = std::fs::read(format!("/proc/{leaf_pid}/cmdline")).unwrap();
+        let cmd_s = String::from_utf8_lossy(&cmd_raw);
+        assert!(
+            !cmd_s.contains("<REDACTED"),
+            "literal <REDACTED> leaked into cmdline: {cmd_s}"
+        );
+        // 4. Token present in anon rw-p ONLY (not as a stack local outside argv/env).
+        let (in_anon, _) = scan_proc_mem_for_token(leaf_pid, &tok_copy);
+        assert!(in_anon, "expected anon-only token in anon rw-p");
+        // Verify a pure anon-only token (absent from argv) is NOT placed in [stack].
+        let mut anon_only_p = crate::profile::synthetic_default_profile("anon-tok", false);
+        anon_only_p.dumpable = Some(true);
+        anon_only_p.status.seccomp_filters = sys::self_seccomp_filters();
+        anon_only_p.memory.token_present = true;
+        anon_only_p.memory.token_len = Some(20);
+        anon_only_p.memory.token_charset = Some("hex".to_string());
+        anon_only_p.memory.token_placements = vec!["anon".to_string()];
+        let anon_spec = profile_to_decoy_tree(&anon_only_p, 6, None, 0);
+        let anon_tok = anon_spec.decoy_token.clone();
+        assert_eq!(anon_tok.len(), 20);
+        let anon_pids = spawn_decoy_trees(
+            &[anon_spec],
+            &DecoySpawnOpts {
+                duration: 30,
+                clean_env: true,
+                bind_exe: false,
+                ..DecoySpawnOpts::default()
+            },
+        )
+        .expect("spawn anon-only decoy");
+        let _anon_guard = PidGuard(anon_pids.clone());
+        let (a_anon, a_stack) = scan_proc_mem_for_token(anon_pids[0], &anon_tok);
+        assert!(a_anon, "expected pure anon-only token in anon rw-p");
+        assert!(
+            !a_stack,
+            "pure anon-only token must not be placed in [stack]"
+        );
+        // 5. Zero-burn read-only file mapping present in /proc/<pid>/maps.
+        let maps = std::fs::read_to_string(format!("/proc/{leaf_pid}/maps")).unwrap();
+        assert!(
+            maps.contains("shared-lib.dat"),
+            "expected shared-lib.dat in maps:\n{maps}"
+        );
+        // 6. stop via 3-field pidfile cleans up both parent & trailing-space child.
+        assert_eq!(stop(&pf_bytes, false, false, true), 0);
+        for _ in 0..50 {
+            let _ = sys::reap_children_nonblock();
+            if pids.iter().all(|&pid| live::read_stat(pid).is_none()) {
+                break;
+            }
+            sys::nanosleep(0, 10_000_000);
+        }
+        for &pid in &pids {
+            assert!(live::read_stat(pid).is_none(), "pid {pid} still alive");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
