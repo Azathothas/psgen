@@ -1,6 +1,6 @@
 [package]
 name = "psgen"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Generate realistic Linux process lists and inject them into the real process table"
 license = "0BSD"

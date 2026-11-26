@@ -1,20 +1,24 @@
-//! Process profile schema (`schema: 1`), strict JSON validator, secret redaction,
+//! Process profile schema (`schema: 2`), strict JSON validator, secret redaction,
 //! host-path sanitization, and live `/proc/<pid>` extractor.
 
-use crate::json::{self, cat2, cat3, cat4, push_i64, push_u64, u64_str, JRead, Json, Jw};
+use crate::json::{
+    self, cat2, cat3, cat4, csv_has, lossy, next_csv, own, path_lossy, push_i64, push_u64, u64_str,
+    JRead, Json, Jw,
+};
+use crate::sha256;
 use crate::sys;
 use std::fs;
 use std::io;
 use std::path::Path;
 
-pub const PROFILE_SCHEMA: u32 = 1;
+pub const PROFILE_SCHEMA: u32 = 2;
 
 const MAX_PROC_READ: usize = 4 * 1024 * 1024;
 const MAX_MAPS_LINES: usize = 512;
 const MAX_SMAPS_LINES: usize = 256;
 const MAX_MEM_SCAN_BYTES: usize = 16 * 1024 * 1024;
 
-#[derive(Clone, Default)]
+#[derive(Default)]
 #[cfg_attr(test, derive(Debug, PartialEq))]
 pub struct Profile {
     pub schema: u32,
@@ -26,15 +30,36 @@ pub struct Profile {
     pub fds: Vec<ProfileFd>,
     pub auxv: ProfileAuxv,
     pub environ: Vec<String>,
+    pub environ_raw_len: u64,
+    pub environ_all_nul: bool,
     pub task: Vec<ProfileTask>,
     pub syscall: ProfileSyscall,
     pub timing: ProfileTiming,
     pub dumpable: Option<bool>,
     pub children: Vec<Profile>,
+    pub parent: Option<Box<Profile>>,
+    pub tracer: Option<Box<Profile>>,
 }
 
-#[derive(Clone, Default)]
-#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+#[inline(never)]
+fn default_profile() -> Profile {
+    Profile::default()
+}
+
+impl Clone for Profile {
+    #[inline(never)]
+    fn clone(&self) -> Self {
+        let s = self.to_json_str(false);
+        let mut p = default_profile();
+        if let Ok(doc) = json::parse(&s) {
+            let _ = fill_profile_json(&doc, &mut p, false);
+        }
+        p
+    }
+}
+
+#[derive(Default)]
+#[cfg_attr(test, derive(Clone, Debug, PartialEq, Eq))]
 pub struct ProfileSource {
     pub masker: String,
     pub profile: String,
@@ -42,8 +67,8 @@ pub struct ProfileSource {
     pub observer_uid: Option<u32>,
 }
 
-#[derive(Clone, Default)]
-#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+#[derive(Default)]
+#[cfg_attr(test, derive(Clone, Debug, PartialEq, Eq))]
 pub struct ProfileIdentity {
     pub label: String,
     pub comm: String,
@@ -51,8 +76,11 @@ pub struct ProfileIdentity {
     pub cmdline_raw_nuls: Option<usize>,
     pub pid: i32,
     pub ppid: i32,
+    pub pgid: i32,
+    pub sid: i32,
     pub uid: u32,
     pub gid: u32,
+    pub groups: Vec<u32>,
     pub starttime: u64,
     pub cwd: String,
     pub root: String,
@@ -61,8 +89,8 @@ pub struct ProfileIdentity {
     pub ns: ProfileNs,
 }
 
-#[derive(Clone, Default)]
-#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+#[derive(Default)]
+#[cfg_attr(test, derive(Clone, Debug, PartialEq, Eq))]
 pub struct ProfileNs {
     pub pid: Option<String>,
     pub mnt: Option<String>,
@@ -70,8 +98,8 @@ pub struct ProfileNs {
     pub net: Option<String>,
 }
 
-#[derive(Clone, Default)]
-#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+#[derive(Default)]
+#[cfg_attr(test, derive(Clone, Debug, PartialEq, Eq))]
 pub struct ProfileStatus {
     pub name: String,
     pub state: String,
@@ -90,7 +118,7 @@ pub struct ProfileStatus {
     pub rss_shmem: Option<u64>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Copy, Default)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub struct ProfileStat {
     pub ppid: i32,
@@ -106,13 +134,16 @@ pub struct ProfileStat {
     pub startstack: u64,
 }
 
-#[derive(Clone, Default)]
-#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+#[derive(Default)]
+#[cfg_attr(test, derive(Clone, Debug, PartialEq, Eq))]
 pub struct ProfileMemory {
     pub maps: Vec<String>,
     pub smaps: Vec<String>,
     pub token_present: bool,
     pub token_sha256: Option<String>,
+    pub token_len: Option<u32>,
+    pub token_charset: Option<String>,
+    pub token_placements: Vec<String>,
     pub readable_by: Vec<String>,
     pub denied_by: Vec<String>,
 }
@@ -124,8 +155,8 @@ pub struct ProfileFd {
     pub target: String,
 }
 
-#[derive(Clone, Default)]
-#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+#[derive(Default)]
+#[cfg_attr(test, derive(Clone, Debug, PartialEq, Eq))]
 pub struct ProfileAuxv {
     pub at_execfn: Option<String>,
     pub at_platform: Option<String>,
@@ -141,8 +172,8 @@ pub struct ProfileTask {
     pub state: String,
 }
 
-#[derive(Clone, Default)]
-#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+#[derive(Default)]
+#[cfg_attr(test, derive(Clone, Debug, PartialEq, Eq))]
 pub struct ProfileSyscall {
     pub syscall: String,
     pub wchan: String,
@@ -150,7 +181,7 @@ pub struct ProfileSyscall {
     pub priority: i32,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Copy, Default)]
 #[cfg_attr(test, derive(Debug, PartialEq))]
 pub struct ProfileTiming {
     pub exec_ms: f64,
@@ -164,6 +195,7 @@ pub struct ExtractOpts {
     pub profile_name: String,
     pub version: String,
     pub tree: bool,
+    pub ancestors: bool,
     pub redact_tokens: Vec<String>,
     pub redact_envs: Vec<String>,
     pub max_depth: usize,
@@ -174,10 +206,11 @@ impl ExtractOpts {
         Self {
             pid,
             label: None,
-            masker: "live".to_string(),
-            profile_name: "single".to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            masker: own("live"),
+            profile_name: own("single"),
+            version: own(env!("CARGO_PKG_VERSION")),
             tree: false,
+            ancestors: true,
             redact_tokens: Vec::new(),
             redact_envs: Vec::new(),
             max_depth: 4,
@@ -185,50 +218,209 @@ impl ExtractOpts {
     }
 }
 
-fn fill_profile_json(val: &Json, p: &mut Profile) -> Result<(), String> {
+/// Read newline-separated redaction tokens from a file (or `"-"` for stdin),
+/// trimming `\r\n` and skipping empty lines.
+#[inline(never)]
+pub fn read_redact_tokens_file(path: &str) -> Result<Vec<String>, String> {
+    let text = if path == "-" {
+        let raw = read_fd_bytes(0, MAX_PROC_READ).map_err(|_| own("stdin read failed"))?;
+        String::from_utf8(raw).map_err(|_| own("invalid utf-8"))?
+    } else {
+        json::read_str(Path::new(path))?
+    };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim_end_matches('\r');
+        if !trimmed.is_empty() {
+            out.push(own(trimmed));
+        }
+    }
+    Ok(out)
+}
+
+/// Classify a token's character shape without leaking secret suffixes:
+/// `"prefix:<pfx>:hex"`, `"prefix:<pfx>:alnum"`, `"hex"`, `"alnum"`, `"base64"`, or `"ascii"`.
+#[inline(never)]
+pub fn classify_token_charset(tok: &str) -> String {
+    if tok.is_empty() {
+        return own("ascii");
+    }
+    if let Some(pos) = tok.bytes().rposition(|b| b == b'-' || b == b'_') {
+        if let (Some(pfx), Some(suffix)) = (tok.get(..=pos), tok.get(pos + 1..)) {
+            if pfx.len() >= 2
+                && pfx.len() <= 8
+                && suffix.len() >= 3
+                && suffix.len() >= pfx.len()
+                && pfx.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+                && pfx
+                    .bytes()
+                    .all(|b| b.is_ascii_alphabetic() || b == b'-' || b == b'_')
+            {
+                if suffix.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return cat3("prefix:", pfx, ":hex");
+                }
+                if suffix.bytes().all(|b| b.is_ascii_alphanumeric()) {
+                    return cat3("prefix:", pfx, ":alnum");
+                }
+            }
+        }
+    }
+    own(if tok.bytes().all(|b| b.is_ascii_hexdigit()) {
+        "hex"
+    } else if tok.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        "alnum"
+    } else if tok
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'_' | b'-'))
+    {
+        "base64"
+    } else {
+        "ascii"
+    })
+}
+
+#[allow(dead_code)]
+fn push_sized_token(out: &mut String, token: &str, want: usize) {
+    if want == 0 {
+        return;
+    }
+    let src = if token.is_empty() { "x" } else { token };
+    let mut rem = want;
+    while rem > 0 {
+        let mut end = rem.min(src.len());
+        while end > 0 && !src.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == 0 {
+            out.push('x');
+            rem -= 1;
+        } else {
+            out.push_str(&src[..end]);
+            rem -= end;
+        }
+    }
+}
+
+/// Replace `<REDACTED:len=N>` (and `<REDACTED>`) placeholders with `token`,
+/// matching exact byte length `N` for length-tagged markers.
+#[allow(dead_code)]
+#[inline(never)]
+pub fn substitute_redacted(s: &str, token: &str) -> String {
+    const PFX: &str = "<REDACTED:len=";
+    if !s.contains("<REDACTED") {
+        return own(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(pos) = rest.find("<REDACTED") {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos..];
+        if let Some(num_rest) = after.strip_prefix(PFX) {
+            if let Some(gt) = num_rest.find('>') {
+                if let Some(want_u64) = json::parse_u64_s(&num_rest[..gt]) {
+                    let want = (want_u64 as usize).min(4096);
+                    push_sized_token(&mut out, token, want);
+                    rest = &num_rest[gt + 1..];
+                    continue;
+                }
+            }
+        }
+        if let Some(tail) = after.strip_prefix("<REDACTED>") {
+            out.push_str(token);
+            rest = tail;
+        } else {
+            out.push_str("<REDACTED");
+            rest = &after[9..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+#[inline(never)]
+fn parse_child_profile(val: &Json, strict: bool) -> Result<Profile, String> {
+    let mut p = default_profile();
+    fill_profile_json(val, &mut p, strict)?;
+    Ok(p)
+}
+
+#[inline(never)]
+fn parse_opt_profile(val: &Json, key: &str, strict: bool) -> Result<Option<Box<Profile>>, String> {
+    match val.get(key) {
+        None | Some(Json::Null) => Ok(None),
+        Some(obj) => Ok(Some(Box::new(parse_child_profile(obj, strict)?))),
+    }
+}
+
+#[inline(never)]
+fn fill_profile_json(val: &Json, p: &mut Profile, strict: bool) -> Result<(), String> {
     let mut r = JRead::new(
         val,
-        "schema,source,identity,status,stat,memory,fds,auxv,environ,task,syscall,timing,dumpable,children",
+        "schema,source,identity,status,stat,memory,fds,auxv,environ,environ_raw_len,environ_all_nul,task,syscall,timing,dumpable,children,parent,tracer",
         "profile",
     )?;
     p.schema = r.u32("schema");
-    if p.schema != PROFILE_SCHEMA {
-        return Err("profile.schema: unsupported schema version".to_string());
+    if strict && p.schema != PROFILE_SCHEMA {
+        return Err(own("bad profile schema"));
     }
     r.fill_str_arr("environ", &mut p.environ);
+    p.environ_raw_len = r.u64("environ_raw_len");
+    p.environ_all_nul = r.bool("environ_all_nul");
     p.dumpable = r.opt_bool("dumpable");
 
     if r.enter(val, "source", "masker,profile,version,observer_uid") {
-        r.fill_str("masker", &mut p.source.masker);
-        r.fill_str("profile", &mut p.source.profile);
-        r.fill_str("version", &mut p.source.version);
+        r.fill_strs(
+            "masker,profile,version",
+            &mut [
+                &mut p.source.masker,
+                &mut p.source.profile,
+                &mut p.source.version,
+            ],
+        );
         p.source.observer_uid = r.opt_u32("observer_uid");
     }
 
     if r.enter(
         val,
         "identity",
-        "label,comm,argv,cmdline_raw_nuls,pid,ppid,uid,gid,starttime,cwd,root,exe,exe_memfd,ns",
+        "label,comm,argv,cmdline_raw_nuls,pid,ppid,pgid,sid,uid,gid,groups,starttime,cwd,root,exe,exe_memfd,ns",
     ) {
         p.identity.cmdline_raw_nuls = r.opt_u32("cmdline_raw_nuls").map(|n| n as usize);
-        r.fill_str("label", &mut p.identity.label);
-        r.fill_str("comm", &mut p.identity.comm);
+        r.fill_strs(
+            "label,comm,cwd,root,exe",
+            &mut [
+                &mut p.identity.label,
+                &mut p.identity.comm,
+                &mut p.identity.cwd,
+                &mut p.identity.root,
+                &mut p.identity.exe,
+            ],
+        );
         r.fill_str_arr("argv", &mut p.identity.argv);
-        p.identity.pid = r.i32("pid");
-        p.identity.ppid = r.i32("ppid");
-        p.identity.uid = r.u32("uid");
-        p.identity.gid = r.u32("gid");
+        r.fill_i32s(
+            "pid,ppid,pgid,sid",
+            &mut [
+                &mut p.identity.pid,
+                &mut p.identity.ppid,
+                &mut p.identity.pgid,
+                &mut p.identity.sid,
+            ],
+        );
+        r.fill_u32s("uid,gid", &mut [&mut p.identity.uid, &mut p.identity.gid]);
+        p.identity.groups = r.u32_arr("groups", false);
         p.identity.starttime = r.u64("starttime");
-        r.fill_str("cwd", &mut p.identity.cwd);
-        r.fill_str("root", &mut p.identity.root);
-        r.fill_str("exe", &mut p.identity.exe);
         r.fill_opt_str("exe_memfd", &mut p.identity.exe_memfd);
         let id_val = val.get("identity").unwrap_or(&Json::Null);
         if r.enter(id_val, "ns", "pid,mnt,user,net") {
-            r.fill_opt_str("pid", &mut p.identity.ns.pid);
-            r.fill_opt_str("mnt", &mut p.identity.ns.mnt);
-            r.fill_opt_str("user", &mut p.identity.ns.user);
-            r.fill_opt_str("net", &mut p.identity.ns.net);
+            r.fill_opt_strs(
+                "pid,mnt,user,net",
+                &mut [
+                    &mut p.identity.ns.pid,
+                    &mut p.identity.ns.mnt,
+                    &mut p.identity.ns.user,
+                    &mut p.identity.ns.net,
+                ],
+            );
         }
     }
 
@@ -237,21 +429,29 @@ fn fill_profile_json(val: &Json, p: &mut Profile) -> Result<(), String> {
         "status",
         "Name,State,PPid,Uid,Gid,Threads,TracerPid,NoNewPrivs,Seccomp,Seccomp_filters,CapEff,CapPrm,CapBnd,VmLck,RssShmem",
     ) {
-        r.fill_str("Name", &mut p.status.name);
-        r.fill_str("State", &mut p.status.state);
-        p.status.ppid = r.i32("PPid");
-        r.fill_str("Uid", &mut p.status.uid);
-        r.fill_str("Gid", &mut p.status.gid);
-        p.status.threads = r.u32("Threads");
-        p.status.tracer_pid = r.i32("TracerPid");
-        p.status.no_new_privs = r.u32("NoNewPrivs");
-        p.status.seccomp = r.u32("Seccomp");
-        p.status.seccomp_filters = r.u32("Seccomp_filters");
-        r.fill_str("CapEff", &mut p.status.cap_eff);
-        r.fill_str("CapPrm", &mut p.status.cap_prm);
-        r.fill_str("CapBnd", &mut p.status.cap_bnd);
-        p.status.vm_lck = r.opt_u64("VmLck");
-        p.status.rss_shmem = r.opt_u64("RssShmem");
+        r.fill_strs(
+            "Name,State,Uid,Gid,CapEff,CapPrm,CapBnd",
+            &mut [
+                &mut p.status.name,
+                &mut p.status.state,
+                &mut p.status.uid,
+                &mut p.status.gid,
+                &mut p.status.cap_eff,
+                &mut p.status.cap_prm,
+                &mut p.status.cap_bnd,
+            ],
+        );
+        r.fill_i32s("PPid,TracerPid", &mut [&mut p.status.ppid, &mut p.status.tracer_pid]);
+        r.fill_u32s(
+            "Threads,NoNewPrivs,Seccomp,Seccomp_filters",
+            &mut [
+                &mut p.status.threads,
+                &mut p.status.no_new_privs,
+                &mut p.status.seccomp,
+                &mut p.status.seccomp_filters,
+            ],
+        );
+        r.fill_opt_u64s("VmLck,RssShmem", &mut [&mut p.status.vm_lck, &mut p.status.rss_shmem]);
     }
 
     if r.enter(
@@ -261,42 +461,65 @@ fn fill_profile_json(val: &Json, p: &mut Profile) -> Result<(), String> {
     ) {
         p.stat.ppid = r.i32("ppid");
         p.stat.num_threads = r.u32("num_threads");
-        p.stat.starttime = r.u64("starttime");
-        p.stat.vsize = r.u64("vsize");
-        p.stat.rss = r.u64("rss");
         p.stat.flags = r.opt_u64("flags");
-        p.stat.arg_start = r.u64("arg_start");
-        p.stat.arg_end = r.u64("arg_end");
-        p.stat.env_start = r.u64("env_start");
-        p.stat.env_end = r.u64("env_end");
-        p.stat.startstack = r.u64("startstack");
+        r.fill_u64s(
+            "starttime,vsize,rss,arg_start,arg_end,env_start,env_end,startstack",
+            &mut [
+                &mut p.stat.starttime,
+                &mut p.stat.vsize,
+                &mut p.stat.rss,
+                &mut p.stat.arg_start,
+                &mut p.stat.arg_end,
+                &mut p.stat.env_start,
+                &mut p.stat.env_end,
+                &mut p.stat.startstack,
+            ],
+        );
     }
 
     if r.enter(
         val,
         "memory",
-        "maps,smaps,token_present,token_sha256,readable_by,denied_by",
+        "maps,smaps,token_present,token_sha256,token_len,token_charset,token_placements,readable_by,denied_by",
     ) {
-        r.fill_str_arr("maps", &mut p.memory.maps);
-        r.fill_str_arr("smaps", &mut p.memory.smaps);
+        r.fill_str_arrs(
+            "maps,smaps,token_placements,readable_by,denied_by",
+            &mut [
+                &mut p.memory.maps,
+                &mut p.memory.smaps,
+                &mut p.memory.token_placements,
+                &mut p.memory.readable_by,
+                &mut p.memory.denied_by,
+            ],
+        );
         p.memory.token_present = r.bool("token_present");
-        r.fill_opt_str("token_sha256", &mut p.memory.token_sha256);
-        r.fill_str_arr("readable_by", &mut p.memory.readable_by);
-        r.fill_str_arr("denied_by", &mut p.memory.denied_by);
+        p.memory.token_len = r.opt_u32("token_len");
+        r.fill_opt_strs(
+            "token_sha256,token_charset",
+            &mut [&mut p.memory.token_sha256, &mut p.memory.token_charset],
+        );
     }
 
     if r.enter(val, "auxv", "AT_EXECFN,AT_PLATFORM,AT_BASE,AT_ENTRY") {
-        r.fill_opt_str("AT_EXECFN", &mut p.auxv.at_execfn);
-        r.fill_opt_str("AT_PLATFORM", &mut p.auxv.at_platform);
-        p.auxv.at_base = r.u64("AT_BASE");
-        p.auxv.at_entry = r.u64("AT_ENTRY");
+        r.fill_opt_strs(
+            "AT_EXECFN,AT_PLATFORM",
+            &mut [&mut p.auxv.at_execfn, &mut p.auxv.at_platform],
+        );
+        r.fill_u64s(
+            "AT_BASE,AT_ENTRY",
+            &mut [&mut p.auxv.at_base, &mut p.auxv.at_entry],
+        );
     }
 
     if r.enter(val, "syscall", "syscall,wchan,policy,priority") {
-        r.fill_str("syscall", &mut p.syscall.syscall);
-        r.fill_str("wchan", &mut p.syscall.wchan);
-        p.syscall.policy = r.i32("policy");
-        p.syscall.priority = r.i32("priority");
+        r.fill_strs(
+            "syscall,wchan",
+            &mut [&mut p.syscall.syscall, &mut p.syscall.wchan],
+        );
+        r.fill_i32s(
+            "policy,priority",
+            &mut [&mut p.syscall.policy, &mut p.syscall.priority],
+        );
     }
 
     if r.enter(val, "timing", "exec_ms,first_conceal_ms") {
@@ -309,21 +532,26 @@ fn fill_profile_json(val: &Json, p: &mut Profile) -> Result<(), String> {
     for item in val.req_arr("fds")? {
         let mut fr = JRead::new(item, "fd,target", "fds")?;
         let fd = fr.i32("fd");
-        if fd < 0 {
-            return Err("fds.fd: must be non-negative".to_string());
-        }
-        let target = fr.str("target");
+        let target = fr.str_ref("target");
         fr.check()?;
-        p.fds.push(ProfileFd { fd, target });
+        if strict && fd < 0 {
+            return Err(own("fds.fd < 0"));
+        }
+        p.fds.push(ProfileFd {
+            fd,
+            target: own(target),
+        });
     }
 
     for item in val.req_arr("task")? {
         let mut tr = JRead::new(item, "tid,comm,state", "task")?;
-        let tid = tr.i32("tid");
-        let comm = tr.str("comm");
-        let state = tr.str("state");
+        let (tid, comm, state) = (tr.i32("tid"), tr.str_ref("comm"), tr.str_ref("state"));
         tr.check()?;
-        p.task.push(ProfileTask { tid, comm, state });
+        p.task.push(ProfileTask {
+            tid,
+            comm: own(comm),
+            state: own(state),
+        });
     }
 
     match val.get("children") {
@@ -331,104 +559,155 @@ fn fill_profile_json(val: &Json, p: &mut Profile) -> Result<(), String> {
         Some(Json::Arr(arr)) => {
             p.children.reserve(arr.len());
             for child in arr {
-                p.children.push(Profile::from_json(child)?);
+                p.children.push(parse_child_profile(child, strict)?);
             }
         }
-        Some(_) => return Err("profile.children: expected array or null".to_string()),
+        Some(_) => return Err(own("profile.children: expected array")),
     }
+    p.parent = parse_opt_profile(val, "parent", strict)?;
+    p.tracer = parse_opt_profile(val, "tracer", strict)?;
     Ok(())
 }
 
 impl Profile {
-    /// Parse a JSON string into a strictly validated `schema: 1` `Profile`.
+    /// Parse a JSON string into a strictly validated `schema: 2` `Profile`.
+    #[inline(never)]
     pub fn parse_str(input: &str) -> Result<Profile, String> {
         let doc = json::parse(input)?;
         Profile::from_json(&doc)
     }
 
     /// Parse a `Json` DOM into a `Profile`, rejecting unknown fields at every level
-    /// and enforcing `schema == 1`.
+    /// and enforcing `schema == 2`.
+    #[inline(never)]
     pub fn from_json(val: &Json) -> Result<Profile, String> {
-        let mut p = Profile::default();
-        fill_profile_json(val, &mut p)?;
-        Ok(p)
+        parse_child_profile(val, true)
     }
 
+    #[inline(never)]
     pub fn write_json(&self, w: &mut Jw) {
         w.obj_open();
         w.k_i64("schema", self.schema as i64);
 
         w.k_obj("source");
-        w.k_str("masker", &self.source.masker);
-        w.k_str("profile", &self.source.profile);
-        w.k_str("version", &self.source.version);
+        w.k_strs(
+            "masker,profile,version",
+            &[
+                &self.source.masker,
+                &self.source.profile,
+                &self.source.version,
+            ],
+        );
         w.k_some_u64("observer_uid", self.source.observer_uid.map(u64::from));
         w.obj_close();
 
         w.k_obj("identity");
-        w.k_str("label", &self.identity.label);
-        w.k_str("comm", &self.identity.comm);
+        w.k_strs(
+            "label,comm,cwd,root,exe",
+            &[
+                &self.identity.label,
+                &self.identity.comm,
+                &self.identity.cwd,
+                &self.identity.root,
+                &self.identity.exe,
+            ],
+        );
         w.k_str_arr("argv", &self.identity.argv);
         w.k_some_u64(
             "cmdline_raw_nuls",
             self.identity.cmdline_raw_nuls.map(|n| n as u64),
         );
-        w.k_i64("pid", self.identity.pid as i64);
-        w.k_i64("ppid", self.identity.ppid as i64);
-        w.k_i64("uid", self.identity.uid as i64);
-        w.k_i64("gid", self.identity.gid as i64);
+        w.k_i64s(
+            "pid,ppid,pgid,sid,uid,gid",
+            &[
+                self.identity.pid as i64,
+                self.identity.ppid as i64,
+                self.identity.pgid as i64,
+                self.identity.sid as i64,
+                self.identity.uid as i64,
+                self.identity.gid as i64,
+            ],
+        );
+        w.k_u32_arr("groups", &self.identity.groups);
         w.k_u64("starttime", self.identity.starttime);
-        w.k_str("cwd", &self.identity.cwd);
-        w.k_str("root", &self.identity.root);
-        w.k_str("exe", &self.identity.exe);
         w.k_some_str("exe_memfd", &self.identity.exe_memfd);
         w.k_obj("ns");
-        w.k_some_str("pid", &self.identity.ns.pid);
-        w.k_some_str("mnt", &self.identity.ns.mnt);
-        w.k_some_str("user", &self.identity.ns.user);
-        w.k_some_str("net", &self.identity.ns.net);
+        w.k_some_strs(
+            "pid,mnt,user,net",
+            &[
+                &self.identity.ns.pid,
+                &self.identity.ns.mnt,
+                &self.identity.ns.user,
+                &self.identity.ns.net,
+            ],
+        );
         w.obj_close();
         w.obj_close();
 
         w.k_obj("status");
-        w.k_str("Name", &self.status.name);
-        w.k_str("State", &self.status.state);
-        w.k_i64("PPid", self.status.ppid as i64);
-        w.k_str("Uid", &self.status.uid);
-        w.k_str("Gid", &self.status.gid);
-        w.k_i64("Threads", self.status.threads as i64);
-        w.k_i64("TracerPid", self.status.tracer_pid as i64);
-        w.k_i64("NoNewPrivs", self.status.no_new_privs as i64);
-        w.k_i64("Seccomp", self.status.seccomp as i64);
-        w.k_i64("Seccomp_filters", self.status.seccomp_filters as i64);
-        w.k_str("CapEff", &self.status.cap_eff);
-        w.k_str("CapPrm", &self.status.cap_prm);
-        w.k_str("CapBnd", &self.status.cap_bnd);
+        w.k_strs(
+            "Name,State,Uid,Gid,CapEff,CapPrm,CapBnd",
+            &[
+                &self.status.name,
+                &self.status.state,
+                &self.status.uid,
+                &self.status.gid,
+                &self.status.cap_eff,
+                &self.status.cap_prm,
+                &self.status.cap_bnd,
+            ],
+        );
+        w.k_i64s(
+            "PPid,Threads,TracerPid,NoNewPrivs,Seccomp,Seccomp_filters",
+            &[
+                self.status.ppid as i64,
+                self.status.threads as i64,
+                self.status.tracer_pid as i64,
+                self.status.no_new_privs as i64,
+                self.status.seccomp as i64,
+                self.status.seccomp_filters as i64,
+            ],
+        );
         w.k_some_u64("VmLck", self.status.vm_lck);
         w.k_some_u64("RssShmem", self.status.rss_shmem);
         w.obj_close();
 
         w.k_obj("stat");
-        w.k_i64("ppid", self.stat.ppid as i64);
-        w.k_i64("num_threads", self.stat.num_threads as i64);
-        w.k_u64("starttime", self.stat.starttime);
-        w.k_u64("vsize", self.stat.vsize);
-        w.k_u64("rss", self.stat.rss);
+        w.k_i64s(
+            "ppid,num_threads",
+            &[self.stat.ppid as i64, self.stat.num_threads as i64],
+        );
+        w.k_u64s(
+            "starttime,vsize,rss,arg_start,arg_end,env_start,env_end,startstack",
+            &[
+                self.stat.starttime,
+                self.stat.vsize,
+                self.stat.rss,
+                self.stat.arg_start,
+                self.stat.arg_end,
+                self.stat.env_start,
+                self.stat.env_end,
+                self.stat.startstack,
+            ],
+        );
         w.k_some_u64("flags", self.stat.flags);
-        w.k_u64("arg_start", self.stat.arg_start);
-        w.k_u64("arg_end", self.stat.arg_end);
-        w.k_u64("env_start", self.stat.env_start);
-        w.k_u64("env_end", self.stat.env_end);
-        w.k_u64("startstack", self.stat.startstack);
         w.obj_close();
 
         w.k_obj("memory");
-        w.k_str_arr("maps", &self.memory.maps);
-        w.k_str_arr("smaps", &self.memory.smaps);
+        w.k_str_arrs(
+            "maps,smaps,token_placements,readable_by,denied_by",
+            &[
+                &self.memory.maps,
+                &self.memory.smaps,
+                &self.memory.token_placements,
+                &self.memory.readable_by,
+                &self.memory.denied_by,
+            ],
+        );
         w.k_bool("token_present", self.memory.token_present);
         w.k_opt_str("token_sha256", &self.memory.token_sha256);
-        w.k_str_arr("readable_by", &self.memory.readable_by);
-        w.k_str_arr("denied_by", &self.memory.denied_by);
+        w.k_some_u64("token_len", self.memory.token_len.map(u64::from));
+        w.k_some_str("token_charset", &self.memory.token_charset);
         w.obj_close();
 
         w.k_arr("fds");
@@ -443,27 +722,31 @@ impl Profile {
         w.k_obj("auxv");
         w.k_opt_str("AT_EXECFN", &self.auxv.at_execfn);
         w.k_opt_str("AT_PLATFORM", &self.auxv.at_platform);
-        w.k_u64("AT_BASE", self.auxv.at_base);
-        w.k_u64("AT_ENTRY", self.auxv.at_entry);
+        w.k_u64s("AT_BASE,AT_ENTRY", &[self.auxv.at_base, self.auxv.at_entry]);
         w.obj_close();
 
         w.k_str_arr("environ", &self.environ);
+        w.k_u64("environ_raw_len", self.environ_raw_len);
+        w.k_bool("environ_all_nul", self.environ_all_nul);
 
         w.k_arr("task");
         for t in &self.task {
             w.elem_obj();
             w.k_i64("tid", t.tid as i64);
-            w.k_str("comm", &t.comm);
-            w.k_str("state", &t.state);
+            w.k_strs("comm,state", &[&t.comm, &t.state]);
             w.obj_close();
         }
         w.arr_close();
 
         w.k_obj("syscall");
-        w.k_str("syscall", &self.syscall.syscall);
-        w.k_str("wchan", &self.syscall.wchan);
-        w.k_i64("policy", self.syscall.policy as i64);
-        w.k_i64("priority", self.syscall.priority as i64);
+        w.k_strs(
+            "syscall,wchan",
+            &[&self.syscall.syscall, &self.syscall.wchan],
+        );
+        w.k_i64s(
+            "policy,priority",
+            &[self.syscall.policy as i64, self.syscall.priority as i64],
+        );
         w.obj_close();
 
         w.k_obj("timing");
@@ -474,13 +757,17 @@ impl Profile {
         if let Some(d) = self.dumpable {
             w.k_bool("dumpable", d);
         }
-        if !self.children.is_empty() {
-            w.k_arr("children");
-            for child in &self.children {
-                w.elem();
-                child.write_json(w);
+        w.k_arr("children");
+        for child in &self.children {
+            w.elem();
+            child.write_json(w);
+        }
+        w.arr_close();
+        for (k, opt) in [("parent", &self.parent), ("tracer", &self.tracer)] {
+            if let Some(ref p) = opt {
+                w.key(k);
+                p.write_json(w);
             }
-            w.arr_close();
         }
         w.obj_close();
     }
@@ -497,67 +784,81 @@ impl Profile {
     }
 
     /// Validate schema invariants and verify zero real secrets leaked anywhere in the profile.
+    #[inline(never)]
     pub fn validate(&self, forbidden_secrets: &[&str]) -> Result<(), String> {
+        self.validate_inner(forbidden_secrets, true)
+    }
+
+    fn validate_inner(
+        &self,
+        forbidden_secrets: &[&str],
+        check_serialized: bool,
+    ) -> Result<(), String> {
         let bad = if self.schema != PROFILE_SCHEMA {
-            Some("invalid profile schema (expected 1)")
-        } else if self.identity.comm.trim().is_empty() {
-            Some("profile identity.comm must not be empty")
-        } else if self.identity.label.trim().is_empty() {
-            Some("profile identity.label must not be empty")
+            Some("bad schema")
+        } else if self.identity.comm.trim().is_empty() || self.identity.label.trim().is_empty() {
+            Some("empty comm/label")
         } else if self.identity.pid < 0 || self.identity.ppid < 0 {
-            Some("profile identity.pid and ppid must be non-negative")
+            Some("negative pid/ppid")
         } else if self.status.threads == 0 || self.stat.num_threads == 0 {
-            Some("profile thread count must be >= 1")
+            Some("zero threads")
         } else if self.memory.token_sha256.as_deref().is_some_and(|h| {
             h.len() != 64 || !h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
         }) {
-            Some("profile memory.token_sha256 must be 64 lowercase hex chars")
+            Some("bad token_sha256")
+        } else if self
+            .memory
+            .token_placements
+            .iter()
+            .any(|pl| !csv_has("anon,argv,environ,heap,stack", pl))
+        {
+            Some("bad token_placements")
         } else if !self.timing.exec_ms.is_finite()
             || self.timing.exec_ms < 0.0
             || !self.timing.first_conceal_ms.is_finite()
             || self.timing.first_conceal_ms < 0.0
         {
-            Some("profile timing values must be finite and non-negative")
+            Some("bad timing")
         } else {
             None
         };
         if let Some(msg) = bad {
-            return Err(msg.to_string());
+            return Err(own(msg));
         }
 
-        // Check for unredacted sensitive environment entries.
         for entry in &self.environ {
             if let Some((k, v)) = entry.split_once('=') {
                 if is_sensitive_env_key(k) && !v.is_empty() && !v.starts_with("<REDACTED") {
-                    return Err(cat3(
-                        "unredacted sensitive environment variable '",
-                        k,
-                        "' in profile",
-                    ));
+                    return Err(cat2("unredacted env ", k));
                 }
             }
             if contains_unredacted_secret_pattern(entry) {
-                return Err("unredacted secret pattern in profile environ".to_string());
+                return Err(own("secret in environ"));
             }
         }
         for arg in &self.identity.argv {
             if contains_unredacted_secret_pattern(arg) {
-                return Err("unredacted secret pattern in profile argv".to_string());
+                return Err(own("secret in argv"));
             }
         }
 
-        // Serialize and scan the entire profile JSON for any forbidden secret value.
-        if !forbidden_secrets.is_empty() {
+        if check_serialized && !forbidden_secrets.is_empty() {
             let serialized = self.to_json_str(false);
             for &secret in forbidden_secrets {
                 if !secret.is_empty() && serialized.contains(secret) {
-                    return Err("forbidden secret leaked in serialized profile JSON".to_string());
+                    return Err(own("forbidden secret leaked"));
                 }
             }
         }
 
+        if let Some(ref p) = self.parent {
+            p.validate_inner(forbidden_secrets, false)?;
+        }
+        if let Some(ref p) = self.tracer {
+            p.validate_inner(forbidden_secrets, false)?;
+        }
         for child in &self.children {
-            child.validate(forbidden_secrets)?;
+            child.validate_inner(forbidden_secrets, false)?;
         }
         Ok(())
     }
@@ -565,22 +866,35 @@ impl Profile {
 
 fn contains_ascii_ci(hay: &str, needle_upper: &[u8]) -> bool {
     let hb = hay.as_bytes();
-    if needle_upper.len() > hb.len() {
-        return false;
-    }
-    hb.windows(needle_upper.len()).any(|w| {
-        w.iter()
-            .zip(needle_upper.iter())
-            .all(|(&a, &b)| a.to_ascii_uppercase() == b)
-    })
+    needle_upper.len() <= hb.len()
+        && hb.windows(needle_upper.len()).any(|w| {
+            w.iter()
+                .zip(needle_upper.iter())
+                .all(|(&a, &b)| a.to_ascii_uppercase() == b)
+        })
 }
 
+#[inline(never)]
 pub fn is_sensitive_env_key(key: &str) -> bool {
-    "SECRET,TOKEN,PASSWORD,PASSWD,API_KEY,APIKEY,PRIVATE_KEY,CREDENTIAL,AUTH_KEY"
-        .split(',')
-        .any(|k| contains_ascii_ci(key, k.as_bytes()))
+    let mut csv = "SECRET,TOKEN,PASSWORD,PASSWD,API_KEY,APIKEY,PRIVATE_KEY,CREDENTIAL,AUTH_KEY";
+    while !csv.is_empty() {
+        if contains_ascii_ci(key, next_csv(&mut csv).as_bytes()) {
+            return true;
+        }
+    }
+    false
 }
 
+fn is_akia_at(b: &[u8]) -> bool {
+    b.len() >= 20
+        && b.starts_with(b"AKIA")
+        && b.get(4..20).is_some_and(|s| {
+            s.iter()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        })
+}
+
+#[inline(never)]
 pub fn contains_unredacted_secret_pattern(s: &str) -> bool {
     if (s.contains("-----BEGIN ") && s.contains("PRIVATE KEY-----"))
         || s.contains("ghp_")
@@ -590,15 +904,10 @@ pub fn contains_unredacted_secret_pattern(s: &str) -> bool {
     {
         return true;
     }
-    // AWS access key ID pattern: AKIA + 16 uppercase alphanumeric chars
     let bytes = s.as_bytes();
-    if bytes.len() >= 20 {
-        for i in 0..=bytes.len() - 20 {
-            if &bytes[i..i + 4] == b"AKIA"
-                && bytes[i + 4..i + 20]
-                    .iter()
-                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
-            {
+    for i in 0..bytes.len().saturating_sub(19) {
+        if let Some(rest) = bytes.get(i..) {
+            if is_akia_at(rest) {
                 return true;
             }
         }
@@ -624,11 +933,10 @@ pub fn has_unredacted_secret_in_environ(env_text: &str) -> bool {
 }
 
 fn is_win_drive(b: &[u8], i: usize) -> bool {
-    i + 2 < b.len()
-        && b[i].is_ascii_alphabetic()
-        && b[i + 1] == b':'
-        && matches!(b[i + 2], b'\\' | b'/')
-        && !(i > 0 && b[i - 1].is_ascii_alphanumeric())
+    matches!(
+        (b.get(i), b.get(i + 1), b.get(i + 2)),
+        (Some(c), Some(&b':'), Some(b'\\' | b'/')) if c.is_ascii_alphabetic()
+    ) && !(i > 0 && b.get(i - 1).is_some_and(u8::is_ascii_alphanumeric))
 }
 
 fn is_runner_home(after: &str) -> bool {
@@ -640,6 +948,7 @@ fn is_runner_home(after: &str) -> bool {
 }
 
 /// Detect host home paths (`/Users/`, `/home/<non-runner>`, or Windows drive paths `C:\`).
+#[inline(never)]
 pub fn contains_host_home_path(text: &str, allow_synthetic_runner: bool) -> Option<&'static str> {
     if text.contains("/Users/") {
         return Some("/Users/");
@@ -651,12 +960,12 @@ pub fn contains_host_home_path(text: &str, allow_synthetic_runner: bool) -> Opti
         }
     }
     let mut start = 0usize;
-    while let Some(rel) = text[start..].find("/home/") {
-        let pos = start + rel;
-        if !(allow_synthetic_runner && is_runner_home(&text[pos + 6..])) {
+    while let Some(rel) = text.get(start..).and_then(|t| t.find("/home/")) {
+        let pos = start + rel + 6;
+        if !(allow_synthetic_runner && text.get(pos..).is_some_and(is_runner_home)) {
             return Some("/home/");
         }
-        start = pos + 6;
+        start = pos;
     }
     None
 }
@@ -665,53 +974,133 @@ pub fn contains_host_home_path(text: &str, allow_synthetic_runner: bool) -> Opti
 /// and Windows drive paths (`C:\...`, `c:/...`) into neutral `/srv/work` paths.
 #[inline(never)]
 pub fn sanitize_host_home(s: &str) -> String {
-    let mut out = s.to_string();
-    for prefix in ["/Users/", "/home/"] {
-        let mut cursor = 0usize;
-        while let Some(rel) = out[cursor..].find(prefix) {
-            let pos = cursor + rel;
-            let after_idx = pos + prefix.len();
-            let after = &out[after_idx..];
-            if prefix == "/home/" && is_runner_home(after) {
-                cursor = after_idx;
-                continue;
-            }
-            let user_end = after
-                .find(['/', ':', ' ', '"', '\'', '\n', '\0'])
+    let mut mid = String::with_capacity(s.len());
+    let mut rest = s;
+    loop {
+        let p_u = rest.find("/Users/");
+        let p_h = rest.find("/home/");
+        let next = match (p_u, p_h) {
+            (Some(a), Some(b)) if a <= b => Some((a, 7usize, false)),
+            (Some(_), Some(b)) => Some((b, 6, true)),
+            (Some(a), None) => Some((a, 7, false)),
+            (None, Some(b)) => Some((b, 6, true)),
+            (None, None) => None,
+        };
+        let Some((pos, plen, is_home)) = next else {
+            mid.push_str(rest);
+            break;
+        };
+        mid.push_str(rest.get(..pos).unwrap_or(""));
+        let after = rest.get(pos + plen..).unwrap_or("");
+        if is_home && is_runner_home(after) {
+            mid.push_str("/home/");
+            rest = after;
+        } else {
+            let uend = after
+                .bytes()
+                .position(|b| matches!(b, b'/' | b':' | b' ' | b'"' | b'\'' | b'\n' | b'\0'))
                 .unwrap_or(after.len());
-            out.replace_range(pos..after_idx + user_end, "/srv/work");
-            cursor = pos + 9;
+            mid.push_str("/srv/work");
+            rest = after.get(uend..).unwrap_or("");
         }
     }
 
-    let mut cursor = 0usize;
-    while cursor + 2 < out.len() {
-        if !is_win_drive(out.as_bytes(), cursor) {
-            cursor += 1;
+    let bytes = mid.as_bytes();
+    let mut out = String::with_capacity(mid.len());
+    let mut i = 0usize;
+    let mut copied = 0usize;
+    while i + 2 < bytes.len() {
+        if !is_win_drive(bytes, i) {
+            i += 1;
             continue;
         }
-        let rest = &out[cursor + 3..];
-        let seg_end = rest
-            .find([' ', '\t', '\n', '\r', '"', '\'', ';', '\0'])
-            .unwrap_or(rest.len());
-        let mut norm_tail = rest[..seg_end].replace('\\', "/");
-        if let Some(after_users) = norm_tail
-            .strip_prefix("Users/")
-            .or_else(|| norm_tail.strip_prefix("users/"))
-        {
-            let uend = after_users.find('/').unwrap_or(after_users.len());
-            norm_tail = after_users[uend..].trim_start_matches('/').to_string();
+        out.push_str(mid.get(copied..i).unwrap_or(""));
+        let after = mid.get(i + 3..).unwrap_or("");
+        let seg_end = after
+            .bytes()
+            .position(|b| {
+                matches!(
+                    b,
+                    b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\'' | b';' | b'\0'
+                )
+            })
+            .unwrap_or(after.len());
+        let mut tail = String::with_capacity(seg_end);
+        for c in after.get(..seg_end).unwrap_or("").chars() {
+            tail.push(if c == '\\' { '/' } else { c });
         }
-        let rep = if norm_tail.is_empty() {
-            "/srv/work".to_string()
+        let trimmed = if let Some(au) = tail
+            .strip_prefix("Users/")
+            .or_else(|| tail.strip_prefix("users/"))
+        {
+            let uend = au.find('/').unwrap_or(au.len());
+            au.get(uend..).unwrap_or("").trim_start_matches('/')
         } else {
-            cat2("/srv/work/", &norm_tail)
+            tail.as_str()
         };
-        let nlen = rep.len();
-        out.replace_range(cursor..cursor + 3 + seg_end, &rep);
-        cursor += nlen;
+        out.push_str("/srv/work");
+        if !trimmed.is_empty() {
+            out.push('/');
+            out.push_str(trimmed);
+        }
+        i += 3 + seg_end;
+        copied = i;
     }
+    out.push_str(mid.get(copied..).unwrap_or(""));
     out
+}
+
+fn strip_proc_newline(raw: &[u8]) -> String {
+    let mut s = raw;
+    if let Some(t) = s.strip_suffix(b"\n") {
+        s = t;
+    }
+    if let Some(t) = s.strip_suffix(b"\r") {
+        s = t;
+    }
+    lossy(s)
+}
+
+#[inline(never)]
+fn find_inline_secret_bytes(hay: &[u8]) -> Option<&[u8]> {
+    const RULES: &[(&[u8], usize, usize, u8)] = &[
+        (b"TOK-", 10, 68, 7),
+        (b"github_pat_", 21, 107, 2),
+        (b"ghp_", 14, 68, 0),
+        (b"xoxb-", 13, 69, 1),
+        (b"xoxp-", 13, 69, 1),
+    ];
+    for i in 0..hay.len() {
+        let Some(rest) = hay.get(i..) else { break };
+        let boundary = i == 0 || !hay.get(i - 1).is_some_and(u8::is_ascii_alphanumeric);
+        for &(pfx, min_len, max_len, flags) in RULES {
+            if ((flags & 4) == 0 || boundary) && rest.starts_with(pfx) {
+                let mut end = pfx.len();
+                let lim = rest.len().min(max_len);
+                while let Some(&b) = rest.get(end) {
+                    if end >= lim
+                        || !(b.is_ascii_alphanumeric()
+                            || ((flags & 1) != 0 && b == b'-')
+                            || ((flags & 2) != 0 && b == b'_'))
+                    {
+                        break;
+                    }
+                    end += 1;
+                }
+                if end >= min_len {
+                    return rest.get(..end);
+                }
+            }
+        }
+        if boundary && is_akia_at(rest) {
+            return rest.get(..20);
+        }
+    }
+    None
+}
+
+fn find_inline_secret_str(s: &str) -> Option<&str> {
+    find_inline_secret_bytes(s.as_bytes()).and_then(|b| std::str::from_utf8(b).ok())
 }
 
 fn redacted_marker(len: usize) -> String {
@@ -719,13 +1108,31 @@ fn redacted_marker(len: usize) -> String {
 }
 
 #[inline(never)]
-fn scrub_tokens(s: &str, tokens: &[String], found: &mut bool) -> String {
-    let mut out = s.to_string();
+fn scrub_tokens_with<'a>(
+    s: &str,
+    tokens: &'a [String],
+    matched: &mut Option<&'a str>,
+) -> (String, bool) {
+    let mut out = own(s);
+    let mut hit = false;
     for tok in tokens {
         if !tok.is_empty() && out.contains(tok.as_str()) {
-            *found = true;
+            hit = true;
+            if matched.is_none() {
+                *matched = Some(tok.as_str());
+            }
             out = out.replace(tok.as_str(), &redacted_marker(tok.len()));
         }
+    }
+    (out, hit)
+}
+
+#[cfg(test)]
+fn scrub_tokens(s: &str, tokens: &[String], found: &mut bool) -> String {
+    let mut m = None;
+    let (out, hit) = scrub_tokens_with(s, tokens, &mut m);
+    if hit {
+        *found = true;
     }
     out
 }
@@ -739,15 +1146,7 @@ fn is_perm_denied(err: &io::Error) -> bool {
 }
 
 #[inline(never)]
-fn read_proc_bytes(path: &str, max_len: usize) -> Result<Vec<u8>, i32> {
-    let fd = sys::open(
-        path.as_bytes(),
-        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
-        0,
-    );
-    if fd < 0 {
-        return Err(sys::errno());
-    }
+fn read_fd_bytes(fd: i32, max_len: usize) -> Result<Vec<u8>, i32> {
     let mut out = Vec::new();
     let mut chunk = [0u8; 4096];
     while out.len() < max_len {
@@ -762,14 +1161,28 @@ fn read_proc_bytes(path: &str, max_len: usize) -> Result<Vec<u8>, i32> {
             if e == libc::EINTR {
                 continue;
             }
-            sys::close(fd);
             return Err(e);
         }
     }
-    sys::close(fd);
     Ok(out)
 }
 
+#[inline(never)]
+fn read_proc_bytes(path: &str, max_len: usize) -> Result<Vec<u8>, i32> {
+    let fd = sys::open(
+        path.as_bytes(),
+        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        0,
+    );
+    if fd < 0 {
+        return Err(sys::errno());
+    }
+    let res = read_fd_bytes(fd, max_len);
+    sys::close(fd);
+    res
+}
+
+#[inline(never)]
 fn proc_path(pid: i32, suffix: &str) -> String {
     let mut s = String::with_capacity(16 + suffix.len());
     s.push_str("/proc/");
@@ -785,29 +1198,33 @@ fn detect_exe_memfd(exe: &str) -> Option<String> {
     let trimmed = exe.strip_prefix('/').unwrap_or(exe);
     let rest = trimmed.strip_prefix("memfd:")?;
     let name = rest.strip_suffix(" (deleted)").unwrap_or(rest).trim();
-    (!name.is_empty()).then(|| name.to_string())
+    (!name.is_empty()).then(|| own(name))
 }
 
 fn parse_cmdline(raw: &[u8]) -> (Vec<String>, usize) {
     let mut end = raw.len();
-    while end > 0 && raw[end - 1] == 0 {
+    while end > 0 && raw.get(end - 1) == Some(&0) {
         end -= 1;
     }
     let trailing_nuls = raw.len() - end;
-    if end == 0 {
-        return (Vec::new(), trailing_nuls);
+    let mut argv = Vec::new();
+    if let Some(body) = raw.get(..end) {
+        if !body.is_empty() {
+            for part in body.split(|&b| b == 0) {
+                argv.push(lossy(part));
+            }
+        }
     }
-    let argv = raw[..end]
-        .split(|&b| b == 0)
-        .map(|part| String::from_utf8_lossy(part).into_owned())
-        .collect();
     (argv, trailing_nuls)
 }
 
+#[derive(Default)]
 struct ParsedStat {
     comm: String,
     state: String,
     ppid: i32,
+    pgid: i32,
+    sid: i32,
     flags: u64,
     priority: i32,
     num_threads: u32,
@@ -822,44 +1239,84 @@ struct ParsedStat {
     env_end: u64,
 }
 
-fn stat_u64(fields: &[&str], idx: usize) -> Option<u64> {
-    fields.get(idx).and_then(|s| json::parse_u64_s(s))
-}
-
-fn stat_i32(fields: &[&str], idx: usize) -> Option<i32> {
-    fields.get(idx).and_then(|s| json::parse_i32_s(s))
-}
-
+#[inline(never)]
 fn parse_proc_stat(raw: &[u8]) -> Result<ParsedStat, String> {
-    let bad = "malformed /proc/PID/stat";
-    let open = raw.iter().position(|&b| b == b'(').ok_or(bad)?;
-    let close = raw.iter().rposition(|&b| b == b')').ok_or(bad)?;
-    if close <= open {
-        return Err(bad.to_string());
+    let (Some(open), Some(close)) = (
+        raw.iter().position(|&b| b == b'('),
+        raw.iter().rposition(|&b| b == b')'),
+    ) else {
+        return Err(own("bad stat"));
+    };
+    let Some(comm_b) = raw.get(open + 1..close) else {
+        return Err(own("bad stat"));
+    };
+    let mut ps = ParsedStat {
+        comm: lossy(comm_b),
+        ..Default::default()
+    };
+    let rest = raw
+        .get(close + 1..)
+        .and_then(|b| std::str::from_utf8(b).ok())
+        .unwrap_or("");
+    let mut count = 0usize;
+    let mut req_mask = 0u8;
+    for (idx, tok) in rest.split_ascii_whitespace().enumerate() {
+        count = idx + 1;
+        if idx == 0 {
+            json::assign_str(&mut ps.state, tok);
+            continue;
+        }
+        let u_opt = json::parse_u64_s(tok);
+        let u = u_opt.unwrap_or(0);
+        let iv = || json::parse_i32_s(tok);
+        match idx {
+            1 => {
+                if let Some(v) = iv() {
+                    ps.ppid = v;
+                    req_mask |= 1;
+                }
+            }
+            2 => ps.pgid = iv().unwrap_or(0),
+            3 => ps.sid = iv().unwrap_or(0),
+            6 => ps.flags = u,
+            15 => ps.priority = iv().unwrap_or(0),
+            17 => {
+                if u_opt.is_some() {
+                    ps.num_threads = u.max(1) as u32;
+                    req_mask |= 2;
+                }
+            }
+            19 => {
+                if u_opt.is_some() {
+                    ps.starttime = u;
+                    req_mask |= 4;
+                }
+            }
+            20 => {
+                if u_opt.is_some() {
+                    ps.vsize = u;
+                    req_mask |= 8;
+                }
+            }
+            21 => {
+                if u_opt.is_some() {
+                    ps.rss = u;
+                    req_mask |= 16;
+                }
+            }
+            25 => ps.startstack = u,
+            38 => ps.policy = iv().unwrap_or(0),
+            45 => ps.arg_start = u,
+            46 => ps.arg_end = u,
+            47 => ps.env_start = u,
+            48 => ps.env_end = u,
+            _ => {}
+        }
     }
-    let comm = String::from_utf8_lossy(&raw[open + 1..close]).into_owned();
-    let rest = std::str::from_utf8(&raw[close + 1..]).unwrap_or("");
-    let f: Vec<&str> = rest.split_ascii_whitespace().collect();
-    if f.len() < 22 {
-        return Err(bad.to_string());
+    if count < 22 || req_mask != 0b11111 {
+        return Err(own("bad stat"));
     }
-    Ok(ParsedStat {
-        comm,
-        state: f[0].to_string(),
-        ppid: stat_i32(&f, 1).ok_or(bad)?,
-        flags: stat_u64(&f, 6).unwrap_or(0),
-        priority: stat_i32(&f, 15).unwrap_or(0),
-        num_threads: stat_u64(&f, 17).ok_or(bad)?.max(1) as u32,
-        starttime: stat_u64(&f, 19).ok_or(bad)?,
-        vsize: stat_u64(&f, 20).ok_or(bad)?,
-        rss: stat_u64(&f, 21).ok_or(bad)?,
-        startstack: stat_u64(&f, 25).unwrap_or(0),
-        policy: stat_i32(&f, 38).unwrap_or(0),
-        arg_start: stat_u64(&f, 45).unwrap_or(0),
-        arg_end: stat_u64(&f, 46).unwrap_or(0),
-        env_start: stat_u64(&f, 47).unwrap_or(0),
-        env_end: stat_u64(&f, 48).unwrap_or(0),
-    })
+    Ok(ps)
 }
 
 fn parse_status_kb_field(val: &str) -> Option<u64> {
@@ -868,102 +1325,128 @@ fn parse_status_kb_field(val: &str) -> Option<u64> {
         .and_then(json::parse_u64_s)
 }
 
-fn parse_ugid_eff(val: &str) -> u32 {
-    let mut parts = val.split_ascii_whitespace();
-    let real = parts.next().and_then(json::parse_u32_s).unwrap_or(0);
-    parts.next().and_then(json::parse_u32_s).unwrap_or(real)
-}
-
-fn normalize_ws_join(val: &str) -> String {
-    let mut out = String::new();
+#[inline(never)]
+fn parse_ugid(val: &str, dst: &mut String, eff: &mut u32) {
+    dst.clear();
+    let mut real = 0u32;
+    let mut got_eff = false;
     for (i, part) in val.split_ascii_whitespace().enumerate() {
         if i > 0 {
-            out.push(' ');
+            dst.push(' ');
         }
-        out.push_str(part);
+        dst.push_str(part);
+        if i == 0 {
+            real = json::parse_u32_s(part).unwrap_or(0);
+        } else if i == 1 {
+            if let Some(v) = json::parse_u32_s(part) {
+                *eff = v;
+                got_eff = true;
+            }
+        }
     }
-    out
+    if !got_eff {
+        *eff = real;
+    }
 }
 
+#[inline(never)]
 fn default_status() -> ProfileStatus {
     ProfileStatus {
-        state: "S".to_string(),
-        uid: "0 0 0 0".to_string(),
-        gid: "0 0 0 0".to_string(),
+        state: own("S"),
+        uid: own("0 0 0 0"),
+        gid: own("0 0 0 0"),
         threads: 1,
-        cap_eff: "0000000000000000".to_string(),
-        cap_prm: "0000000000000000".to_string(),
-        cap_bnd: "0000000000000000".to_string(),
+        cap_eff: own("0000000000000000"),
+        cap_prm: own("0000000000000000"),
+        cap_bnd: own("0000000000000000"),
         ..Default::default()
     }
 }
 
-fn parse_proc_status(raw: &[u8]) -> (ProfileStatus, u32, u32) {
+#[inline(never)]
+fn parse_proc_status(raw: &[u8]) -> (ProfileStatus, u32, u32, Vec<u32>) {
     let mut st = default_status();
     let mut euid = 0u32;
     let mut egid = 0u32;
-
-    let text = String::from_utf8_lossy(raw);
+    let mut groups = Vec::new();
+    let text = lossy(raw);
     for line in text.lines() {
-        let Some((k, v)) = line.split_once(':') else {
+        let Some((k, raw_v)) = line.split_once(':') else {
             continue;
         };
-        let v = v.trim();
+        if k == "Name" {
+            json::assign_str(&mut st.name, raw_v.trim_start_matches('\t'));
+            continue;
+        }
+        let v = raw_v.trim();
+        let u32v = json::parse_u32_s(v).unwrap_or(0);
+        let i32v = json::parse_i32_s(v).unwrap_or(0);
         match k {
-            "Name" => st.name = v.to_string(),
             "State" => {
                 if let Some(code) = v.split_ascii_whitespace().next() {
-                    st.state = code.to_string();
+                    json::assign_str(&mut st.state, code);
                 }
             }
-            "PPid" => st.ppid = json::parse_i32_s(v).unwrap_or(0),
-            "Uid" => {
-                st.uid = normalize_ws_join(v);
-                euid = parse_ugid_eff(v);
+            "Uid" => parse_ugid(v, &mut st.uid, &mut euid),
+            "Gid" => parse_ugid(v, &mut st.gid, &mut egid),
+            "Groups" => {
+                for tok in v.split_ascii_whitespace() {
+                    if let Some(g) = json::parse_u32_s(tok) {
+                        groups.push(g);
+                    }
+                }
             }
-            "Gid" => {
-                st.gid = normalize_ws_join(v);
-                egid = parse_ugid_eff(v);
-            }
-            "Threads" => st.threads = json::parse_u32_s(v).unwrap_or(1).max(1),
-            "TracerPid" => st.tracer_pid = json::parse_i32_s(v).unwrap_or(0),
-            "NoNewPrivs" => st.no_new_privs = json::parse_u32_s(v).unwrap_or(0),
-            "Seccomp" => st.seccomp = json::parse_u32_s(v).unwrap_or(0),
-            "Seccomp_filters" => st.seccomp_filters = json::parse_u32_s(v).unwrap_or(0),
-            "CapEff" => st.cap_eff = v.to_string(),
-            "CapPrm" => st.cap_prm = v.to_string(),
-            "CapBnd" => st.cap_bnd = v.to_string(),
+            "CapEff" => json::assign_str(&mut st.cap_eff, v),
+            "CapPrm" => json::assign_str(&mut st.cap_prm, v),
+            "CapBnd" => json::assign_str(&mut st.cap_bnd, v),
+            "PPid" => st.ppid = i32v,
+            "TracerPid" => st.tracer_pid = i32v,
+            "Threads" => st.threads = u32v,
+            "NoNewPrivs" => st.no_new_privs = u32v,
+            "Seccomp" => st.seccomp = u32v,
+            "Seccomp_filters" => st.seccomp_filters = u32v,
             "VmLck" => st.vm_lck = parse_status_kb_field(v),
             "RssShmem" => st.rss_shmem = parse_status_kb_field(v),
             _ => {}
         }
     }
-    (st, euid, egid)
+    st.threads = st.threads.max(1);
+    (st, euid, egid, groups)
 }
 
+#[inline(never)]
+fn format_smaps_entry(hdr: &str, r: u64, p: u64, a: u64) -> String {
+    let mut line = String::with_capacity(hdr.len() + 48);
+    line.push_str(hdr);
+    line.push_str(" Rss:");
+    push_u64(&mut line, r);
+    line.push_str("kB Private_Dirty:");
+    push_u64(&mut line, p);
+    line.push_str("kB Anonymous:");
+    push_u64(&mut line, a);
+    line.push_str("kB");
+    line
+}
+
+#[inline(never)]
 fn normalize_maps(raw: &[u8]) -> Vec<String> {
-    let text = String::from_utf8_lossy(raw);
+    let text = lossy(raw);
     let mut out = Vec::new();
     for line in text.lines().take(MAX_MAPS_LINES) {
         let mut parts = line.split_ascii_whitespace();
-        let Some(_addr_range) = parts.next() else {
+        let (Some(_), Some(perms)) = (parts.next(), parts.next()) else {
             continue;
         };
-        let Some(perms) = parts.next() else {
-            continue;
-        };
-        let offset = parts.next().unwrap_or("00000000");
-        let dev = parts.next().unwrap_or("00:00");
-        let inode = parts.next().unwrap_or("0");
-        let mut s = String::with_capacity(64);
-        s.push_str("<addr> ");
-        s.push_str(perms);
-        s.push(' ');
-        s.push_str(offset);
-        s.push(' ');
-        s.push_str(dev);
-        s.push(' ');
-        s.push_str(inode);
+        let mut s = own("<addr>");
+        for p in [
+            perms,
+            parts.next().unwrap_or("00000000"),
+            parts.next().unwrap_or("00:00"),
+            parts.next().unwrap_or("0"),
+        ] {
+            s.push(' ');
+            s.push_str(p);
+        }
         for p in parts {
             s.push(' ');
             s.push_str(p);
@@ -973,58 +1456,38 @@ fn normalize_maps(raw: &[u8]) -> Vec<String> {
     out
 }
 
+#[inline(never)]
 fn normalize_smaps(raw: &[u8]) -> Vec<String> {
-    let text = String::from_utf8_lossy(raw);
+    let text = lossy(raw);
     let mut out = Vec::new();
     let mut cur_header: Option<String> = None;
-    let mut rss = 0u64;
-    let mut pdirty = 0u64;
-    let mut anon = 0u64;
-
-    let flush = |out: &mut Vec<String>, hdr: &mut Option<String>, r: u64, p: u64, a: u64| {
-        if let Some(h) = hdr.take() {
-            if out.len() < MAX_SMAPS_LINES {
-                let mut line = String::with_capacity(h.len() + 48);
-                line.push_str(&h);
-                line.push_str(" Rss:");
-                push_u64(&mut line, r);
-                line.push_str("kB Private_Dirty:");
-                push_u64(&mut line, p);
-                line.push_str("kB Anonymous:");
-                push_u64(&mut line, a);
-                line.push_str("kB");
-                out.push(line);
-            }
-        }
-    };
-
+    let mut counts = [0u64; 3];
     for line in text.lines() {
         if let Some((k, v)) = line.split_once(':') {
             if !k.contains(' ') && !k.contains('-') {
-                match k {
-                    "Rss" => rss = parse_status_kb_field(v).unwrap_or(0),
-                    "Private_Dirty" => pdirty = parse_status_kb_field(v).unwrap_or(0),
-                    "Anonymous" => anon = parse_status_kb_field(v).unwrap_or(0),
-                    _ => {}
+                let idx = match k {
+                    "Rss" => Some(0),
+                    "Private_Dirty" => Some(1),
+                    "Anonymous" => Some(2),
+                    _ => None,
+                };
+                if let Some(i) = idx {
+                    counts[i] = parse_status_kb_field(v).unwrap_or(0);
                 }
                 continue;
             }
         }
-        // Header line of a mapping block: `<start>-<end> <perms> <off> <dev> <ino> [path]`
-        flush(&mut out, &mut cur_header, rss, pdirty, anon);
-        rss = 0;
-        pdirty = 0;
-        anon = 0;
+        if let Some(h) = cur_header.take() {
+            if out.len() < MAX_SMAPS_LINES {
+                out.push(format_smaps_entry(&h, counts[0], counts[1], counts[2]));
+            }
+        }
+        counts = [0; 3];
         let mut parts = line.split_ascii_whitespace();
         let _addr = parts.next();
-        let perms = parts.next().unwrap_or("----");
-        let _off = parts.next();
-        let _dev = parts.next();
-        let _ino = parts.next();
-        let mut hdr = String::with_capacity(48);
-        hdr.push_str(perms);
+        let mut hdr = own(parts.next().unwrap_or("----"));
         let mut any = false;
-        for p in parts {
+        for p in parts.skip(3) {
             hdr.push(' ');
             hdr.push_str(p);
             any = true;
@@ -1034,10 +1497,15 @@ fn normalize_smaps(raw: &[u8]) -> Vec<String> {
         }
         cur_header = Some(hdr);
     }
-    flush(&mut out, &mut cur_header, rss, pdirty, anon);
+    if let Some(h) = cur_header {
+        if out.len() < MAX_SMAPS_LINES {
+            out.push(format_smaps_entry(&h, counts[0], counts[1], counts[2]));
+        }
+    }
     out
 }
 
+#[inline(never)]
 fn read_mem_cstring(pid: i32, addr: u64) -> Option<String> {
     if addr == 0 {
         return None;
@@ -1050,150 +1518,168 @@ fn read_mem_cstring(pid: i32, addr: u64) -> Option<String> {
     let mut buf = [0u8; 256];
     let n = sys::pread_fd(fd, &mut buf, addr);
     sys::close(fd);
-    if n <= 0 {
-        return None;
-    }
-    let slice = &buf[..n as usize];
+    let slice = buf.get(..usize::try_from(n).ok()?)?;
     let nul = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
-    if nul == 0 {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&slice[..nul]).into_owned())
+    (nul > 0).then(|| lossy(slice.get(..nul).unwrap_or(b"")))
 }
 
+#[inline(never)]
 fn parse_auxv(pid: i32, raw: &[u8], exe_fallback: &str, mem_readable: bool) -> ProfileAuxv {
-    const AT_NULL: usize = 0;
-    const AT_BASE: usize = 7;
-    const AT_ENTRY: usize = 9;
-    const AT_PLATFORM: usize = 15;
-    const AT_EXECFN: usize = 31;
-
-    let word = std::mem::size_of::<usize>();
-    let pair = word * 2;
+    const W: usize = std::mem::size_of::<usize>();
     let mut aux = ProfileAuxv::default();
     let mut execfn_ptr = 0u64;
     let mut platform_ptr = 0u64;
 
-    let mut off = 0;
-    while off + pair <= raw.len() {
-        let mut a_buf = [0u8; std::mem::size_of::<usize>()];
-        let mut v_buf = [0u8; std::mem::size_of::<usize>()];
-        a_buf.copy_from_slice(&raw[off..off + word]);
-        v_buf.copy_from_slice(&raw[off + word..off + pair]);
-        let a_type = usize::from_ne_bytes(a_buf);
-        let a_val = usize::from_ne_bytes(v_buf);
-        off += pair;
-
-        if a_type == AT_NULL {
+    for chunk in raw.chunks_exact(W * 2) {
+        let (Some(ab), Some(vb)) = (chunk.get(..W), chunk.get(W..W * 2)) else {
             break;
-        }
+        };
+        let (Ok(a_arr), Ok(v_arr)) = (ab.try_into(), vb.try_into()) else {
+            break;
+        };
+        let a_type = usize::from_ne_bytes(a_arr);
+        let a_val = usize::from_ne_bytes(v_arr) as u64;
         match a_type {
-            AT_BASE => aux.at_base = a_val as u64,
-            AT_ENTRY => aux.at_entry = a_val as u64,
-            AT_EXECFN => execfn_ptr = a_val as u64,
-            AT_PLATFORM => platform_ptr = a_val as u64,
+            0 => break,
+            7 => aux.at_base = a_val,
+            9 => aux.at_entry = a_val,
+            15 => platform_ptr = a_val,
+            31 => execfn_ptr = a_val,
             _ => {}
         }
     }
 
     if execfn_ptr != 0 {
-        aux.at_execfn = if mem_readable {
-            read_mem_cstring(pid, execfn_ptr)
-        } else {
-            None
-        }
-        .or_else(|| {
-            if !exe_fallback.is_empty() {
-                Some(exe_fallback.to_string())
-            } else {
-                None
-            }
-        });
+        aux.at_execfn = mem_readable
+            .then(|| read_mem_cstring(pid, execfn_ptr))
+            .flatten()
+            .or_else(|| (!exe_fallback.is_empty()).then(|| own(exe_fallback)));
     }
-
     if platform_ptr != 0 {
-        aux.at_platform = if mem_readable {
-            read_mem_cstring(pid, platform_ptr)
-        } else {
-            None
-        }
-        .or_else(|| Some(std::env::consts::ARCH.to_string()));
+        aux.at_platform = mem_readable
+            .then(|| read_mem_cstring(pid, platform_ptr))
+            .flatten()
+            .or_else(|| Some(own(std::env::consts::ARCH)));
     }
-
     aux
 }
 
-fn decode_syscall_static(nr: i64) -> Option<&'static str> {
-    let nr = libc::c_long::try_from(nr).ok()?;
-    #[cfg(target_arch = "x86_64")]
-    {
-        if nr == libc::SYS_poll {
-            return Some("poll");
-        }
-        if nr == libc::SYS_select {
-            return Some("select");
-        }
-        if nr == libc::SYS_pause {
-            return Some("pause");
-        }
-        if nr == libc::SYS_epoll_wait {
-            return Some("epoll_wait");
-        }
-    }
-    match nr {
-        libc::SYS_read => Some("read"),
-        libc::SYS_write => Some("write"),
-        libc::SYS_ppoll => Some("ppoll"),
-        libc::SYS_pselect6 => Some("pselect6"),
-        libc::SYS_epoll_pwait => Some("epoll_pwait"),
-        libc::SYS_nanosleep => Some("nanosleep"),
-        libc::SYS_clock_nanosleep => Some("clock_nanosleep"),
-        libc::SYS_futex => Some("futex"),
-        libc::SYS_wait4 => Some("wait4"),
-        libc::SYS_rt_sigsuspend => Some("rt_sigsuspend"),
-        libc::SYS_accept4 => Some("accept4"),
-        libc::SYS_recvfrom => Some("recvfrom"),
-        _ => None,
-    }
-}
-
+#[inline(never)]
 fn parse_proc_syscall(raw: &[u8]) -> String {
-    let text = String::from_utf8_lossy(raw);
+    const TABLE: &[(libc::c_long, &str)] = &[
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_poll, "poll"),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_select, "select"),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_pause, "pause"),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_epoll_wait, "epoll_wait"),
+        (libc::SYS_read, "read"),
+        (libc::SYS_write, "write"),
+        (libc::SYS_ppoll, "ppoll"),
+        (libc::SYS_pselect6, "pselect6"),
+        (libc::SYS_epoll_pwait, "epoll_pwait"),
+        (libc::SYS_nanosleep, "nanosleep"),
+        (libc::SYS_clock_nanosleep, "clock_nanosleep"),
+        (libc::SYS_futex, "futex"),
+        (libc::SYS_wait4, "wait4"),
+        (libc::SYS_rt_sigsuspend, "rt_sigsuspend"),
+        (libc::SYS_accept4, "accept4"),
+        (libc::SYS_recvfrom, "recvfrom"),
+    ];
+    let text = lossy(raw);
     let first = text.split_ascii_whitespace().next().unwrap_or("");
     if first.is_empty() {
-        return "unknown".to_string();
+        return own("unknown");
     }
     if first == "running" {
-        return "running".to_string();
+        return own("running");
     }
     match json::parse_i64_s(first) {
-        Some(nr) if nr >= 0 => match decode_syscall_static(nr) {
-            Some(name) => name.to_string(),
-            None => cat2("syscall_", &json::i64_str(nr)),
-        },
-        _ => first.to_string(),
+        Some(nr) if nr >= 0 => {
+            let cnr = nr as libc::c_long;
+            if (cnr as i64) == nr {
+                if let Some(&(_, name)) = TABLE.iter().find(|&&(n, _)| n == cnr) {
+                    return own(name);
+                }
+            }
+            cat2("syscall_", &json::i64_str(nr))
+        }
+        _ => own(first),
     }
 }
 
-/// Scan writable anonymous, `[stack]`, `[heap]`, and `[anon:...]` memory regions for tokens.
-/// Prioritizes `[stack]` and `[heap]` first so large anonymous arenas never exhaust
-/// `MAX_MEM_SCAN_BYTES` before reaching `[stack]`.
-fn scan_anon_mem_for_tokens(pid: i32, raw_maps: &[u8], tokens: &[String]) -> bool {
+struct MemScanResult {
+    placements: Vec<&'static str>,
+    matched_tok: Option<String>,
+    matched_explicit: bool,
+}
+
+#[inline(never)]
+fn parse_hex_u64(s: &str) -> Option<u64> {
+    if s.is_empty() {
+        return None;
+    }
+    let mut v = 0u64;
+    for b in s.bytes() {
+        let d = match b {
+            b'0'..=b'9' => (b - b'0') as u64,
+            b'a'..=b'f' => (b - b'a' + 10) as u64,
+            b'A'..=b'F' => (b - b'A' + 10) as u64,
+            _ => return None,
+        };
+        v = v.checked_mul(16)?.checked_add(d)?;
+    }
+    Some(v)
+}
+
+#[inline(never)]
+fn find_tok_in_bytes<'a>(hay: &[u8], toks: &'a [String]) -> Option<&'a str> {
+    for t in toks {
+        let nb = t.as_bytes();
+        if !nb.is_empty() && hay.windows(nb.len()).any(|w| w == nb) {
+            return Some(t.as_str());
+        }
+    }
+    None
+}
+
+/// Scan writable `[stack]`, `[heap]`, and anonymous (`rw*`) memory regions for tokens.
+#[inline(never)]
+fn scan_anon_mem_for_tokens(
+    pid: i32,
+    raw_maps: &[u8],
+    explicit_tokens: &[String],
+    extra_tokens: &[String],
+    arg_range: (u64, u64),
+    env_range: (u64, u64),
+) -> MemScanResult {
+    let mut res = MemScanResult {
+        placements: Vec::new(),
+        matched_tok: None,
+        matched_explicit: false,
+    };
+
     let mut max_needle = 0usize;
-    for t in tokens {
-        max_needle = max_needle.max(t.len());
+    for toks in [explicit_tokens, extra_tokens] {
+        for t in toks {
+            max_needle = max_needle.max(t.len());
+        }
     }
-    if max_needle == 0 {
-        return false;
+    let has_needles = max_needle > 0;
+    if !has_needles {
+        max_needle = 108;
     }
+
     let path = proc_path(pid, "mem");
     let fd = sys::open(path.as_bytes(), libc::O_RDONLY | libc::O_CLOEXEC, 0);
     if fd < 0 {
-        return false;
+        return res;
     }
 
-    let text = String::from_utf8_lossy(raw_maps);
-    let mut regions: Vec<(u8, u64, u64)> = Vec::new();
+    let text = lossy(raw_maps);
+    let mut regions: Vec<(u8, u8, u64, u64)> = Vec::new();
     for line in text.lines() {
         let mut parts = line.split_ascii_whitespace();
         let (Some(range), Some(perms)) = (parts.next(), parts.next()) else {
@@ -1203,22 +1689,19 @@ fn scan_anon_mem_for_tokens(pid: i32, raw_maps: &[u8], tokens: &[String]) -> boo
             continue;
         }
         let pathname = parts.nth(3).unwrap_or("");
-        let prio = if pathname == "[stack]" || pathname.starts_with("[stack:") {
-            0u8
+        let (prio, pbit) = if pathname == "[stack]" || pathname.starts_with("[stack:") {
+            (0u8, 0u8)
         } else if pathname == "[heap]" {
-            1u8
-        } else if pathname.is_empty() || pathname.starts_with("[anon:") {
-            2u8
+            (1u8, 1u8)
+        } else if pathname.is_empty() || pathname.starts_with("[anon") {
+            (2u8, 2u8)
         } else {
             continue;
         };
         let Some((s_hex, e_hex)) = range.split_once('-') else {
             continue;
         };
-        let (Ok(start), Ok(end)) = (
-            u64::from_str_radix(s_hex, 16),
-            u64::from_str_radix(e_hex, 16),
-        ) else {
+        let (Some(start), Some(end)) = (parse_hex_u64(s_hex), parse_hex_u64(e_hex)) else {
             continue;
         };
         if end > start {
@@ -1227,37 +1710,78 @@ fn scan_anon_mem_for_tokens(pid: i32, raw_maps: &[u8], tokens: &[String]) -> boo
             } else {
                 prio
             };
-            regions.push((p, start, end));
+            regions.push((p, pbit, start, end));
         }
     }
 
     let mut total_scanned = 0usize;
     let mut buf = vec![0u8; 64 * 1024];
     let overlap = max_needle.saturating_sub(1).min(buf.len() / 2);
-    let mut found = false;
+    let mut found_mask = 0u8;
 
     'scan: for target_prio in 0..=3u8 {
-        for &(prio, start, end) in &regions {
-            if prio != target_prio {
+        for &(prio, pbit, start, end) in &regions {
+            if prio != target_prio || (found_mask & (1 << pbit)) != 0 {
                 continue;
             }
             let mut addr = start;
             while addr < end && total_scanned < MAX_MEM_SCAN_BYTES {
                 let rem = (end - addr).min((MAX_MEM_SCAN_BYTES - total_scanned) as u64);
                 let want = (rem as usize).min(buf.len());
-                let n = sys::pread_fd(fd, &mut buf[..want], addr);
+                let Some(dst) = buf.get_mut(..want) else {
+                    break;
+                };
+                let n = sys::pread_fd(fd, dst, addr);
                 if n <= 0 {
                     break;
                 }
                 let got = n as usize;
                 total_scanned += got;
-                let hay = &buf[..got];
-                for t in tokens {
-                    let nb = t.as_bytes();
-                    if !nb.is_empty() && hay.windows(nb.len()).any(|w| w == nb) {
-                        found = true;
+                if pbit == 0 {
+                    for &(ex_s, ex_e) in &[arg_range, env_range] {
+                        if ex_s < ex_e {
+                            let ov_s = addr.max(ex_s);
+                            let ov_e = (addr + got as u64).min(ex_e);
+                            if ov_s < ov_e {
+                                if let Some(sl) =
+                                    buf.get_mut((ov_s - addr) as usize..(ov_e - addr) as usize)
+                                {
+                                    sl.fill(0);
+                                }
+                            }
+                        }
+                    }
+                }
+                let hay = buf.get(..got).unwrap_or(b"");
+                let mut hit_here = false;
+                if has_needles {
+                    for (is_exp, toks) in [(true, explicit_tokens), (false, extra_tokens)] {
+                        if let Some(t) = find_tok_in_bytes(hay, toks) {
+                            if (is_exp && !res.matched_explicit) || res.matched_tok.is_none() {
+                                res.matched_tok = Some(own(t));
+                                res.matched_explicit |= is_exp;
+                            }
+                            hit_here = true;
+                            break;
+                        }
+                    }
+                }
+                if !hit_here {
+                    if let Some(tok_s) =
+                        find_inline_secret_bytes(hay).and_then(|b| std::str::from_utf8(b).ok())
+                    {
+                        if res.matched_tok.is_none() {
+                            res.matched_tok = Some(own(tok_s));
+                        }
+                        hit_here = true;
+                    }
+                }
+                if hit_here {
+                    found_mask |= 1 << pbit;
+                    if found_mask == 0b111 {
                         break 'scan;
                     }
+                    break;
                 }
                 if got <= overlap || addr + got as u64 >= end {
                     break;
@@ -1268,7 +1792,31 @@ fn scan_anon_mem_for_tokens(pid: i32, raw_maps: &[u8], tokens: &[String]) -> boo
     }
 
     sys::close(fd);
-    found
+    for (bit, name) in [(2, "anon"), (1, "heap"), (0, "stack")] {
+        if (found_mask & (1 << bit)) != 0 {
+            res.placements.push(name);
+        }
+    }
+    res
+}
+
+fn is_stop_ancestor_comm(comm: &str) -> bool {
+    csv_has(
+        "init,systemd,podman-init,tini,dumb-init,conmon,catatonit,docker-init,pause,s6-svscan,supervisord,runit,sshd,login",
+        comm.trim(),
+    )
+}
+
+#[inline(never)]
+fn should_capture_ancestor(apid: i32, target_uid: u32, is_tracer: bool, visited: &[i32]) -> bool {
+    if apid <= 1 || visited.contains(&apid) {
+        return false;
+    }
+    let Ok(status_raw) = read_proc_bytes(&proc_path(apid, "status"), 64 * 1024) else {
+        return false;
+    };
+    let (st, aeuid, _, _) = parse_proc_status(&status_raw);
+    !is_stop_ancestor_comm(&st.name) && (aeuid == target_uid || is_tracer)
 }
 
 fn push_unique_i32(v: &mut Vec<i32>, x: i32) {
@@ -1278,13 +1826,7 @@ fn push_unique_i32(v: &mut Vec<i32>, x: i32) {
 }
 
 fn sort_i32(v: &mut [i32]) {
-    for i in 1..v.len() {
-        let mut j = i;
-        while j > 0 && v[j - 1] > v[j] {
-            v.swap(j - 1, j);
-            j -= 1;
-        }
-    }
+    json::shell_sort_by(v, |a, b| a > b);
 }
 
 #[inline(never)]
@@ -1301,18 +1843,21 @@ pub fn read_numeric_dir(dir: &str) -> io::Result<Vec<i32>> {
     Ok(out)
 }
 
+#[inline(never)]
+fn task_leaf_path(task_dir: &str, tid: i32, leaf: &str) -> String {
+    let tid_s = json::i64_str(tid as i64);
+    json::concat(&[task_dir, "/", &tid_s, "/", leaf])
+}
+
+#[inline(never)]
 fn discover_child_pids(pid: i32) -> Vec<i32> {
     let mut children: Vec<i32> = Vec::new();
     let task_dir = proc_path(pid, "task");
     let mut used_proc_children = false;
     if let Ok(tids) = read_numeric_dir(&task_dir) {
         for tid in tids {
-            let p = cat3(
-                &task_dir,
-                "/",
-                &cat2(&json::i64_str(tid as i64), "/children"),
-            );
-            if let Ok(text) = json::read_str(Path::new(&p)) {
+            if let Ok(text) = json::read_str(Path::new(&task_leaf_path(&task_dir, tid, "children")))
+            {
                 used_proc_children = true;
                 for tok in text.split_ascii_whitespace() {
                     if let Some(cpid) = json::parse_i32_s(tok) {
@@ -1328,12 +1873,9 @@ fn discover_child_pids(pid: i32) -> Vec<i32> {
     if !used_proc_children {
         if let Ok(pids) = read_numeric_dir("/proc") {
             for cpid in pids {
-                if cpid <= 0 || cpid == pid {
-                    continue;
-                }
-                if let Ok(raw) = read_proc_bytes(&proc_path(cpid, "stat"), 4096) {
-                    if let Ok(parsed) = parse_proc_stat(&raw) {
-                        if parsed.ppid == pid {
+                if cpid > 0 && cpid != pid {
+                    if let Ok(raw) = read_proc_bytes(&proc_path(cpid, "stat"), 4096) {
+                        if parse_proc_stat(&raw).is_ok_and(|p| p.ppid == pid) {
                             push_unique_i32(&mut children, cpid);
                         }
                     }
@@ -1349,6 +1891,10 @@ struct ProcCtx<'a> {
     dir: String,
     toks: &'a [String],
     hit: bool,
+    matched_tok: Option<String>,
+    matched_explicit: bool,
+    placements: Vec<&'static str>,
+    mem_extra_toks: Vec<String>,
     readable: &'a mut Vec<String>,
     denied: &'a mut Vec<String>,
 }
@@ -1358,10 +1904,57 @@ impl<'a> ProcCtx<'a> {
         cat3(&self.dir, "/", rel)
     }
 
-    fn s(&mut self, v: &str) -> String {
-        scrub_tokens(v, self.toks, &mut self.hit)
+    fn note_placement(&mut self, pl: &'static str) {
+        if !self.placements.contains(&pl) {
+            self.placements.push(pl);
+        }
     }
 
+    #[inline(never)]
+    fn record_match(&mut self, tok: &str, placement: Option<&'static str>, explicit: bool) {
+        self.hit = true;
+        if let Some(pl) = placement {
+            self.note_placement(pl);
+        }
+        if !tok.is_empty() {
+            if (explicit && !self.matched_explicit) || self.matched_tok.is_none() {
+                self.matched_tok = Some(own(tok));
+                self.matched_explicit = explicit;
+            }
+            if !explicit
+                && tok.len() >= 4
+                && !self.toks.iter().any(|t| t == tok)
+                && !self.mem_extra_toks.iter().any(|t| t == tok)
+            {
+                self.mem_extra_toks.push(own(tok));
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn scrub_explicit(&mut self, v: &str, pl: Option<&'static str>) -> (String, bool) {
+        let mut matched: Option<&str> = None;
+        let (out, hit) = scrub_tokens_with(v, self.toks, &mut matched);
+        if hit {
+            self.record_match(matched.unwrap_or(""), pl, true);
+        }
+        (out, hit)
+    }
+
+    #[inline(never)]
+    fn scrub_inline(&mut self, mut s: String, pl: &'static str) -> String {
+        while let Some(found) = find_inline_secret_str(&s).map(own) {
+            self.record_match(&found, Some(pl), false);
+            s = s.replace(&found, &redacted_marker(found.len()));
+        }
+        s
+    }
+
+    fn s(&mut self, v: &str) -> String {
+        self.scrub_explicit(v, None).0
+    }
+
+    #[inline(never)]
     fn sv(&mut self, mut items: Vec<String>) -> Vec<String> {
         for item in &mut items {
             *item = self.s(item);
@@ -1369,97 +1962,164 @@ impl<'a> ProcCtx<'a> {
         items
     }
 
+    #[inline(never)]
+    fn scrub_argv(&mut self, raw_argv: Vec<String>) -> Vec<String> {
+        let mut out = Vec::with_capacity(raw_argv.len());
+        for arg in raw_argv {
+            let (clean, _) = self.scrub_explicit(&arg, Some("argv"));
+            let mut clean = self.scrub_inline(clean, "argv");
+            if contains_unredacted_secret_pattern(&clean) {
+                let copy = own(&clean);
+                self.record_match(&copy, Some("argv"), false);
+                clean = redacted_marker(clean.len());
+            }
+            out.push(clean);
+        }
+        out
+    }
+
+    #[inline(never)]
     fn read(&mut self, name: &str, max: usize, track: bool) -> Option<Vec<u8>> {
         match read_proc_bytes(&self.path(name), max) {
             Ok(b) => {
                 if track {
-                    self.readable.push(name.to_string());
+                    self.readable.push(own(name));
                 }
                 Some(b)
             }
             Err(e) => {
                 if is_perm_errno(e) {
-                    self.denied.push(name.to_string());
+                    self.denied.push(own(name));
                 }
                 None
             }
         }
     }
 
+    #[inline(never)]
     fn read_str(&self, rel: &str, max: usize) -> Option<String> {
         read_proc_bytes(&self.path(rel), max)
             .ok()
-            .map(|b| String::from_utf8_lossy(&b).trim().to_string())
+            .map(|b| own(lossy(&b).trim()))
     }
 
+    #[inline(never)]
     fn read_link(&self, rel: &str) -> Option<String> {
-        fs::read_link(self.path(rel))
-            .ok()
-            .map(|p| p.to_string_lossy().into_owned())
+        fs::read_link(self.path(rel)).ok().map(|p| path_lossy(&p))
     }
 
+    #[inline(never)]
+    fn read_exe(&mut self) -> String {
+        match fs::read_link(self.path("exe")) {
+            Ok(p) => {
+                self.readable.push(own("exe"));
+                let raw = path_lossy(&p);
+                self.s(&raw)
+            }
+            Err(e) => {
+                if is_perm_denied(&e) {
+                    self.denied.push(own("exe"));
+                }
+                String::new()
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn check_mem_readable(&mut self) -> bool {
+        let mem_fd = sys::open(
+            self.path("mem").as_bytes(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+            0,
+        );
+        if mem_fd >= 0 {
+            sys::close(mem_fd);
+            self.readable.push(own("mem"));
+            true
+        } else {
+            if is_perm_errno(sys::errno()) {
+                self.denied.push(own("mem"));
+            }
+            false
+        }
+    }
+
+    #[inline(never)]
     fn read_fds(&mut self) -> Vec<ProfileFd> {
         let mut fds = Vec::new();
         let fd_dir = self.path("fd");
         match read_numeric_dir(&fd_dir) {
             Ok(nums) => {
-                self.readable.push("fd".to_string());
+                self.readable.push(own("fd"));
                 for fd in nums {
                     let p = cat3(&fd_dir, "/", &json::i64_str(fd as i64));
                     if let Ok(target) = fs::read_link(&p) {
-                        let t = self.s(&target.to_string_lossy());
+                        let t = self.s(&path_lossy(&target));
                         fds.push(ProfileFd { fd, target: t });
                     }
                 }
             }
-            Err(e) if is_perm_denied(&e) => self.denied.push("fd".to_string()),
+            Err(e) if is_perm_denied(&e) => self.denied.push(own("fd")),
             Err(_) => {}
         }
         fds
     }
 
-    fn read_environ(&mut self, redact_envs: &[String]) -> Vec<String> {
+    #[inline(never)]
+    fn parse_environ_raw(
+        &mut self,
+        raw: &[u8],
+        redact_envs: &[String],
+    ) -> (Vec<String>, u64, bool) {
         let mut environ = Vec::new();
-        if let Some(raw) = self.read("environ", MAX_PROC_READ, true) {
-            for part in raw.split(|&b| b == 0) {
-                if part.is_empty() {
-                    continue;
-                }
-                let entry = String::from_utf8_lossy(part);
-                if let Some((k, v)) = entry.split_once('=') {
-                    let flagged = is_sensitive_env_key(k)
-                        || redact_envs.iter().any(|r| r.eq_ignore_ascii_case(k))
-                        || contains_unredacted_secret_pattern(v);
-                    let val = if flagged {
-                        self.hit = true;
-                        redacted_marker(v.len())
-                    } else {
-                        self.s(v)
-                    };
-                    environ.push(cat3(k, "=", &val));
+        let raw_len = raw.len() as u64;
+        let all_nul = !raw.is_empty() && raw.iter().all(|&b| b == 0);
+        for part in raw.split(|&b| b == 0) {
+            if part.is_empty() {
+                continue;
+            }
+            let entry = lossy(part);
+            if let Some((k, v)) = entry.split_once('=') {
+                let (clean_v, exp_hit) = self.scrub_explicit(v, Some("environ"));
+                let key_flagged = (is_sensitive_env_key(k)
+                    || redact_envs.iter().any(|r| r.eq_ignore_ascii_case(k)))
+                    && !v.is_empty()
+                    && !v.starts_with("<REDACTED");
+                let pat_flagged = contains_unredacted_secret_pattern(&clean_v);
+                let val = if key_flagged || pat_flagged {
+                    if !exp_hit {
+                        let tok_src = find_inline_secret_str(&clean_v).unwrap_or(v);
+                        self.record_match(tok_src, Some("environ"), false);
+                    }
+                    redacted_marker(v.len())
                 } else {
-                    environ.push(self.s(&entry));
-                }
+                    self.scrub_inline(clean_v, "environ")
+                };
+                environ.push(cat3(k, "=", &val));
+            } else {
+                let (clean, _) = self.scrub_explicit(&entry, Some("environ"));
+                environ.push(clean);
             }
         }
-        environ
+        (environ, raw_len, all_nul)
     }
 
+    #[inline(never)]
     fn read_tasks(&mut self, pid: i32, comm: &str, state: &str) -> Vec<ProfileTask> {
         let mut task = Vec::new();
         let task_root = self.path("task");
         if let Ok(tids) = read_numeric_dir(&task_root) {
             for tid in tids {
-                let tbase = cat3(&task_root, "/", &json::i64_str(tid as i64));
-                let t_comm = read_proc_bytes(&cat2(&tbase, "/comm"), 256)
+                let t_comm = read_proc_bytes(&task_leaf_path(&task_root, tid, "comm"), 256)
                     .ok()
-                    .map(|b| String::from_utf8_lossy(&b).trim().to_string())
-                    .unwrap_or_else(|| comm.to_string());
-                let t_state = read_proc_bytes(&cat2(&tbase, "/stat"), 4096)
+                    .map(|b| strip_proc_newline(&b))
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| own(comm));
+                let t_state = read_proc_bytes(&task_leaf_path(&task_root, tid, "stat"), 4096)
                     .ok()
                     .and_then(|b| parse_proc_stat(&b).ok())
                     .map(|s| s.state)
-                    .unwrap_or_else(|| state.to_string());
+                    .unwrap_or_else(|| own(state));
                 task.push(ProfileTask {
                     tid,
                     comm: self.s(&t_comm),
@@ -1470,25 +2130,72 @@ impl<'a> ProcCtx<'a> {
         if task.is_empty() {
             task.push(ProfileTask {
                 tid: pid,
-                comm: comm.to_string(),
-                state: state.to_string(),
+                comm: own(comm),
+                state: own(state),
             });
         }
         task
     }
 }
 
-/// Extract a live `schema: 1` `Profile` from `/proc/<pid>`.
-pub fn extract_live(opts: &ExtractOpts) -> Result<Profile, String> {
-    let mut visited: Vec<i32> = Vec::new();
-    extract_live_inner(opts, opts.pid, 0, &mut visited)
+#[inline(never)]
+fn try_capture_ancestor(
+    opts: &ExtractOpts,
+    apid: i32,
+    uid: u32,
+    is_tracer: bool,
+    depth: usize,
+    visited: &mut Vec<i32>,
+) -> Option<Box<Profile>> {
+    if should_capture_ancestor(apid, uid, is_tracer, visited) {
+        extract_live_inner(opts, apid, depth + 1, visited, false, true)
+            .ok()
+            .map(Box::new)
+    } else {
+        None
+    }
 }
 
+/// Extract a live `schema: 2` `Profile` from `/proc/<pid>`.
+pub fn extract_live(opts: &ExtractOpts) -> Result<Profile, String> {
+    let mut visited: Vec<i32> = Vec::new();
+    // Exclude the caller's own ancestor chain (the launching shell/harness above
+    // `psgen`) so upward `--tree` traversal captures target supervisors/tracers
+    // without cloning the outer test/shell runner.
+    if opts.tree && opts.ancestors {
+        let mut cur = sys::getpid();
+        for _ in 0..32 {
+            let Ok(raw) = read_proc_bytes(&proc_path(cur, "stat"), 4096) else {
+                break;
+            };
+            let Ok(st) = parse_proc_stat(&raw) else {
+                break;
+            };
+            if st.ppid <= 1 || st.ppid == opts.pid || visited.contains(&st.ppid) {
+                break;
+            }
+            visited.push(st.ppid);
+            cur = st.ppid;
+        }
+    }
+    extract_live_inner(
+        opts,
+        opts.pid,
+        0,
+        &mut visited,
+        opts.tree,
+        opts.tree && opts.ancestors,
+    )
+}
+
+#[inline(never)]
 fn extract_live_inner(
     opts: &ExtractOpts,
     pid: i32,
     depth: usize,
     visited: &mut Vec<i32>,
+    walk_down: bool,
+    walk_up: bool,
 ) -> Result<Profile, String> {
     if pid <= 0 {
         return Err(cat2("invalid pid ", &json::i64_str(pid as i64)));
@@ -1496,34 +2203,229 @@ fn extract_live_inner(
     push_unique_i32(visited, pid);
 
     let proc_dir = proc_path(pid, "");
-    if !Path::new(&proc_dir).exists() {
-        return Err(cat3(
-            "process ",
-            &json::i64_str(pid as i64),
-            " does not exist in /proc",
-        ));
-    }
-
     let stat_path = cat2(&proc_dir, "/stat");
     let stat_raw = read_proc_bytes(&stat_path, 8192).map_err(|e| {
-        cat4(
-            "cannot read ",
-            &stat_path,
-            ": errno ",
-            &json::i64_str(e as i64),
-        )
+        if e == libc::ENOENT {
+            cat3("pid ", &json::i64_str(pid as i64), " not found")
+        } else {
+            cat4("read ", &stat_path, ": errno ", &json::i64_str(e as i64))
+        }
     })?;
     let pstat = parse_proc_stat(&stat_raw)?;
 
     let observer_uid = sys::geteuid();
-    let mut prof = Profile {
+    let mut readable = vec![cat2("uid:", &u64_str(observer_uid as u64))];
+    let mut denied = Vec::new();
+
+    let mut ctx = ProcCtx {
+        dir: proc_dir,
+        toks: &opts.redact_tokens,
+        hit: false,
+        matched_tok: None,
+        matched_explicit: false,
+        placements: Vec::new(),
+        mem_extra_toks: Vec::new(),
+        readable: &mut readable,
+        denied: &mut denied,
+    };
+
+    let comm_raw = read_proc_bytes(&ctx.path("comm"), 256)
+        .ok()
+        .map(|b| strip_proc_newline(&b))
+        .filter(|s| !s.is_empty())
+        .unwrap_or(pstat.comm);
+    let comm = ctx.s(&comm_raw);
+
+    let (raw_argv, cmdline_raw_nuls) = match ctx.read("cmdline", 512 * 1024, false) {
+        Some(b) => parse_cmdline(&b),
+        None => (Vec::new(), 0),
+    };
+
+    let (mut status, euid, egid, groups) = match read_proc_bytes(&ctx.path("status"), MAX_PROC_READ)
+    {
+        Ok(b) => parse_proc_status(&b),
+        Err(_) => {
+            let mut st = default_status();
+            json::assign_str(&mut st.name, &comm);
+            st.state = pstat.state;
+            st.ppid = pstat.ppid;
+            st.threads = pstat.num_threads;
+            (st, 0, 0, Vec::new())
+        }
+    };
+    let sname = if status.name.is_empty() {
+        own(&comm)
+    } else {
+        ctx.s(&status.name)
+    };
+    json::assign_str(&mut status.name, &sname);
+
+    let exe = ctx.read_exe();
+    let exe_memfd = detect_exe_memfd(&exe);
+    let label = ctx.s(opts.label.as_deref().unwrap_or(&comm));
+    let argv = ctx.scrub_argv(raw_argv);
+    let cwd = ctx.s(&ctx.read_link("cwd").unwrap_or_default());
+    let root = ctx.read_link("root").unwrap_or_else(|| own("/"));
+    let ns = ProfileNs {
+        pid: ctx.read_link("ns/pid"),
+        mnt: ctx.read_link("ns/mnt"),
+        user: ctx.read_link("ns/user"),
+        net: ctx.read_link("ns/net"),
+    };
+
+    let (environ, environ_raw_len, environ_all_nul) = match ctx.read("environ", MAX_PROC_READ, true)
+    {
+        Some(raw) => ctx.parse_environ_raw(&raw, &opts.redact_envs),
+        None => (Vec::new(), 0, false),
+    };
+
+    let mem_readable = ctx.check_mem_readable();
+
+    let maps = if let Some(raw_maps) = ctx.read("maps", MAX_PROC_READ, true) {
+        let m = ctx.sv(normalize_maps(&raw_maps));
+        if mem_readable && pid != sys::getpid() {
+            let mres = scan_anon_mem_for_tokens(
+                pid,
+                &raw_maps,
+                &opts.redact_tokens,
+                &ctx.mem_extra_toks,
+                (pstat.arg_start, pstat.arg_end),
+                (pstat.env_start, pstat.env_end),
+            );
+            if !mres.placements.is_empty() {
+                for pl in mres.placements {
+                    ctx.note_placement(pl);
+                }
+                ctx.record_match(
+                    mres.matched_tok.as_deref().unwrap_or(""),
+                    None,
+                    mres.matched_explicit,
+                );
+            }
+        }
+        m
+    } else {
+        Vec::new()
+    };
+
+    let smaps = match read_proc_bytes(&ctx.path("smaps"), MAX_PROC_READ) {
+        Ok(raw) => ctx.sv(normalize_smaps(&raw)),
+        Err(_) => Vec::new(),
+    };
+
+    let fds = ctx.read_fds();
+
+    let mut auxv = match ctx.read("auxv", 64 * 1024, true) {
+        Some(raw) => parse_auxv(pid, &raw, &exe, mem_readable),
+        None => ProfileAuxv::default(),
+    };
+    if let Some(ref mut execfn) = auxv.at_execfn {
+        let cleaned = ctx.s(execfn);
+        json::assign_str(execfn, &cleaned);
+    }
+
+    let task = ctx.read_tasks(pid, &comm, &status.state);
+    let syscall = ProfileSyscall {
+        syscall: read_proc_bytes(&ctx.path("syscall"), 512)
+            .map(|b| parse_proc_syscall(&b))
+            .unwrap_or_else(|_| own("unknown")),
+        wchan: ctx.read_str("wchan", 256).unwrap_or_else(|| own("0")),
+        policy: pstat.policy,
+        priority: pstat.priority,
+    };
+
+    let matched_tok = ctx.matched_tok.take();
+    let token_present = ctx.hit || matched_tok.is_some();
+    let mut placements = Vec::with_capacity(ctx.placements.len());
+    for pl in ctx.placements {
+        placements.push(own(pl));
+    }
+    json::sort_strings(&mut placements);
+
+    let (token_sha256, token_len, token_charset) = match matched_tok {
+        Some(ref tok) => (
+            Some(sha256::hash_hex(tok.as_bytes())),
+            Some(tok.len() as u32),
+            Some(classify_token_charset(tok)),
+        ),
+        None => (None, None, None),
+    };
+
+    let dumpable = if observer_uid != 0 && observer_uid == euid {
+        // Under Yama ptrace_scope=1, a dumpable sibling still denies `/proc/<pid>/mem`
+        // (PTRACE_MODE_ATTACH) while keeping environ/maps/auxv/exe/fd readable.
+        // True non-dumpable (`PR_SET_DUMPABLE=0`) denies all of those surfaces.
+        let non_mem_denied = denied
+            .iter()
+            .any(|s| csv_has("environ,maps,auxv,exe,fd", s));
+        Some(!non_mem_denied)
+    } else {
+        None
+    };
+
+    let mut children = Vec::new();
+    if walk_down && depth < opts.max_depth {
+        for cpid in discover_child_pids(pid) {
+            if !visited.contains(&cpid) {
+                if let Ok(child_prof) =
+                    extract_live_inner(opts, cpid, depth + 1, visited, true, false)
+                {
+                    children.push(child_prof);
+                }
+            }
+        }
+    }
+
+    let (parent, tracer) = if walk_up && depth < opts.max_depth {
+        let ppid = pstat.ppid;
+        let tpid = status.tracer_pid;
+        let par = try_capture_ancestor(opts, ppid, euid, ppid == tpid, depth, visited);
+        let tr = if tpid > 0 && tpid != ppid {
+            try_capture_ancestor(opts, tpid, euid, true, depth, visited)
+        } else {
+            None
+        };
+        (par, tr)
+    } else {
+        (None, None)
+    };
+
+    let profile_kind = if !opts.profile_name.is_empty() {
+        opts.profile_name.as_str()
+    } else if !children.is_empty() || parent.is_some() || tracer.is_some() {
+        "tree"
+    } else {
+        "single"
+    };
+
+    Ok(Profile {
         schema: PROFILE_SCHEMA,
         source: ProfileSource {
-            masker: opts.masker.clone(),
-            profile: String::new(),
-            version: opts.version.clone(),
+            masker: own(&opts.masker),
+            profile: own(profile_kind),
+            version: own(&opts.version),
             observer_uid: Some(observer_uid),
         },
+        identity: ProfileIdentity {
+            label,
+            comm,
+            argv,
+            cmdline_raw_nuls: Some(cmdline_raw_nuls),
+            pid,
+            ppid: pstat.ppid,
+            pgid: pstat.pgid,
+            sid: pstat.sid,
+            uid: euid,
+            gid: egid,
+            groups,
+            starttime: pstat.starttime,
+            cwd,
+            root,
+            exe,
+            exe_memfd,
+            ns,
+        },
+        status,
         stat: ProfileStat {
             ppid: pstat.ppid,
             num_threads: pstat.num_threads,
@@ -1537,163 +2439,30 @@ fn extract_live_inner(
             env_end: pstat.env_end,
             startstack: pstat.startstack,
         },
-        ..Default::default()
-    };
-    prof.memory
-        .readable_by
-        .push(cat2("uid:", &u64_str(observer_uid as u64)));
-
-    let mut ctx = ProcCtx {
-        dir: proc_dir,
-        toks: &opts.redact_tokens,
-        hit: false,
-        readable: &mut prof.memory.readable_by,
-        denied: &mut prof.memory.denied_by,
-    };
-
-    let comm_raw = ctx
-        .read_str("comm", 256)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(pstat.comm);
-    let comm = ctx.s(&comm_raw);
-
-    let (raw_argv, cmdline_raw_nuls) = match ctx.read("cmdline", 512 * 1024, false) {
-        Some(b) => parse_cmdline(&b),
-        None => (Vec::new(), 0),
-    };
-
-    let (mut status, euid, egid) = match read_proc_bytes(&ctx.path("status"), MAX_PROC_READ) {
-        Ok(b) => parse_proc_status(&b),
-        Err(_) => {
-            let mut st = default_status();
-            st.name = comm.clone();
-            st.state = pstat.state;
-            st.ppid = pstat.ppid;
-            st.threads = pstat.num_threads;
-            (st, 0, 0)
-        }
-    };
-    status.name = if status.name.is_empty() {
-        comm.clone()
-    } else {
-        ctx.s(&status.name)
-    };
-    prof.status = status;
-
-    let exe_raw = match fs::read_link(ctx.path("exe")) {
-        Ok(p) => {
-            ctx.readable.push("exe".to_string());
-            p.to_string_lossy().into_owned()
-        }
-        Err(e) => {
-            if is_perm_denied(&e) {
-                ctx.denied.push("exe".to_string());
-            }
-            String::new()
-        }
-    };
-    let exe = ctx.s(&exe_raw);
-    prof.identity.exe_memfd = detect_exe_memfd(&exe);
-    prof.identity.label = ctx.s(opts.label.as_deref().unwrap_or(&comm));
-    prof.identity.comm = comm;
-    prof.identity.argv = ctx.sv(raw_argv);
-    prof.identity.cmdline_raw_nuls = Some(cmdline_raw_nuls);
-    prof.identity.pid = pid;
-    prof.identity.ppid = pstat.ppid;
-    prof.identity.uid = euid;
-    prof.identity.gid = egid;
-    prof.identity.starttime = pstat.starttime;
-    prof.identity.cwd = ctx.s(&ctx.read_link("cwd").unwrap_or_default());
-    prof.identity.root = ctx.read_link("root").unwrap_or_else(|| "/".to_string());
-    prof.identity.exe = exe;
-    prof.identity.ns = ProfileNs {
-        pid: ctx.read_link("ns/pid"),
-        mnt: ctx.read_link("ns/mnt"),
-        user: ctx.read_link("ns/user"),
-        net: ctx.read_link("ns/net"),
-    };
-
-    let mem_fd = sys::open(
-        ctx.path("mem").as_bytes(),
-        libc::O_RDONLY | libc::O_CLOEXEC,
-        0,
-    );
-    let mem_readable = if mem_fd >= 0 {
-        sys::close(mem_fd);
-        ctx.readable.push("mem".to_string());
-        true
-    } else {
-        if is_perm_errno(sys::errno()) {
-            ctx.denied.push("mem".to_string());
-        }
-        false
-    };
-
-    if let Some(raw_maps) = ctx.read("maps", MAX_PROC_READ, true) {
-        prof.memory.maps = ctx.sv(normalize_maps(&raw_maps));
-        if mem_readable
-            && pid != sys::getpid()
-            && !opts.redact_tokens.is_empty()
-            && scan_anon_mem_for_tokens(pid, &raw_maps, &opts.redact_tokens)
-        {
-            ctx.hit = true;
-        }
-    }
-
-    if let Ok(raw) = read_proc_bytes(&ctx.path("smaps"), MAX_PROC_READ) {
-        prof.memory.smaps = ctx.sv(normalize_smaps(&raw));
-    }
-
-    prof.fds = ctx.read_fds();
-
-    if let Some(raw) = ctx.read("auxv", 64 * 1024, true) {
-        prof.auxv = parse_auxv(pid, &raw, &prof.identity.exe, mem_readable);
-        if let Some(ref execfn) = prof.auxv.at_execfn {
-            prof.auxv.at_execfn = Some(ctx.s(execfn));
-        }
-    }
-
-    prof.environ = ctx.read_environ(&opts.redact_envs);
-    prof.task = ctx.read_tasks(pid, &prof.identity.comm, &prof.status.state);
-    prof.syscall = ProfileSyscall {
-        syscall: read_proc_bytes(&ctx.path("syscall"), 512)
-            .map(|b| parse_proc_syscall(&b))
-            .unwrap_or_else(|_| "unknown".to_string()),
-        wchan: ctx
-            .read_str("wchan", 256)
-            .unwrap_or_else(|| "0".to_string()),
-        policy: pstat.policy,
-        priority: pstat.priority,
-    };
-    prof.memory.token_present = ctx.hit;
-
-    if observer_uid != 0 && observer_uid == euid {
-        let any_denied = prof
-            .memory
-            .denied_by
-            .iter()
-            .any(|s| "environ,maps,auxv,exe,fd,mem".split(',').any(|d| d == s));
-        prof.dumpable = Some(!any_denied);
-    }
-
-    if opts.tree && depth < opts.max_depth {
-        for cpid in discover_child_pids(pid) {
-            if !visited.contains(&cpid) {
-                if let Ok(child_prof) = extract_live_inner(opts, cpid, depth + 1, visited) {
-                    prof.children.push(child_prof);
-                }
-            }
-        }
-    }
-
-    prof.source.profile = if !opts.profile_name.is_empty() {
-        opts.profile_name.clone()
-    } else if !prof.children.is_empty() {
-        "tree".to_string()
-    } else {
-        "single".to_string()
-    };
-    Ok(prof)
+        memory: ProfileMemory {
+            maps,
+            smaps,
+            token_present,
+            token_sha256,
+            token_len,
+            token_charset,
+            token_placements: placements,
+            readable_by: readable,
+            denied_by: denied,
+        },
+        fds,
+        auxv,
+        environ,
+        environ_raw_len,
+        environ_all_nul,
+        task,
+        syscall,
+        timing: ProfileTiming::default(),
+        dumpable,
+        children,
+        parent,
+        tracer,
+    })
 }
 
 /// Shared synthetic 3-line `maps` & `smaps` builder (used by `synthetic_default_profile` & `harness.rs`).
@@ -1706,61 +2475,57 @@ pub fn basic_maps_smaps(
 ) -> (Vec<String>, Vec<String>) {
     let maps = vec![
         cat4("<addr> r-xp 00001000 08:01 ", exe_ino, " ", exe),
-        "<addr> rw-p 00000000 00:00 0 [heap]".to_string(),
-        "<addr> rw-p 00000000 00:00 0 [stack]".to_string(),
+        own("<addr> rw-p 00000000 00:00 0 [heap]"),
+        own("<addr> rw-p 00000000 00:00 0 [stack]"),
     ];
-    let exe_s = u64_str(exe_kb);
-    let heap_s = u64_str(heap_kb);
     let smaps = vec![
-        cat4(
-            "r-xp ",
-            exe,
-            " Rss:",
-            &cat2(&exe_s, "kB Private_Dirty:0kB Anonymous:0kB"),
-        ),
-        cat4(
-            "rw-p [heap] Rss:",
-            &heap_s,
-            "kB Private_Dirty:",
-            &cat4(&heap_s, "kB Anonymous:", &heap_s, "kB"),
-        ),
-        "rw-p [stack] Rss:128kB Private_Dirty:128kB Anonymous:128kB".to_string(),
+        format_smaps_entry(&cat2("r-xp ", exe), exe_kb, 0, 0),
+        format_smaps_entry("rw-p [heap]", heap_kb, heap_kb, heap_kb),
+        own("rw-p [stack] Rss:128kB Private_Dirty:128kB Anonymous:128kB"),
     ];
     (maps, smaps)
 }
 
-/// Build a canonical synthetic `schema: 1` `Profile` for `selftest` and unit tests.
+/// Build a canonical synthetic `schema: 2` `Profile` for `selftest` and unit tests.
 #[inline(never)]
 pub fn synthetic_default_profile(label: &str, tree: bool) -> Profile {
     const BASE_JSON: &str = concat!(
-        r#"{"schema":1,"source":{"masker":"synthetic","profile":"single","version":""#,
+        r#"{"schema":2,"source":{"masker":"synthetic","profile":"single","version":""#,
         env!("CARGO_PKG_VERSION"),
-        r#"","observer_uid":2000},"identity":{"label":"ci-runner","comm":"ci-runner","argv":["ci-runner","--serve"],"cmdline_raw_nuls":1,"pid":1234,"ppid":1,"uid":2000,"gid":2000,"starttime":123456,"cwd":"/srv/ci","root":"/","exe":"/srv/ci/ci-runner","ns":{"pid":"pid:[4026531836]","mnt":"mnt:[4026531841]","user":"user:[4026531837]","net":"net:[4026531992]"}},"status":{"Name":"ci-runner","State":"S","PPid":1,"Uid":"2000 2000 2000 2000","Gid":"2000 2000 2000 2000","Threads":1,"TracerPid":0,"NoNewPrivs":0,"Seccomp":0,"Seccomp_filters":0,"CapEff":"0000000000000000","CapPrm":"0000000000000000","CapBnd":"0000000000000000","VmLck":0,"RssShmem":0},"stat":{"ppid":1,"num_threads":1,"starttime":123456,"vsize":12345344,"rss":1024,"flags":4194304,"arg_start":140000000000000,"arg_end":140000000000018,"env_start":140000000000018,"env_end":140000000000114,"startstack":140000000000000},"memory":{"maps":[],"smaps":[],"token_present":false,"token_sha256":null,"readable_by":["uid:2000","exe","mem","maps","fd","auxv","environ"],"denied_by":[]},"fds":[{"fd":0,"target":"/dev/null"},{"fd":1,"target":"pipe:[12345]"},{"fd":2,"target":"pipe:[12345]"}],"auxv":{"AT_EXECFN":"/srv/ci/ci-runner","AT_PLATFORM":""#,
+        r#"","observer_uid":2000},"identity":{"label":"ci-runner","comm":"ci-runner","argv":["ci-runner","--serve"],"cmdline_raw_nuls":1,"pid":1234,"ppid":1,"pgid":1234,"sid":1234,"uid":2000,"gid":2000,"groups":[],"starttime":123456,"cwd":"/srv/ci","root":"/","exe":"/srv/ci/ci-runner","ns":{"pid":"pid:[4026531836]","mnt":"mnt:[4026531841]","user":"user:[4026531837]","net":"net:[4026531992]"}},"status":{"Name":"ci-runner","State":"S","PPid":1,"Uid":"2000 2000 2000 2000","Gid":"2000 2000 2000 2000","Threads":1,"TracerPid":0,"NoNewPrivs":0,"Seccomp":0,"Seccomp_filters":0,"CapEff":"0000000000000000","CapPrm":"0000000000000000","CapBnd":"0000000000000000","VmLck":0,"RssShmem":0},"stat":{"ppid":1,"num_threads":1,"starttime":123456,"vsize":12345344,"rss":1024,"flags":4194304,"arg_start":140000000000000,"arg_end":140000000000018,"env_start":140000000000018,"env_end":140000000000114,"startstack":140000000000000},"memory":{"maps":[],"smaps":[],"token_present":false,"token_sha256":null,"token_placements":[],"readable_by":["uid:2000","exe","mem","maps","fd","auxv","environ"],"denied_by":[]},"fds":[{"fd":0,"target":"/dev/null"},{"fd":1,"target":"pipe:[12345]"},{"fd":2,"target":"pipe:[12345]"}],"auxv":{"AT_EXECFN":"/srv/ci/ci-runner","AT_PLATFORM":""#,
         "",
-        r#"","AT_BASE":0,"AT_ENTRY":0},"environ":["PATH=/usr/local/bin:/usr/bin:/bin","HOME=/home/runner","LANG=C.UTF-8"],"task":[{"tid":1234,"comm":"ci-runner","state":"S"}],"syscall":{"syscall":"epoll_wait","wchan":"do_epoll_wait","policy":0,"priority":20},"timing":{"exec_ms":3.2,"first_conceal_ms":18.0},"dumpable":true}"#,
+        r#"","AT_BASE":0,"AT_ENTRY":0},"environ":["PATH=/usr/local/bin:/usr/bin:/bin","HOME=/home/runner","LANG=C.UTF-8"],"environ_raw_len":66,"environ_all_nul":false,"task":[{"tid":1234,"comm":"ci-runner","state":"S"}],"syscall":{"syscall":"epoll_wait","wchan":"do_epoll_wait","policy":0,"priority":20},"timing":{"exec_ms":3.2,"first_conceal_ms":18.0},"dumpable":true,"children":[]}"#,
     );
     let clean_label = if label.trim().is_empty() {
         "ci-runner"
     } else {
         label.trim()
     };
-    let comm: String = clean_label.chars().take(15).collect();
+    let comm_end = clean_label
+        .char_indices()
+        .nth(15)
+        .map_or(clean_label.len(), |(i, _)| i);
+    let comm = clean_label.get(..comm_end).unwrap_or(clean_label);
     let exe = cat2("/srv/ci/", clean_label);
     let (maps, smaps) = basic_maps_smaps(&exe, "1001", 1536, 2432);
     let arg_len = (clean_label.len() + 9) as u64;
 
-    let mut root = Profile::parse_str(BASE_JSON).expect("base synth json");
+    let mut root = Profile::parse_str(BASE_JSON).unwrap_or_else(|_| default_profile());
     if tree {
-        root.source.profile = "tree".to_string();
+        json::assign_str(&mut root.source.profile, "tree");
     }
-    root.identity.label = clean_label.to_string();
-    root.identity.comm = comm.clone();
-    root.identity.argv[0] = clean_label.to_string();
-    root.identity.exe = exe.clone();
-    root.status.name = comm.clone();
-    root.task[0].comm = comm;
+    json::assign_str(&mut root.identity.label, clean_label);
+    json::assign_str(&mut root.identity.comm, comm);
+    if let Some(a0) = root.identity.argv.first_mut() {
+        json::assign_str(a0, clean_label);
+    }
+    json::assign_str(&mut root.identity.exe, &exe);
+    json::assign_str(&mut root.status.name, comm);
+    if let Some(t0) = root.task.first_mut() {
+        json::assign_str(&mut t0.comm, comm);
+    }
     root.auxv.at_execfn = Some(exe);
-    root.auxv.at_platform = Some(std::env::consts::ARCH.to_string());
+    root.auxv.at_platform = Some(own(std::env::consts::ARCH));
     root.memory.maps = maps;
     root.memory.smaps = smaps;
     root.stat.arg_end = root.stat.arg_start + arg_len;
@@ -1775,11 +2540,15 @@ pub fn synthetic_default_profile(label: &str, tree: bool) -> Profile {
         child.stat.ppid = 1234;
         child.identity.starttime = 123_474;
         child.stat.starttime = 123_474;
-        child.identity.argv[1] = "--worker".to_string();
+        if let Some(a1) = child.identity.argv.get_mut(1) {
+            json::assign_str(a1, "--worker");
+        }
         child.stat.arg_end = child.stat.arg_start + (clean_label.len() + 10) as u64;
         child.stat.env_start = child.stat.arg_end;
         child.stat.env_end = child.stat.env_start + 96;
-        child.task[0].tid = 1235;
+        if let Some(t0) = child.task.first_mut() {
+            t0.tid = 1235;
+        }
         root.children.push(child);
     }
     root
@@ -1873,7 +2642,7 @@ mod tests {
         if let Json::Obj(ref mut entries) = ver_bad {
             for (k, v) in entries.iter_mut() {
                 if k == "schema" {
-                    *v = Json::Int(2);
+                    *v = Json::Int(1);
                 }
             }
         }
@@ -1920,6 +2689,8 @@ mod tests {
         assert_eq!(st.comm, "my (weird) proc");
         assert_eq!(st.state, "S");
         assert_eq!(st.ppid, 100);
+        assert_eq!(st.pgid, 4242);
+        assert_eq!(st.sid, 4242);
         assert_eq!(st.flags, 4_194_304);
         assert_eq!(st.priority, 20);
         assert_eq!(st.num_threads, 3);
@@ -1953,9 +2724,15 @@ mod tests {
         let prof = extract_live(&opts).expect("extract live self pid");
         assert_eq!(prof.schema, PROFILE_SCHEMA);
         assert_eq!(prof.identity.pid, pid);
+        assert!(prof.identity.sid > 0);
+        assert!(prof.identity.pgid > 0);
         assert!(!prof.identity.comm.is_empty());
         assert!(!prof.task.is_empty());
-        assert!(prof.memory.token_sha256.is_none());
+        if prof.memory.token_present {
+            assert!(prof.memory.token_sha256.is_some());
+        } else {
+            assert!(prof.memory.token_sha256.is_none());
+        }
         prof.validate(&["DO_NOT_LEAK_SELF_TOKEN"]).unwrap();
 
         let json_str = prof.to_json().to_string();
@@ -1966,33 +2743,280 @@ mod tests {
 
     #[test]
     fn live_child_redaction_and_tree_extraction() {
-        let secret = "LIVE_CHILD_SECRET_VALUE_XYZ_999";
-        let mut child = std::process::Command::new("sleep")
+        let secret = "TOK-a1b2c3d4e5f60718";
+        let mut child = std::process::Command::new("/bin/sleep")
             .arg("10")
+            .env_clear()
             .env("MY_APP_SECRET", secret)
             .env("NORMAL_VAR", format!("holder-{secret}-end"))
             .spawn()
             .expect("spawn sleep child");
         let cpid = child.id() as i32;
+        for _ in 0..100 {
+            if read_proc_bytes(&proc_path(cpid, "environ"), 4096)
+                .is_ok_and(|b| b.windows(secret.len()).any(|w| w == secret.as_bytes()))
+            {
+                break;
+            }
+            sys::nanosleep(0, 5_000_000);
+        }
 
         // Extract child directly with redaction.
         let mut child_opts = ExtractOpts::for_pid(cpid);
         child_opts.redact_tokens.push(secret.to_string());
         let cprof = extract_live(&child_opts).expect("extract live child");
         assert_eq!(cprof.identity.pid, cpid);
+        assert!(cprof.environ_raw_len > 0);
+        assert!(!cprof.environ_all_nul);
         assert!(cprof.memory.token_present);
-        assert!(cprof.memory.token_sha256.is_none());
+        assert_eq!(
+            cprof.memory.token_sha256.as_deref(),
+            Some(sha256::hash_hex(secret.as_bytes()).as_str())
+        );
+        assert_eq!(cprof.memory.token_len, Some(secret.len() as u32));
+        assert_eq!(
+            cprof.memory.token_charset.as_deref(),
+            Some("prefix:TOK-:hex")
+        );
+        assert!(cprof
+            .memory
+            .token_placements
+            .contains(&"environ".to_string()));
         let cjson = cprof.to_json().to_string();
         assert!(!cjson.contains(secret));
+        assert!(cjson.contains("\"children\":[]"));
         cprof.validate(&[secret]).unwrap();
+
+        // Extract child with tree=true, ancestors=true and verify upward parent capture!
+        let mut anc_opts = ExtractOpts::for_pid(cpid);
+        anc_opts.tree = true;
+        anc_opts.ancestors = true;
+        anc_opts.redact_tokens.push(secret.to_string());
+        let aprof = extract_live(&anc_opts).expect("extract live child with ancestors");
+        let parent = aprof
+            .parent
+            .as_ref()
+            .expect("upward parent should be captured under tree+ancestors");
+        assert_eq!(parent.identity.pid, sys::getpid());
+        assert!(parent.children.is_empty());
+        aprof.validate(&[secret]).unwrap();
+
+        // Extract child with tree=true, ancestors=false and verify parent is NOT captured.
+        anc_opts.ancestors = false;
+        let no_anc = extract_live(&anc_opts).expect("extract live child without ancestors");
+        assert!(no_anc.parent.is_none());
 
         // Extract self with tree=true and verify child appears in children.
         let mut tree_opts = ExtractOpts::for_pid(sys::getpid());
         tree_opts.tree = true;
+        tree_opts.ancestors = false;
         tree_opts.redact_tokens.push(secret.to_string());
         let tprof = extract_live(&tree_opts).expect("extract live tree");
         assert!(tprof.children.iter().any(|c| c.identity.pid == cpid));
         tprof.validate(&[secret]).unwrap();
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn trailing_space_comm_and_status_groups_preserved() {
+        assert_eq!(strip_proc_newline(b"ci-runner      \n"), "ci-runner      ");
+        assert_eq!(
+            strip_proc_newline(b"ci-runner      \r\n"),
+            "ci-runner      "
+        );
+        let raw_status = b"Name:\tci-runner      \nState:\tS (sleeping)\nPPid:\t100\nUid:\t2000\t2000\t2000\t2000\nGid:\t2000\t2000\t2000\t2000\nGroups:\t4 27 2000 \nThreads:\t1\nTracerPid:\t0\n";
+        let (st, euid, egid, groups) = parse_proc_status(raw_status);
+        assert_eq!(st.name, "ci-runner      ");
+        assert_eq!(euid, 2000);
+        assert_eq!(egid, 2000);
+        assert_eq!(groups, vec![4, 27, 2000]);
+
+        let mut prof = synthetic_default_profile("ci-runner", false);
+        prof.identity.comm = "ci-runner      ".to_string();
+        prof.status.name = "ci-runner      ".to_string();
+        prof.task[0].comm = "ci-runner      ".to_string();
+        prof.validate(&[]).unwrap();
+        let rt = Profile::parse_str(&prof.to_json_str(false)).unwrap();
+        assert_eq!(rt.identity.comm, "ci-runner      ");
+        assert_eq!(rt.status.name, "ci-runner      ");
+        assert_eq!(rt.task[0].comm, "ci-runner      ");
+    }
+
+    #[test]
+    fn classify_token_charset_and_substitute_redacted() {
+        assert_eq!(
+            classify_token_charset("TOK-deadbeef0123"),
+            "prefix:TOK-:hex"
+        );
+        assert_eq!(classify_token_charset("TOK-abcXYZ123"), "prefix:TOK-:alnum");
+        assert_eq!(
+            classify_token_charset("sk_live_AbCd1234"),
+            "prefix:sk_live_:hex"
+        );
+        assert_eq!(
+            classify_token_charset("sk_live_AbGz1234"),
+            "prefix:sk_live_:alnum"
+        );
+        assert_eq!(classify_token_charset("DECOY-012345"), "prefix:DECOY-:hex");
+        assert_eq!(classify_token_charset("deadbeef01234567"), "hex");
+        assert_eq!(classify_token_charset("AbGzEf0123456789"), "alnum");
+        assert_eq!(classify_token_charset("YWJjZGVm+/=="), "base64");
+        assert_eq!(classify_token_charset("p@ss!word$123"), "ascii");
+        // Long descriptive prefixes must not leak secret words into token_charset.
+        assert_eq!(classify_token_charset("FAKE_SECRET_12345"), "base64");
+
+        assert_eq!(
+            substitute_redacted("SECRET=<REDACTED:len=10>", "DECOY-0123456789"),
+            "SECRET=DECOY-0123"
+        );
+        assert_eq!(
+            substitute_redacted("A=<REDACTED:len=6>,B=<REDACTED>", "XY"),
+            "A=XYXYXY,B=XY"
+        );
+        assert_eq!(substitute_redacted("plain", "TOK"), "plain");
+    }
+
+    #[test]
+    fn read_redact_tokens_file_trims_crlf_and_skips_blank() {
+        let path =
+            std::env::temp_dir().join(format!("psgen-redact-tokens-{}.txt", std::process::id()));
+        fs::write(&path, "TOK-11112222\r\n\n\r\nTOK-33334444\n").unwrap();
+        let toks = read_redact_tokens_file(path.to_str().unwrap()).unwrap();
+        let _ = fs::remove_file(&path);
+        assert_eq!(toks, vec!["TOK-11112222", "TOK-33334444"]);
+    }
+
+    #[test]
+    fn schema_v2_roundtrip_all_new_fields() {
+        let mut parent = synthetic_default_profile("ci-super", false);
+        parent.identity.pid = 1000;
+        parent.identity.ppid = 1;
+        parent.identity.pgid = 1000;
+        parent.identity.sid = 1000;
+        parent.identity.groups = vec![10, 2000];
+
+        let mut tracer = synthetic_default_profile("ci-trace", false);
+        tracer.identity.pid = 1001;
+
+        let mut prof = synthetic_default_profile("ci-runner", true);
+        prof.identity.comm = "ci-runner      ".to_string();
+        prof.identity.pgid = 1234;
+        prof.identity.sid = 1234;
+        prof.identity.groups = vec![4, 24, 2000];
+        prof.environ.clear();
+        prof.environ_raw_len = 81;
+        prof.environ_all_nul = true;
+        prof.memory.token_present = true;
+        prof.memory.token_sha256 = Some(sha256::hash_hex(b"TOK-abcdef123456"));
+        prof.memory.token_len = Some(16);
+        prof.memory.token_charset = Some("prefix:TOK-:hex".to_string());
+        prof.memory.token_placements = vec!["anon".to_string(), "heap".to_string()];
+        prof.parent = Some(Box::new(parent));
+        prof.tracer = Some(Box::new(tracer));
+
+        prof.validate(&["TOK-abcdef123456"]).unwrap();
+        let compact = prof.to_json_str(false);
+        let parsed = Profile::parse_str(&compact).unwrap();
+        assert_eq!(parsed, prof);
+        let pretty = prof.to_json_str(true);
+        let parsed_pretty = Profile::parse_str(&pretty).unwrap();
+        assert_eq!(parsed_pretty, prof);
+
+        // Secret leaked inside parent or tracer must be caught by validate().
+        let mut leaky = prof.clone();
+        leaky
+            .parent
+            .as_mut()
+            .unwrap()
+            .environ
+            .push("SECRET_TOKEN=LEAKED_PARENT_SECRET".to_string());
+        assert!(leaky.validate(&["LEAKED_PARENT_SECRET"]).is_err());
+
+        // Invalid token placement must be rejected by validate().
+        let mut bad_pl = prof.clone();
+        bad_pl.memory.token_placements.push("bogus".to_string());
+        assert!(bad_pl.validate(&[]).is_err());
+    }
+
+    #[test]
+    fn environ_all_nul_and_raw_len_captured_correctly() {
+        // Direct unit check of all-NUL blanked environ buffer.
+        let mut readable = Vec::new();
+        let mut denied = Vec::new();
+        let mut ctx = ProcCtx {
+            dir: String::new(),
+            toks: &[],
+            hit: false,
+            matched_tok: None,
+            matched_explicit: false,
+            placements: Vec::new(),
+            mem_extra_toks: Vec::new(),
+            readable: &mut readable,
+            denied: &mut denied,
+        };
+        let blank = vec![0u8; 58];
+        let (env_entries, raw_len, all_nul) = ctx.parse_environ_raw(&blank, &[]);
+        assert!(env_entries.is_empty());
+        assert_eq!(raw_len, 58);
+        assert!(all_nul);
+
+        // Live child check with exact K=V\0 env.
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("10")
+            .env_clear()
+            .env("K", "V")
+            .spawn()
+            .expect("spawn sleep");
+        let cpid = child.id() as i32;
+        for _ in 0..100 {
+            if read_proc_bytes(&proc_path(cpid, "environ"), 64).is_ok_and(|b| b == b"K=V\0") {
+                break;
+            }
+            sys::nanosleep(0, 5_000_000);
+        }
+        let prof = extract_live(&ExtractOpts::for_pid(cpid)).expect("extract");
+        assert_eq!(prof.environ, vec!["K=V".to_string()]);
+        assert_eq!(prof.environ_raw_len, 4); // b"K=V\0"
+        assert!(!prof.environ_all_nul);
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn live_argv_inline_token_redacted_and_hashed() {
+        let tok = "TOK-1234567890ab";
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 10; :", "sh", tok])
+            .env_clear()
+            .spawn()
+            .expect("spawn sh");
+        let cpid = child.id() as i32;
+        for _ in 0..100 {
+            if read_proc_bytes(&proc_path(cpid, "cmdline"), 4096)
+                .is_ok_and(|b| b.windows(tok.len()).any(|w| w == tok.as_bytes()))
+            {
+                break;
+            }
+            sys::nanosleep(0, 5_000_000);
+        }
+
+        // Even WITHOUT passing redact_tokens, inline TOK-... in argv is detected, hashed, and redacted.
+        let prof = extract_live(&ExtractOpts::for_pid(cpid)).expect("extract sh");
+        assert!(prof.memory.token_present);
+        assert_eq!(
+            prof.memory.token_sha256.as_deref(),
+            Some(sha256::hash_hex(tok.as_bytes()).as_str())
+        );
+        assert_eq!(prof.memory.token_len, Some(tok.len() as u32));
+        assert_eq!(
+            prof.memory.token_charset.as_deref(),
+            Some("prefix:TOK-:hex")
+        );
+        assert!(prof.memory.token_placements.contains(&"argv".to_string()));
+        assert!(!prof.to_json_str(false).contains(tok));
+        prof.validate(&[tok]).unwrap();
 
         let _ = child.kill();
         let _ = child.wait();

@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.2.0
+
+### Added
+
+- Upgraded `psgen profile` to **schema v2** with upward + downward `--tree` capture (`parent` and `tracer` ancestors bounded away from init and caller harness shells; opt out via `--no-ancestors`), exact trailing-space `comm` preservation (up to 15 bytes), `sid`/`pgid`/`groups`, `environ_raw_len`/`environ_all_nul`, and token shape/length/charset/placement/SHA-256 metadata (`token_len`, `token_charset`, `token_placements`, `token_sha256`) across `argv`, `environ`, `heap`, `stack`, and `anon`.
+- Added `--redact-token-file <FILE>` (supporting `-` for stdin) to `profile`, `run`, and `verify` so callers never have to export secrets into child environments.
+- Added `--no-clean-env`, `--same-session`, `--label-decoys <N>`, and `--interleave-cmd <CMD>` to `psgen inject`, plus `wait4` (`do_wait`) wait-channel mode and per-thread `wchan` cloning.
+- Added `--redact-token`, `--redact-token-file`, and `--redact-env` to `psgen run`, and made `--profile` optional when `--live` is paired with `--target-cmd` or `--target-pid` (auto-capturing the target tree).
+- Added fail-closed `psgen verify --blind-dir <DIR>` verifying `BLIND_MANIFEST.sha256` and refusing any contaminated blind directory (`answer.json`, `population.json`, `profile.json`, `MANIFEST.sha256`, `*.pid`, target PID labels, secret leaks, or host path leaks).
+- Added 15-surface `surface_fidelity` reporting (`ps_indistinguishable_decoys`, `proc_indistinguishable_decoys`, `per_surface`, `separating_surfaces`, `discrimination_gate`) in `psgen score`.
+- Added planted-defect guards `PD-07` (blind-dir contamination fail-closed check) and `PD-08` (opacity/seccomp inversion and flat-`PPid=1` decoy defect detection + survival-gated scoring) to `psgen selftest`.
+
+### Fixed
+
+- Fixed opacity & seccomp/NNP inversion in `inject --from-profile`: decoys now match target `dumpable`, `NoNewPrivs`, and exact `Seccomp_filters` delta (`target - inherited`) instead of forcing `dumpable=0` / extra filters at Level 6, and Yama `ptrace_scope=1` `/proc/<pid>/mem` denials no longer misclassify dumpable targets as non-dumpable.
+- Fixed flat `PPid=1` decoy trees and session leaks: decoy supervisors now stay alive blocking in `wait4` (`do_wait`) with seeded intra-tree PID dispersion, exact child session inheritance, and full-tree 3-field pidfile cleanup via `psgen stop`.
+- Fixed `<REDACTED:len=N>` verbatim copy, all-NUL `environ` span mismatch (in-place stack `environ` zeroing), `AT_EXECFN` matching, capability leakage (`capset` zeroing after private-userns bind-mount exe spoofing), detached stdout pipe hangs under `| tee`, and `run --live` synthetic churn/decoy mixing.
+- Replaced high-RAM private `F_CLEAN_ENV` page dirtying with zero-burn shared read-only page-cache `maps`/`RssFile` mappings and untouched `PROT_NONE` `VmSize` padding.
+- Fixed `compute_population_score` to strictly gate the 0–10 score on `C-06` survival, control pass rate, `C-04` false-positive rate, `wrong_reason_picks`, and `differing_target_surfaces`.
+
+### Changed
+
+- Unified the stub configuration wire format to `PGCFG023` v5 authenticated via sealed memfd link name (`/memfd:pg:<nonce>`), defaulted `--clean-env` and `bind_exe` (with basename-matched shadow copy fallback) ON under `inject --from-profile`, and slimmed binary size + enabled static non-PIE musl relocation so all seven static musl release binaries stay comfortably under 1 MiB.
+
 ## 0.1.0
 
 ### Added

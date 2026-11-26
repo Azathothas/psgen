@@ -7,7 +7,7 @@
 use std::ffi::{CString, OsStr};
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub const O_WRONLY: i32 = libc::O_WRONLY;
 pub const O_RDWR: i32 = libc::O_RDWR;
@@ -67,26 +67,9 @@ fn path_of(path: &[u8]) -> &Path {
 /// `| head` exits before the writer does — so it is the one case that stays
 /// silent, and the generator that cares stops through `out_checked`.
 pub fn out(buf: &[u8]) {
-    match io::stdout()
-        .write_all(buf)
-        .and_then(|()| io::stdout().flush())
-    {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {}
-        Err(e) => out_failed(e),
+    if let OutResult::Failed(e) = out_checked(buf) {
+        std::process::exit(out_failure(e));
     }
-}
-
-fn out_message(e: &io::Error) -> Vec<u8> {
-    let mut msg = b"psgen: cannot write to stdout: ".to_vec();
-    msg.extend_from_slice(e.to_string().as_bytes());
-    msg.push(b'\n');
-    msg
-}
-
-fn out_failed(e: io::Error) -> ! {
-    let _ = io::stderr().write_all(&out_message(&e));
-    std::process::exit(1)
 }
 
 /// What a stdout write means to a generator that may write again.
@@ -107,6 +90,7 @@ pub enum OutResult {
 }
 
 /// Write to stdout and say which of the three outcomes happened.
+#[inline(never)]
 pub fn out_checked(buf: &[u8]) -> OutResult {
     match io::stdout()
         .write_all(buf)
@@ -119,9 +103,71 @@ pub fn out_checked(buf: &[u8]) -> OutResult {
 }
 
 /// Report a stdout failure the way `out()` does and return the exit code.
+#[inline(never)]
 pub fn out_failure(e: io::Error) -> i32 {
-    let _ = io::stderr().write_all(&out_message(&e));
+    let mut b = crate::str::Buf::new();
+    buf_push_s(&mut b, "psgen: cannot write to stdout: ");
+    push_io_err(&mut b, &e);
+    b.push(b'\n');
+    err(b.as_bytes());
     1
+}
+
+/// Non-inlined `Buf` helpers shared across modules to prevent per-callsite
+/// `Vec::extend_from_slice` and `push_u64` code bloat.
+#[inline(never)]
+pub(crate) fn buf_push_s(b: &mut crate::str::Buf, s: &str) {
+    b.push_str(s);
+}
+
+#[inline(never)]
+pub(crate) fn buf_push_b(b: &mut crate::str::Buf, s: &[u8]) {
+    b.push_bytes(s);
+}
+
+#[inline(never)]
+pub(crate) fn buf_push_u(b: &mut crate::str::Buf, n: u64) {
+    b.push_u64(n);
+}
+
+#[inline(never)]
+pub(crate) fn push_io_err(b: &mut crate::str::Buf, e: &io::Error) {
+    use std::fmt::Write;
+    let mut s = String::new();
+    let _ = write!(s, "{e}");
+    b.push_str(&s);
+}
+
+#[inline(never)]
+pub(crate) fn push_errno(b: &mut crate::str::Buf, code: i32) {
+    push_io_err(b, &io::Error::from_raw_os_error(code));
+}
+
+#[inline(never)]
+pub(crate) fn err_parts(parts: &[&[u8]]) {
+    let mut b = crate::str::Buf::new();
+    buf_push_s(&mut b, "psgen: ");
+    for p in parts {
+        buf_push_b(&mut b, p);
+    }
+    b.push(b'\n');
+    err(b.as_bytes());
+}
+
+#[inline(never)]
+pub(crate) fn proc_path(pid: i32, suffix: &str) -> crate::str::Buf {
+    let mut b = crate::str::Buf::with_capacity(24 + suffix.len());
+    buf_push_s(&mut b, "/proc/");
+    buf_push_u(&mut b, pid as u64);
+    if !suffix.is_empty() {
+        buf_push_s(&mut b, suffix);
+    }
+    b
+}
+
+#[inline(never)]
+pub(crate) fn is_untrusted_fs(fs: Option<i64>) -> bool {
+    matches!(fs, Some(FUSE_SUPER_MAGIC) | Some(OVERLAYFS_SUPER_MAGIC))
 }
 
 pub fn err(buf: &[u8]) {
@@ -248,10 +294,7 @@ pub fn seccomp_user_notif() -> bool {
     if r != -1 {
         return true;
     }
-    !matches!(
-        last_error().raw_os_error(),
-        Some(libc::EPERM) | Some(libc::EACCES) | Some(libc::ENOSYS)
-    )
+    !matches!(errno(), libc::EPERM | libc::EACCES | libc::ENOSYS)
 }
 
 pub fn read_fd(fd: i32, buf: &mut [u8]) -> isize {
@@ -285,7 +328,7 @@ pub fn write_fd(fd: i32, buf: &[u8]) -> bool {
     while !rest.is_empty() {
         let n = unsafe { libc::write(fd, rest.as_ptr() as *const libc::c_void, rest.len()) };
         if n < 0 {
-            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            if errno() == libc::EINTR {
                 continue;
             }
             return false;
@@ -312,11 +355,7 @@ pub fn open(path: &[u8], flags: i32, mode: u32) -> i32 {
 /// tells "this file has no name anyone else can open" from a named file handed
 /// in by a supervisor.
 pub fn fd_nlink(fd: i32) -> Option<u64> {
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(fd, &mut st) } != 0 {
-        return None;
-    }
-    Some(st.st_nlink as u64)
+    fd_stat(fd).map(|s| s.nlink)
 }
 
 /// The seals the stub requires: the size cannot change and no further seals
@@ -402,11 +441,7 @@ pub const OVERLAYFS_SUPER_MAGIC: i64 = 0x794c_7630;
 /// The owner uid of the object a descriptor refers to, or None when fstat
 /// fails.
 pub fn fd_owner(fd: i32) -> Option<u32> {
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(fd, &mut st) } != 0 {
-        return None;
-    }
-    Some(st.st_uid as u32)
+    fd_stat(fd).map(|s| s.uid)
 }
 
 /// Whether a descriptor carries the seals the stub requires.
@@ -479,7 +514,7 @@ pub fn execve(path: &[u8], argv: &[*const u8], envp: &[*const u8]) -> isize {
 pub fn waitpid(pid: i32, status: &mut i32) -> i32 {
     loop {
         let r = unsafe { libc::waitpid(pid, status, 0) };
-        if r < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+        if r < 0 && errno() == libc::EINTR {
             continue;
         }
         return r;
@@ -560,6 +595,10 @@ pub fn setsid() -> i32 {
     unsafe { libc::setsid() }
 }
 
+pub fn getsid(pid: i32) -> i32 {
+    unsafe { libc::getsid(pid) }
+}
+
 pub fn setpgid(pid: i32, pgid: i32) -> bool {
     unsafe { libc::setpgid(pid, pgid) == 0 }
 }
@@ -606,26 +645,24 @@ pub fn ignore_sigxfsz() {
     }
 }
 
-pub fn now_secs() -> u64 {
+fn clock_ts(clk: libc::clockid_t) -> Option<libc::timespec> {
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
     };
-    unsafe {
-        libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts);
+    if unsafe { libc::clock_gettime(clk, &mut ts) } != 0 {
+        return None;
     }
-    ts.tv_sec as u64
+    Some(ts)
+}
+
+pub fn now_secs() -> u64 {
+    clock_ts(libc::CLOCK_REALTIME).map_or(0, |ts| ts.tv_sec as u64)
 }
 
 pub fn monotonic_ns() -> u64 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    unsafe {
-        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
-    }
-    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+    clock_ts(libc::CLOCK_MONOTONIC)
+        .map_or(0, |ts| ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64)
 }
 
 /// `CLOCK_BOOTTIME` in nanoseconds, or `None` when the syscall fails.
@@ -635,12 +672,8 @@ pub fn monotonic_ns() -> u64 {
 /// needs. `/proc/uptime` is normally the same clock, but a container whose
 /// procfs is virtualized (lxcfs) makes it disagree.
 pub fn boottime_ns() -> Option<u64> {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    let r = unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) };
-    if r != 0 || ts.tv_sec < 0 || ts.tv_nsec < 0 {
+    let ts = clock_ts(libc::CLOCK_BOOTTIME)?;
+    if ts.tv_sec < 0 || ts.tv_nsec < 0 {
         return None;
     }
     Some(
@@ -733,14 +766,14 @@ pub fn anon_file(name: &[u8], size: u64) -> i32 {
         }
         close(fd);
     }
-    let bases: Vec<PathBuf> = vec![
-        std::env::temp_dir(),
-        PathBuf::from("/tmp"),
-        PathBuf::from("/dev/shm"),
-        PathBuf::from("."),
-    ];
-    for base in bases {
-        if let Some(fd) = temp_anon_fd(&base, size) {
+    let td = std::env::temp_dir();
+    for base in [
+        td.as_path(),
+        Path::new("/tmp"),
+        Path::new("/dev/shm"),
+        Path::new("."),
+    ] {
+        if let Some(fd) = temp_anon_fd(base, size) {
             return fd;
         }
     }
@@ -1022,6 +1055,54 @@ pub fn wait_exit_code(status: i32) -> Option<i32> {
     }
 }
 
+/// Read the current process's `Seccomp_filters:` count from `/proc/self/status`,
+/// returning `0` if absent or unreadable.
+#[inline(never)]
+pub fn self_seccomp_filters() -> u32 {
+    let Some(text) = read_file_nofollow(b"/proc/self/status", 65_536) else {
+        return 0;
+    };
+    for line in text.split(|&b| b == b'\n') {
+        if let Some(mut rest) = line.strip_prefix(b"Seccomp_filters:") {
+            while let Some(&b) = rest.first() {
+                if b == b' ' || b == b'\t' {
+                    rest = &rest[1..];
+                } else {
+                    break;
+                }
+            }
+            let end = rest
+                .iter()
+                .position(|b| !b.is_ascii_digit())
+                .unwrap_or(rest.len());
+            if let Some(v) = crate::str::parse_u64(&rest[..end]) {
+                return v.min(u32::MAX as u64) as u32;
+            }
+        }
+    }
+    0
+}
+
+/// Close all file descriptors `>= first`, using `close_range(2)` when available
+/// and falling back to an explicit close loop on older kernels.
+#[inline(never)]
+pub fn close_range_from(first: i32) {
+    let start = first.max(0);
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            start as libc::c_long,
+            u32::MAX as libc::c_long,
+            0 as libc::c_long,
+        )
+    };
+    if r != 0 {
+        for fd in start..=1024 {
+            close(fd);
+        }
+    }
+}
+
 pub fn prctl_set_dumpable(dumpable: bool) -> bool {
     let v: libc::c_ulong = if dumpable { 1 } else { 0 };
     unsafe {
@@ -1044,6 +1125,47 @@ pub fn prctl_set_no_new_privs() -> bool {
             0 as libc::c_ulong,
             0 as libc::c_ulong,
         ) == 0
+    }
+}
+
+/// Drop all effective, permitted, and inheritable capabilities so an
+/// unprivileged stub that entered a private user namespace for bind-mount exe
+/// spoofing matches the unprivileged target's zeroed `CapPrm`/`CapEff`.
+pub fn drop_all_caps() {
+    #[repr(C)]
+    struct CapHeader {
+        version: u32,
+        pid: i32,
+    }
+    #[repr(C)]
+    struct CapData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+    let mut hdr = CapHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let data = [
+        CapData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        },
+        CapData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        },
+    ];
+    unsafe {
+        let _ = libc::syscall(
+            libc::SYS_capset,
+            (&mut hdr as *mut CapHeader).cast::<libc::c_void>(),
+            data.as_ptr().cast::<libc::c_void>(),
+        );
     }
 }
 
@@ -1138,7 +1260,7 @@ pub fn memfd_exec_copy(label: &[u8], src_path: &[u8]) -> i32 {
     loop {
         let n = read_fd(sfd, &mut buf);
         if n < 0 {
-            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            if errno() == libc::EINTR {
                 continue;
             }
             ok = false;
@@ -1231,6 +1353,38 @@ pub fn wait_wchan(mode: u8) -> ! {
                 }
             }
         }
+        6 => {
+            // Reap/wait on child stubs via wait4(-1, ...) so /proc/<pid>/wchan
+            // reports `do_wait` and children keep PPid == supervisor PID.
+            unsafe {
+                libc::signal(libc::SIGCHLD, libc::SIG_DFL);
+            }
+            const PTRACE_CONT: libc::c_long = 7;
+            let mut st: libc::c_int = 0;
+            loop {
+                let r = unsafe { libc::wait4(-1, &mut st, 0, core::ptr::null_mut()) };
+                if r > 0 {
+                    if libc::WIFSTOPPED(st) {
+                        let sig = libc::WSTOPSIG(st) as libc::c_long;
+                        unsafe {
+                            let _ = libc::syscall(
+                                libc::SYS_ptrace,
+                                PTRACE_CONT,
+                                r as libc::c_long,
+                                0 as libc::c_long,
+                                sig,
+                            );
+                        }
+                    }
+                    continue;
+                }
+                if r < 0 && errno() == libc::EINTR {
+                    continue;
+                }
+                // ECHILD (no children left): fall through to pause() for remainder of duration.
+                break;
+            }
+        }
         _ => {}
     }
     loop {
@@ -1268,6 +1422,22 @@ pub fn eventfd_open() -> i32 {
     unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) }
 }
 
+pub fn epoll_open() -> i32 {
+    unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) }
+}
+
+pub fn timerfd_open() -> i32 {
+    unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC) }
+}
+
+pub fn signalfd_open() -> i32 {
+    let mut mask: libc::sigset_t = unsafe { core::mem::zeroed() };
+    unsafe {
+        libc::sigemptyset(&mut mask);
+        libc::signalfd(-1, &mask, libc::SFD_CLOEXEC)
+    }
+}
+
 pub fn memfd_dummy(name: &[u8]) -> i32 {
     let raw = if name.is_empty() { b"anon" } else { name };
     let n = &raw[..raw.len().min(240)];
@@ -1287,6 +1457,19 @@ pub fn ptrace_seize(pid: i32) -> bool {
     }
 }
 
+fn build_cstr_ptrs(items: &[&[u8]]) -> Result<(Vec<CString>, Vec<*const libc::c_char>), i32> {
+    let mut owned = Vec::with_capacity(items.len());
+    let mut ptrs = Vec::with_capacity(items.len() + 1);
+    for &s in items {
+        owned.push(cstr(s).ok_or(libc::EINVAL)?);
+    }
+    for s in &owned {
+        ptrs.push(s.as_ptr());
+    }
+    ptrs.push(core::ptr::null());
+    Ok((owned, ptrs))
+}
+
 /// Run an external program via `fork` + `execvp`/`execve` + `waitpid` without
 /// pulling in `std::process::Command` / `CommandEnv` / `BTreeMap<OsString, OsString>`.
 ///
@@ -1301,29 +1484,11 @@ pub fn run_cmd(
     capture_stderr: bool,
 ) -> Result<(i32, Vec<u8>), i32> {
     let c_prog = cstr(prog).ok_or(libc::EINVAL)?;
-    let mut c_args: Vec<CString> = Vec::with_capacity(argv.len());
-    for &a in argv {
-        c_args.push(cstr(a).ok_or(libc::EINVAL)?);
-    }
-    let mut arg_ptrs: Vec<*const libc::c_char> = Vec::with_capacity(c_args.len() + 1);
-    for a in &c_args {
-        arg_ptrs.push(a.as_ptr());
-    }
-    arg_ptrs.push(core::ptr::null());
-
-    let mut c_env: Vec<CString> = Vec::new();
-    let mut env_ptrs: Vec<*const libc::c_char> = Vec::new();
-    if let Some(es) = env {
-        c_env.reserve(es.len());
-        for &e in es {
-            c_env.push(cstr(e).ok_or(libc::EINVAL)?);
-        }
-        env_ptrs.reserve(c_env.len() + 1);
-        for e in &c_env {
-            env_ptrs.push(e.as_ptr());
-        }
-        env_ptrs.push(core::ptr::null());
-    }
+    let (_c_args, arg_ptrs) = build_cstr_ptrs(argv)?;
+    let (_c_env, env_ptrs) = match env {
+        Some(es) => build_cstr_ptrs(es)?,
+        None => (Vec::new(), Vec::new()),
+    };
 
     let (err_r, err_w) = pipe2_pair().ok_or_else(errno)?;
     let serr_pipe = if capture_stderr {
@@ -1406,21 +1571,32 @@ pub fn run_cmd(
     close(err_r);
 
     let mut status: libc::c_int = 0;
-    loop {
-        let r = unsafe { libc::waitpid(pid, &mut status, 0) };
-        if r < 0 && errno() == libc::EINTR {
-            continue;
-        }
-        break;
-    }
+    let _ = waitpid(pid, &mut status);
 
     if err_got == 4 {
         return Err(i32::from_ne_bytes(err_buf));
     }
-    let code = if libc::WIFEXITED(status) {
-        libc::WEXITSTATUS(status)
-    } else {
-        1
-    };
-    Ok((code, stderr_out))
+    Ok((wait_exit_code(status).unwrap_or(1), stderr_out))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn self_seccomp_filters_and_fd_helpers_work() {
+        // Must never panic and must match /proc/self/status.
+        let sf = self_seccomp_filters();
+        assert!(sf <= 64);
+        assert!(getsid(0) > 0);
+        let ep = epoll_open();
+        assert!(ep >= 0);
+        close(ep);
+        let tf = timerfd_open();
+        assert!(tf >= 0);
+        close(tf);
+        let sfd = signalfd_open();
+        assert!(sfd >= 0);
+        close(sfd);
+    }
 }

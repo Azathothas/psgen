@@ -1,6 +1,25 @@
 # Native musl builds use rust-lld. Cross targets are linked by cargo-zigbuild.
+# Non-PIE static relocation removes .rela.dyn / .dynamic / GOT overhead (~35 KiB)
+# across all static musl targets while preserving strict static linking.
 [target.x86_64-unknown-linux-musl]
 linker = "rust-lld"
+rustflags = ["-C", "relocation-model=static", "-C", "link-arg=--icf=all"]
 
 [target.aarch64-unknown-linux-musl]
 linker = "rust-lld"
+rustflags = ["-C", "relocation-model=static", "-C", "link-arg=--icf=all"]
+
+[target.riscv64gc-unknown-linux-musl]
+rustflags = ["-C", "relocation-model=static"]
+
+[target.i686-unknown-linux-musl]
+rustflags = ["-C", "relocation-model=static"]
+
+[target.armv7-unknown-linux-musleabihf]
+rustflags = ["-C", "relocation-model=static"]
+
+[target.loongarch64-unknown-linux-musl]
+rustflags = ["-C", "relocation-model=static"]
+
+[target.powerpc64le-unknown-linux-musl]
+rustflags = ["-C", "relocation-model=static"]

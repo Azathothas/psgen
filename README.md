@@ -513,28 +513,32 @@ On `EPIPE`, `load` exits 0 silently; on any other stdout write error, `load` pri
 
 ## Profile-driven decoys and blind evaluation harness
 
-`psgen` can capture a live target's observable `/proc` shape (`schema: 1`, never storing real secrets), spawn matched low-overhead live decoy populations, and run reproducible two-phase blind evaluations (Phase A process table + Phase B deep `/proc`) with controls (`C-01`..`C-07`), single-surface hard negatives (`HN-01`..`HN-10`), SHA-256 manifests, and planted-defect self-tests.
+`psgen` can capture a live target's observable `/proc` shape (`schema: 2`, never storing real secrets), spawn matched zero-RAM-burn live decoy populations, and run reproducible two-phase blind evaluations (Phase A process table + Phase B deep `/proc`) with controls (`C-01`..`C-07`), single-surface hard negatives (`HN-01`..`HN-10`), SHA-256 manifests, fail-closed blind directory verification, and planted-defect self-tests.
 
 ### profile
 
-Capture a live process or tree into a schema v1 JSON profile, or validate an existing profile:
+Capture a live process or full supervisor/payload tree (walking both upward to supervisors/tracers and downward to children) into a schema v2 JSON profile, or validate an existing profile:
 
 ```sh
 psgen profile --pid 4210 --tree --label ci-runner --masker pmask \
-  --redact-token FAKE_SECRET --out profile.json
-psgen profile --validate profile.json
+  --redact-token-file secrets.txt --out profile.json
+psgen profile --validate profile.json --redact-token-file secrets.txt
 ```
+
+Pass `--no-ancestors` to capture only downward children without walking upward through `PPid`/`TracerPid`.
 
 ### inject fidelity flags
 
-Bare `psgen inject` preserves its existing corpus behavior and `PSGEN_NONCE` / v3 stub config contract.
-Opt-in flags enable profile-matched high-fidelity decoy populations:
+Bare `psgen inject` preserves its corpus process-table behavior. Profile-driven flags spawn matched high-fidelity live decoy populations with clean defaults (`--clean-env` and exe binding/shadow-basename matching enabled by default under `--from-profile`):
 
-- `--from-profile FILE`: build live decoy trees from a schema v1 `profile.json` (`--decoy-level 1..6`, default `5`).
-- `--clean-env`: authenticate config fd 3 via sealed memfd link name (`/memfd:pg:<nonce>`) with zero `PSGEN_NONCE` in `/proc/<pid>/environ`, and clone target `environ`, `cwd`, `fds`, `task/*` thread names, `VmLck`, `RssShmem`, and delta `VmRSS`/`VmSize` without `memfd:cache`.
-- `--exe-memfd`: re-execute stubs from an anonymous memfd (`/memfd:<label> (deleted)`).
-- `--decoy-token PREFIX`: place deterministic shape-matched decoy tokens in anonymous `rw-p` memory and `[stack]` (Level 5+).
-- `--dumpable 0|1`, `--seccomp 0..8`, `--wchan pause|epoll|poll|nanosleep|futex|read`: override hardening and wait-channel surfaces.
+- `--from-profile FILE`: build live decoy trees from a schema v2 `profile.json` (`--decoy-level 1..6`, default `5`), matching target `comm` (preserving trailing spaces up to 15 bytes), NUL-padded `cmdline`, `environ` (including exact-span all-NUL blanked environments), `dumpable`, `NoNewPrivs`, exact `Seccomp_filters` delta, supervisor->payload `PPid`/`TracerPid` trees (`wait4`), `setsid` isolation, zero-burn read-only shared `maps`/`RssFile`, `cwd`, `fds` (shared pipes/sockets/regular files, `epoll`, `timerfd`, `signalfd`, PTYs), `AT_EXECFN`, and per-thread `wchan`.
+- `--no-clean-env`: opt out of clean-env mode under `--from-profile`.
+- `--same-session`: opt out of per-tree `setsid()` session isolation.
+- `--exe-memfd`: re-execute stubs from an anonymous memfd (`/memfd:<label> (deleted)`; auto-enabled when the profile exe is `/memfd:...`).
+- `--decoy-token PREFIX`: place deterministic length- and charset-matched decoy tokens only in profiled placements (`argv`, `environ`, `anon`, `heap`, `stack`), never colliding with `token_sha256`.
+- `--dumpable 0|1`, `--seccomp 0..8`, `--wchan pause|epoll|poll|nanosleep|futex|read|wait4`: override hardening and wait-channel surfaces.
+- `--label-decoys N`: spawn `N` clean label-only decoys alongside profile decoys and record them in `--pidfile`.
+- `--interleave-cmd CMD`: launch `CMD` at a seeded random rank (`[20%..80%]`) among profile decoys with jitter and churn on both sides.
 - `--jitter-ms N`, `--churn N`: spread spawn start times with seeded jitter and reap short-lived background churn with zero zombies (`PR_SET_CHILD_SUBREAPER`).
 - `--masker-cmd CMD`: spawn decoys by running an external masker command directly.
 
@@ -545,18 +549,19 @@ Opt-in flags enable profile-matched high-fidelity decoy populations:
 psgen run --profile profile.json --out run-1234 --blind-dir blind-1234 \
   --decoys 50 --seed 1234 --mode both --level 6 --control C-06
 
-# Live interleaved run (spawns target among matched live decoys and snapshots /proc)
-psgen run --live --profile profile.json --target-cmd "pmask --stealth --label ci-runner -- /bin/sleep 60" \
-  --out run-live --blind-dir blind-live --decoys 20 --seed 4004 --mode both --level 6
+# Live interleaved run (auto-captures profile when --profile is omitted, spawns matched live decoys, snapshots /proc)
+psgen run --live --target-cmd "pmask --stealth --label ci-runner -- /bin/sleep 60" \
+  --redact-token-file secrets.txt --out run-live --blind-dir blind-live \
+  --decoys 20 --seed 4004 --mode both --level 6 --control C-06
 
-# Verify manifest hashes, schema validity, target presence, and zero secret/host-path leaks
-psgen verify run-1234 --pick pick.json --redact-token FAKE_SECRET
+# Verify private bundle AND fail-closed blind directory integrity (refuses answer.json / *.pid / leaks)
+psgen verify run-1234 --blind-dir blind-1234 --pick pick.json --redact-token-file secrets.txt
 
-# Score or deterministically replay offline without touching /proc
+# Score (survival-gated 0-10 score + 15-surface fidelity table) or deterministically replay offline
 psgen score run-1234 --pick pick.json --out score.json
 psgen replay run-1234 --pick pick.json
 
-# Run all 6 planted-defect passing+refusal guards and the 36-run 9/10 vs 7/10 discrimination matrix
+# Run all 8 planted-defect passing+refusal guards (PD-01..PD-08) and the 36-run 9/10 vs 7/10 discrimination matrix
 psgen selftest --out selftest-out
 ```
 

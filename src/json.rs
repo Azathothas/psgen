@@ -54,6 +54,7 @@ impl Jw {
         write_file(path, self.out.as_bytes())
     }
 
+    #[inline(never)]
     fn sep(&mut self) {
         if self.need_comma {
             self.out.push(',');
@@ -65,12 +66,14 @@ impl Jw {
         self.need_comma = true;
     }
 
+    #[inline(never)]
     fn open(&mut self, ch: char) {
         self.out.push(ch);
         self.depth += 1;
         self.need_comma = false;
     }
 
+    #[inline(never)]
     fn close(&mut self, ch: char) {
         self.depth -= 1;
         if self.need_comma && self.pretty {
@@ -116,14 +119,18 @@ impl Jw {
         }
     }
 
-    pub fn k_obj(&mut self, k: &str) {
+    #[inline(never)]
+    fn k_open(&mut self, k: &str, ch: char) {
         self.key(k);
-        self.open('{');
+        self.open(ch);
+    }
+
+    pub fn k_obj(&mut self, k: &str) {
+        self.k_open(k, '{');
     }
 
     pub fn k_arr(&mut self, k: &str) {
-        self.key(k);
-        self.open('[');
+        self.k_open(k, '[');
     }
 
     #[inline(never)]
@@ -132,6 +139,7 @@ impl Jw {
         push_escaped_str(v, &mut self.out);
     }
 
+    #[inline(never)]
     pub fn k_opt_str(&mut self, k: &str, v: &Option<String>) {
         match v {
             Some(s) => self.k_str(k, s),
@@ -151,19 +159,24 @@ impl Jw {
         push_u64(&mut self.out, v);
     }
 
+    #[inline(never)]
     pub fn k_f64(&mut self, k: &str, v: f64) {
         self.key(k);
         push_float(v, &mut self.out);
     }
 
-    pub fn k_bool(&mut self, k: &str, v: bool) {
+    #[inline(never)]
+    fn k_lit(&mut self, k: &str, lit: &str) {
         self.key(k);
-        self.out.push_str(if v { "true" } else { "false" });
+        self.out.push_str(lit);
+    }
+
+    pub fn k_bool(&mut self, k: &str, v: bool) {
+        self.k_lit(k, if v { "true" } else { "false" });
     }
 
     pub fn k_null(&mut self, k: &str) {
-        self.key(k);
-        self.out.push_str("null");
+        self.k_lit(k, "null");
     }
 
     #[inline(never)]
@@ -176,6 +189,7 @@ impl Jw {
         self.arr_close();
     }
 
+    #[inline(never)]
     pub fn k_i32_arr(&mut self, k: &str, items: &[i32]) {
         self.k_arr(k);
         for &n in items {
@@ -185,33 +199,89 @@ impl Jw {
         self.arr_close();
     }
 
+    pub fn k_u32_arr(&mut self, k: &str, items: &[u32]) {
+        self.k_arr(k);
+        for &n in items {
+            self.sep();
+            push_u64(&mut self.out, n as u64);
+        }
+        self.arr_close();
+    }
+
+    #[inline(never)]
     pub fn k_some_str(&mut self, k: &str, v: &Option<String>) {
         if let Some(ref s) = v {
             self.k_str(k, s);
         }
     }
 
+    #[inline(never)]
     pub fn k_some_u64(&mut self, k: &str, v: Option<u64>) {
         if let Some(n) = v {
             self.k_u64(k, n);
         }
     }
 
+    #[inline(never)]
+    fn push_r6(&mut self, v: f64) {
+        push_float(round6(v), &mut self.out);
+    }
+
+    #[inline(never)]
     pub fn k_f64_r6(&mut self, k: &str, v: f64) {
-        self.k_f64(k, round6(v));
+        self.key(k);
+        self.push_r6(v);
     }
 
+    #[inline(never)]
     pub fn k_f64_pair_r6(&mut self, k: &str, p: (f64, f64)) {
-        self.k_f64_pair(k, round6(p.0), round6(p.1));
-    }
-
-    pub fn k_f64_pair(&mut self, k: &str, a: f64, b: f64) {
         self.k_arr(k);
         self.sep();
-        push_float(a, &mut self.out);
+        self.push_r6(p.0);
         self.sep();
-        push_float(b, &mut self.out);
+        self.push_r6(p.1);
         self.arr_close();
+    }
+
+    #[inline(never)]
+    pub fn k_strs(&mut self, mut csv: &str, vals: &[&str]) {
+        for &v in vals {
+            self.k_str(next_csv(&mut csv), v);
+        }
+    }
+
+    pub fn k_some_strs(&mut self, mut csv: &str, vals: &[&Option<String>]) {
+        for &v in vals {
+            self.k_some_str(next_csv(&mut csv), v);
+        }
+    }
+
+    #[inline(never)]
+    pub fn k_i64s(&mut self, mut csv: &str, vals: &[i64]) {
+        for &v in vals {
+            self.k_i64(next_csv(&mut csv), v);
+        }
+    }
+
+    #[inline(never)]
+    pub fn k_u64s(&mut self, mut csv: &str, vals: &[u64]) {
+        for &v in vals {
+            self.k_u64(next_csv(&mut csv), v);
+        }
+    }
+
+    #[inline(never)]
+    pub fn k_f64s_r6(&mut self, mut csv: &str, vals: &[f64]) {
+        for &v in vals {
+            self.k_f64_r6(next_csv(&mut csv), v);
+        }
+    }
+
+    #[inline(never)]
+    pub fn k_str_arrs(&mut self, mut csv: &str, vals: &[&[String]]) {
+        for &v in vals {
+            self.k_str_arr(next_csv(&mut csv), v);
+        }
     }
 
     pub fn k_raw(&mut self, k: &str, raw_json: &str) {
@@ -250,29 +320,114 @@ pub fn parse_u32_s(s: &str) -> Option<u32> {
 // --- Compact shared string/formatting/sorting/I/O helpers ---
 
 #[inline(never)]
-pub fn cat2(a: &str, b: &str) -> String {
-    let mut s = String::with_capacity(a.len() + b.len());
-    s.push_str(a);
-    s.push_str(b);
+pub fn next_csv<'a>(csv: &mut &'a str) -> &'a str {
+    match csv.split_once(',') {
+        Some((k, rest)) => {
+            *csv = rest;
+            k
+        }
+        None => {
+            let k = *csv;
+            *csv = "";
+            k
+        }
+    }
+}
+
+#[inline(never)]
+pub fn csv_idx(mut csv: &str, needle: &str, ci: bool) -> Option<usize> {
+    let mut i = 0;
+    while !csv.is_empty() {
+        let item = next_csv(&mut csv);
+        if if ci {
+            item.eq_ignore_ascii_case(needle)
+        } else {
+            item == needle
+        } {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+pub fn csv_has(csv: &str, needle: &str) -> bool {
+    csv_idx(csv, needle, false).is_some()
+}
+
+pub fn csv_nth(mut csv: &str, idx: usize) -> &str {
+    for _ in 0..idx {
+        let _ = next_csv(&mut csv);
+    }
+    next_csv(&mut csv)
+}
+
+#[inline(never)]
+pub fn lossy(raw: &[u8]) -> String {
+    String::from_utf8_lossy(raw).into_owned()
+}
+
+#[inline(never)]
+pub fn path_lossy(p: &Path) -> String {
+    p.to_string_lossy().into_owned()
+}
+
+#[inline(never)]
+pub fn own(s: &str) -> String {
+    String::from(s)
+}
+
+#[inline(never)]
+pub fn assign_str(dst: &mut String, s: &str) {
+    dst.clear();
+    dst.push_str(s);
+}
+
+#[inline(never)]
+pub fn concat(parts: &[&str]) -> String {
+    let mut len = 0;
+    for &p in parts {
+        len += p.len();
+    }
+    let mut s = String::with_capacity(len);
+    for &p in parts {
+        s.push_str(p);
+    }
     s
 }
 
 #[inline(never)]
-pub fn cat3(a: &str, b: &str, c: &str) -> String {
-    let mut s = String::with_capacity(a.len() + b.len() + c.len());
-    s.push_str(a);
-    s.push_str(b);
-    s.push_str(c);
-    s
+pub fn cat2(a: &str, b: &str) -> String {
+    concat(&[a, b])
 }
 
+#[inline(never)]
+pub fn cat3(a: &str, b: &str, c: &str) -> String {
+    concat(&[a, b, c])
+}
+
+#[inline(never)]
 pub fn cat4(a: &str, b: &str, c: &str, d: &str) -> String {
-    let mut s = String::with_capacity(a.len() + b.len() + c.len() + d.len());
-    s.push_str(a);
-    s.push_str(b);
-    s.push_str(c);
-    s.push_str(d);
-    s
+    concat(&[a, b, c, d])
+}
+
+#[inline(never)]
+pub fn join_strs(items: &[String], sep: &str) -> String {
+    let mut out = String::new();
+    for (i, s) in items.iter().enumerate() {
+        if i > 0 {
+            out.push_str(sep);
+        }
+        out.push_str(s);
+    }
+    out
+}
+
+#[inline(never)]
+pub fn push_unique_str(v: &mut Vec<String>, s: &str) {
+    if !v.iter().any(|x| x == s) {
+        v.push(own(s));
+    }
 }
 
 #[inline(never)]
@@ -283,7 +438,7 @@ pub fn push_u64(out: &mut String, mut n: u64) {
     }
     let mut tmp = [0u8; 20];
     let mut i = 0;
-    while n > 0 {
+    while n > 0 && i < tmp.len() {
         tmp[i] = b'0' + (n % 10) as u8;
         n /= 10;
         i += 1;
@@ -294,6 +449,7 @@ pub fn push_u64(out: &mut String, mut n: u64) {
     }
 }
 
+#[inline(never)]
 pub fn push_i64(out: &mut String, n: i64) {
     if n < 0 {
         out.push('-');
@@ -303,18 +459,21 @@ pub fn push_i64(out: &mut String, n: i64) {
     }
 }
 
+#[inline(never)]
 pub fn u64_str(n: u64) -> String {
-    let mut s = String::with_capacity(20);
+    let mut s = String::new();
     push_u64(&mut s, n);
     s
 }
 
+#[inline(never)]
 pub fn i64_str(n: i64) -> String {
-    let mut s = String::with_capacity(21);
+    let mut s = String::new();
     push_i64(&mut s, n);
     s
 }
 
+#[inline(never)]
 fn push_str_right(out: &mut String, s: &str, width: usize) {
     for _ in s.len()..width {
         out.push(' ');
@@ -330,6 +489,7 @@ pub fn push_i64_right(out: &mut String, n: i64, width: usize) {
     push_str_right(out, &i64_str(n), width);
 }
 
+#[inline(never)]
 pub fn push_str_left(out: &mut String, s: &str, width: usize) {
     out.push_str(s);
     for _ in s.len()..width {
@@ -339,37 +499,37 @@ pub fn push_str_left(out: &mut String, s: &str, width: usize) {
 
 #[inline(never)]
 pub fn err_io(op: &str, path: &Path, e: &std::io::Error) -> String {
-    let mut s = String::with_capacity(op.len() + 48);
-    s.push_str(op);
-    s.push(' ');
-    s.push_str(&path.to_string_lossy());
+    let mut s = cat3(op, " ", &path_lossy(path));
     if let Some(code) = e.raw_os_error() {
         s.push_str(": errno ");
         push_i64(&mut s, code as i64);
-    } else {
-        s.push_str(": io error");
     }
     s
 }
 
 #[inline(never)]
 pub fn read_bytes(path: &Path) -> Result<Vec<u8>, String> {
-    fs::read(path).map_err(|e| err_io("cannot read", path, &e))
+    fs::read(path).map_err(|e| err_io("read", path, &e))
 }
 
 #[inline(never)]
 pub fn read_str(path: &Path) -> Result<String, String> {
-    let raw = read_bytes(path)?;
-    String::from_utf8(raw).map_err(|_| cat2("invalid utf-8 in ", &path.to_string_lossy()))
+    String::from_utf8(read_bytes(path)?).map_err(|_| own("invalid utf-8"))
 }
 
+#[inline(never)]
 pub fn read_str_in(dir: &Path, rel: &str) -> Result<String, String> {
     read_str(&dir.join(rel))
 }
 
 #[inline(never)]
+pub fn read_opt_in(dir: &Path, rel: &str) -> Option<String> {
+    read_str_in(dir, rel).ok()
+}
+
+#[inline(never)]
 pub fn write_file(path: &Path, data: &[u8]) -> Result<(), String> {
-    fs::write(path, data).map_err(|e| err_io("cannot write", path, &e))
+    fs::write(path, data).map_err(|e| err_io("write", path, &e))
 }
 
 pub fn write_in(dir: &Path, rel: &str, data: &[u8]) -> Result<(), String> {
@@ -378,7 +538,7 @@ pub fn write_in(dir: &Path, rel: &str, data: &[u8]) -> Result<(), String> {
 
 #[inline(never)]
 pub fn mkdir_all(path: &Path) -> Result<(), String> {
-    fs::create_dir_all(path).map_err(|e| err_io("cannot create", path, &e))
+    fs::create_dir_all(path).map_err(|e| err_io("mkdir", path, &e))
 }
 
 /// Deferred-error file writer for a directory (eliminates O(N^2) `?` drop glue).
@@ -392,6 +552,7 @@ impl<'a> OutDir<'a> {
         OutDir { dir, err: None }
     }
 
+    #[inline(never)]
     pub fn write(&mut self, rel: &str, data: &[u8]) {
         if self.err.is_none() {
             if let Err(e) = write_in(self.dir, rel, data) {
@@ -400,21 +561,21 @@ impl<'a> OutDir<'a> {
         }
     }
 
+    #[inline(never)]
     pub fn line(&mut self, rel: &str, line: &str) {
-        let mut s = String::with_capacity(line.len() + 1);
-        s.push_str(line);
-        s.push('\n');
-        self.write(rel, s.as_bytes());
+        self.write(rel, cat2(line, "\n").as_bytes());
     }
 
+    #[inline(never)]
     pub fn lines(&mut self, rel: &str, items: &[String]) {
-        let mut s = items.join("\n");
+        let mut s = join_strs(items, "\n");
         if !s.is_empty() {
             s.push('\n');
         }
         self.write(rel, s.as_bytes());
     }
 
+    #[inline(never)]
     pub fn jw(&mut self, rel: &str, w: &mut Jw) {
         w.out.push('\n');
         self.write(rel, w.out.as_bytes());
@@ -433,19 +594,24 @@ pub fn shell_sort_by<T>(v: &mut [T], mut gt: impl FnMut(&T, &T) -> bool) {
     const GAPS: &[usize] = &[701, 301, 132, 57, 23, 10, 4, 1];
     let n = v.len();
     for &gap in GAPS {
-        if gap >= n {
-            continue;
-        }
         for i in gap..n {
             let mut j = i;
-            while j >= gap && gt(&v[j - gap], &v[j]) {
-                v.swap(j - gap, j);
-                j -= gap;
+            while j >= gap {
+                let k = j - gap;
+                let (Some(a), Some(b)) = (v.get(k), v.get(j)) else {
+                    break;
+                };
+                if !gt(a, b) {
+                    break;
+                }
+                v.swap(k, j);
+                j = k;
             }
         }
     }
 }
 
+#[inline(never)]
 pub fn sort_strings(v: &mut [String]) {
     shell_sort_by(v, |a, b| a > b);
 }
@@ -458,11 +624,12 @@ pub fn round6(v: f64) -> f64 {
 }
 
 fn err_missing(key: &str) -> String {
-    cat3("missing required field '", key, "'")
+    cat2("missing ", key)
 }
 
+#[cfg(test)]
 fn err_type(key: &str, expected: &str) -> String {
-    cat4("field '", key, "' must be ", expected)
+    cat3(key, ": expected ", expected)
 }
 
 impl Json {
@@ -498,10 +665,7 @@ impl Json {
         match self {
             Json::Int(n) if *n >= 0 => Some(*n as u64),
             Json::Float(f)
-                if f.is_finite()
-                    && *f >= 0.0
-                    && f.fract() == 0.0
-                    && *f <= 9_007_199_254_740_992.0 =>
+                if *f >= 0.0 && *f <= 9_007_199_254_740_992.0 && (*f as u64) as f64 == *f =>
             {
                 Some(*f as u64)
             }
@@ -524,11 +688,32 @@ impl Json {
         }
     }
 
+    #[inline(never)]
     pub fn get(&self, key: &str) -> Option<&Json> {
         self.as_obj()?
             .iter()
             .find(|(k, _)| k == key)
             .map(|(_, v)| v)
+    }
+
+    pub fn get_str(&self, key: &str) -> Option<&str> {
+        self.get(key)?.as_str()
+    }
+
+    pub fn get_bool(&self, key: &str) -> Option<bool> {
+        self.get(key)?.as_bool()
+    }
+
+    pub fn get_i64(&self, key: &str) -> Option<i64> {
+        self.get(key)?.as_i64()
+    }
+
+    pub fn get_u64(&self, key: &str) -> Option<u64> {
+        self.get(key)?.as_u64()
+    }
+
+    pub fn get_arr(&self, key: &str) -> Option<&[Json]> {
+        self.get(key)?.as_arr()
     }
 
     #[cfg(test)]
@@ -562,9 +747,9 @@ impl Json {
         v.as_bool().ok_or_else(|| err_type(key, "a boolean"))
     }
 
+    #[inline(never)]
     pub fn req_arr(&self, key: &str) -> Result<&[Json], String> {
-        let v = self.get(key).ok_or_else(|| err_missing(key))?;
-        v.as_arr().ok_or_else(|| err_type(key, "an array"))
+        self.get_arr(key).ok_or_else(|| err_missing(key))
     }
 
     #[cfg(test)]
@@ -574,16 +759,15 @@ impl Json {
     }
 
     /// Reject any key not present in comma-separated `allowed_csv`, as well as duplicate keys.
+    #[inline(never)]
     pub fn reject_unknown_keys_csv(&self, allowed_csv: &str, ctx: &str) -> Result<(), String> {
-        let entries = self
-            .as_obj()
-            .ok_or_else(|| cat2(ctx, ": expected JSON object"))?;
+        let entries = self.as_obj().ok_or_else(|| cat2(ctx, ": obj"))?;
         for (i, (k, _)) in entries.iter().enumerate() {
-            if !allowed_csv.split(',').any(|a| a == k.as_str()) {
-                return Err(cat4(ctx, ": unknown field '", k, "'"));
-            }
-            if entries[..i].iter().any(|(prev, _)| prev == k) {
-                return Err(cat4(ctx, ": duplicate field '", k, "'"));
+            let dup = entries
+                .get(..i)
+                .is_some_and(|prev| prev.iter().any(|(p, _)| p == k));
+            if !csv_has(allowed_csv, k) || dup {
+                return Err(cat2("bad field ", k));
             }
         }
         Ok(())
@@ -620,6 +804,7 @@ pub struct JRead<'a> {
 }
 
 impl<'a> JRead<'a> {
+    #[inline(never)]
     pub fn new(v: &'a Json, allowed_csv: &str, ctx: &'a str) -> Result<Self, String> {
         v.reject_unknown_keys_csv(allowed_csv, ctx)?;
         Ok(JRead { v, ctx, err: None })
@@ -654,34 +839,38 @@ impl<'a> JRead<'a> {
         }
     }
 
-    fn req_val(&mut self, k: &str) -> Option<&'a Json> {
+    #[inline(never)]
+    fn get_val(&mut self, k: &str, req: bool) -> Option<&'a Json> {
         match self.v.get(k) {
+            Some(Json::Null) if !req => None,
             Some(v) => Some(v),
             None => {
-                self.fail(k, ": missing");
+                if req {
+                    self.fail(k, ": missing");
+                }
                 None
             }
         }
     }
 
+    #[inline(never)]
     pub fn str_ref(&mut self, k: &str) -> &'a str {
-        let Some(v) = self.req_val(k) else {
+        let Some(v) = self.get_val(k, true) else {
             return "";
         };
         match v.as_str() {
             Some(s) => s,
             None => {
-                self.fail(k, ": expected string");
+                self.fail(k, ": str");
                 ""
             }
         }
     }
 
     pub fn str(&mut self, k: &str) -> String {
-        self.str_ref(k).to_string()
+        own(self.str_ref(k))
     }
 
-    #[inline(never)]
     pub fn fill_str(&mut self, k: &str, dst: &mut String) {
         dst.clear();
         dst.push_str(self.str_ref(k));
@@ -695,142 +884,176 @@ impl<'a> JRead<'a> {
         *dst = self.str_arr(k);
     }
 
+    #[inline(never)]
+    pub fn fill_strs(&mut self, mut csv: &str, dsts: &mut [&mut String]) {
+        for dst in dsts {
+            self.fill_str(next_csv(&mut csv), dst);
+        }
+    }
+
+    #[inline(never)]
+    pub fn fill_opt_strs(&mut self, mut csv: &str, dsts: &mut [&mut Option<String>]) {
+        for dst in dsts {
+            **dst = self.opt_str(next_csv(&mut csv));
+        }
+    }
+
+    #[inline(never)]
+    pub fn fill_str_arrs(&mut self, mut csv: &str, dsts: &mut [&mut Vec<String>]) {
+        for dst in dsts {
+            **dst = self.str_arr(next_csv(&mut csv));
+        }
+    }
+
+    #[inline(never)]
+    pub fn fill_i32s(&mut self, mut csv: &str, dsts: &mut [&mut i32]) {
+        for dst in dsts {
+            **dst = self.i32(next_csv(&mut csv));
+        }
+    }
+
+    #[inline(never)]
+    pub fn fill_u32s(&mut self, mut csv: &str, dsts: &mut [&mut u32]) {
+        for dst in dsts {
+            **dst = self.u32(next_csv(&mut csv));
+        }
+    }
+
+    #[inline(never)]
+    pub fn fill_u64s(&mut self, mut csv: &str, dsts: &mut [&mut u64]) {
+        for dst in dsts {
+            **dst = self.u64(next_csv(&mut csv));
+        }
+    }
+
+    #[inline(never)]
+    pub fn fill_opt_u64s(&mut self, mut csv: &str, dsts: &mut [&mut Option<u64>]) {
+        for dst in dsts {
+            **dst = self.opt_u64(next_csv(&mut csv));
+        }
+    }
+
+    #[inline(never)]
     pub fn opt_str(&mut self, k: &str) -> Option<String> {
-        match self.v.get(k) {
-            None | Some(Json::Null) => None,
-            Some(Json::Str(s)) => Some(s.clone()),
-            Some(_) => {
-                self.fail(k, ": expected string");
+        let v = self.get_val(k, false)?;
+        match v.as_str() {
+            Some(s) => Some(own(s)),
+            None => {
+                self.fail(k, ": str");
+                None
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn read_u64(&mut self, k: &str, req: bool, max: u64) -> Option<u64> {
+        let v = self.get_val(k, req)?;
+        match v.as_u64() {
+            Some(n) if n <= max => Some(n),
+            _ => {
+                self.fail(k, ": int");
                 None
             }
         }
     }
 
     pub fn u64(&mut self, k: &str) -> u64 {
-        let Some(v) = self.req_val(k) else {
-            return 0;
-        };
-        match v.as_u64() {
-            Some(n) => n,
-            None => {
-                self.fail(k, ": expected u64");
-                0
-            }
-        }
+        self.read_u64(k, true, u64::MAX).unwrap_or(0)
     }
 
     pub fn opt_u64(&mut self, k: &str) -> Option<u64> {
-        match self.v.get(k) {
-            None | Some(Json::Null) => None,
-            Some(v) => match v.as_u64() {
-                Some(n) => Some(n),
-                None => {
-                    self.fail(k, ": expected u64");
-                    None
-                }
-            },
-        }
+        self.read_u64(k, false, u64::MAX)
     }
 
     pub fn opt_u32(&mut self, k: &str) -> Option<u32> {
-        let n = self.opt_u64(k)?;
-        match u32::try_from(n) {
-            Ok(v) => Some(v),
-            Err(_) => {
-                self.fail(k, ": out of range");
-                None
-            }
-        }
+        self.read_u64(k, false, u32::MAX as u64).map(|n| n as u32)
     }
 
+    #[inline(never)]
     pub fn i32(&mut self, k: &str) -> i32 {
-        let Some(v) = self.req_val(k) else {
+        let Some(v) = self.get_val(k, true) else {
             return 0;
         };
         match v.as_i64().and_then(|n| i32::try_from(n).ok()) {
             Some(n) => n,
             None => {
-                self.fail(k, ": expected i32");
+                self.fail(k, ": i32");
                 0
             }
         }
     }
 
     pub fn u32(&mut self, k: &str) -> u32 {
-        let n = self.u64(k);
-        match u32::try_from(n) {
-            Ok(v) => v,
-            Err(_) => {
-                self.fail(k, ": expected u32");
-                0
-            }
-        }
+        self.read_u64(k, true, u32::MAX as u64).unwrap_or(0) as u32
     }
 
-    pub fn f64(&mut self, k: &str) -> f64 {
-        let Some(v) = self.req_val(k) else {
-            return 0.0;
-        };
+    #[inline(never)]
+    fn read_f64(&mut self, k: &str, req: bool) -> Option<f64> {
+        let v = self.get_val(k, req)?;
         match v.as_f64() {
-            Some(f) => f,
+            Some(f) => Some(f),
             None => {
-                self.fail(k, ": expected number");
-                0.0
-            }
-        }
-    }
-
-    pub fn opt_f64(&mut self, k: &str) -> Option<f64> {
-        match self.v.get(k) {
-            None | Some(Json::Null) => None,
-            Some(v) => match v.as_f64() {
-                Some(f) => Some(f),
-                None => {
-                    self.fail(k, ": expected number");
-                    None
-                }
-            },
-        }
-    }
-
-    pub fn bool(&mut self, k: &str) -> bool {
-        let Some(v) = self.req_val(k) else {
-            return false;
-        };
-        match v.as_bool() {
-            Some(b) => b,
-            None => {
-                self.fail(k, ": expected bool");
-                false
-            }
-        }
-    }
-
-    pub fn opt_bool(&mut self, k: &str) -> Option<bool> {
-        match self.v.get(k) {
-            None | Some(Json::Null) => None,
-            Some(Json::Bool(b)) => Some(*b),
-            Some(_) => {
-                self.fail(k, ": expected bool");
+                self.fail(k, ": num");
                 None
             }
         }
     }
 
-    pub fn str_arr(&mut self, k: &str) -> Vec<String> {
-        let Some(v) = self.req_val(k) else {
-            return Vec::new();
+    pub fn f64(&mut self, k: &str) -> f64 {
+        self.read_f64(k, true).unwrap_or(0.0)
+    }
+
+    pub fn opt_f64(&mut self, k: &str) -> Option<f64> {
+        self.read_f64(k, false)
+    }
+
+    #[inline(never)]
+    fn read_bool(&mut self, k: &str, req: bool) -> Option<bool> {
+        let v = self.get_val(k, req)?;
+        match v.as_bool() {
+            Some(b) => Some(b),
+            None => {
+                self.fail(k, ": bool");
+                None
+            }
+        }
+    }
+
+    pub fn bool(&mut self, k: &str) -> bool {
+        self.read_bool(k, true).unwrap_or(false)
+    }
+
+    pub fn opt_bool(&mut self, k: &str) -> Option<bool> {
+        self.read_bool(k, false)
+    }
+
+    #[inline(never)]
+    fn arr_slice(&mut self, k: &str, optional: bool) -> Option<&'a [Json]> {
+        let v = if optional {
+            self.v.get(k)?
+        } else {
+            self.get_val(k, true)?
         };
-        let Some(arr) = v.as_arr() else {
-            self.fail(k, ": expected array");
+        match v.as_arr() {
+            Some(arr) => Some(arr),
+            None => {
+                self.fail(k, ": arr");
+                None
+            }
+        }
+    }
+
+    #[inline(never)]
+    pub fn str_arr(&mut self, k: &str) -> Vec<String> {
+        let Some(arr) = self.arr_slice(k, false) else {
             return Vec::new();
         };
         let mut out = Vec::with_capacity(arr.len());
         for item in arr {
             match item.as_str() {
-                Some(s) => out.push(s.to_string()),
+                Some(s) => out.push(own(s)),
                 None => {
-                    self.fail(k, ": expected string array");
+                    self.fail(k, ": str[]");
                     return Vec::new();
                 }
             }
@@ -838,29 +1061,43 @@ impl<'a> JRead<'a> {
         out
     }
 
-    pub fn i32_arr(&mut self, k: &str, optional: bool) -> Vec<i32> {
-        let Some(v) = (if optional {
-            self.v.get(k)
-        } else {
-            self.req_val(k)
-        }) else {
-            return Vec::new();
-        };
-        let Some(arr) = v.as_arr() else {
-            self.fail(k, ": expected array");
+    #[inline(never)]
+    fn int_arr_bits(&mut self, k: &str, optional: bool, signed: bool) -> Vec<u32> {
+        let Some(arr) = self.arr_slice(k, optional) else {
             return Vec::new();
         };
         let mut out = Vec::with_capacity(arr.len());
         for item in arr {
-            match item.as_i64().and_then(|n| i32::try_from(n).ok()) {
+            let parsed = if signed {
+                item.as_i64()
+                    .and_then(|n| i32::try_from(n).ok())
+                    .map(|n| n as u32)
+            } else {
+                item.as_u64().and_then(|n| u32::try_from(n).ok())
+            };
+            match parsed {
                 Some(n) => out.push(n),
                 None => {
-                    self.fail(k, ": expected i32 array");
+                    self.fail(k, ": int[]");
                     return Vec::new();
                 }
             }
         }
         out
+    }
+
+    #[inline(never)]
+    pub fn i32_arr(&mut self, k: &str, optional: bool) -> Vec<i32> {
+        let raw = self.int_arr_bits(k, optional, true);
+        let mut out = Vec::with_capacity(raw.len());
+        for n in raw {
+            out.push(n as i32);
+        }
+        out
+    }
+
+    pub fn u32_arr(&mut self, k: &str, optional: bool) -> Vec<u32> {
+        self.int_arr_bits(k, optional, false)
     }
 
     pub fn check(self) -> Result<(), String> {
@@ -878,153 +1115,91 @@ impl fmt::Display for Json {
     }
 }
 
-fn err_off(msg: &str, off: usize) -> String {
-    let mut s = String::with_capacity(msg.len() + 24);
-    s.push_str(msg);
-    s.push_str(" at offset ");
-    push_u64(&mut s, off as u64);
-    s
+#[inline(never)]
+fn err_off(off: usize) -> String {
+    cat2("invalid json at ", &u64_str(off as u64))
 }
 
 /// Parse an RFC 8259 JSON document.
+#[inline(never)]
 pub fn parse(input: &str) -> Result<Json, String> {
     let mut p = Parser {
         src: input.as_bytes(),
         pos: 0,
     };
-    p.skip_ws();
-    let val = p.parse_value(0)?;
+    let val = p.parse_value(0).ok_or_else(|| err_off(p.pos))?;
     p.skip_ws();
     if p.pos != p.src.len() {
-        return Err(err_off("unexpected trailing byte", p.pos));
+        return Err(err_off(p.pos));
     }
     Ok(val)
 }
 
 /// Hand-rolled decimal `f64` parser to avoid linking `core::num::dec2flt`.
 fn parse_f64_decimal(bytes: &[u8]) -> Option<f64> {
-    if bytes.is_empty() {
-        return None;
-    }
-    let mut i = 0;
-    let neg = if bytes[i] == b'-' {
-        i += 1;
-        true
-    } else {
-        false
+    let (neg, rest) = match bytes.strip_prefix(b"-") {
+        Some(r) => (true, r),
+        None => (false, bytes),
     };
-
-    let mut mant: u64 = 0;
+    let mut mant = 0u64;
     let mut digits = 0u32;
-    let mut exp10: i32 = 0;
-
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        let d = (bytes[i] - b'0') as u64;
-        if mant == 0 && d == 0 {
-            // leading zero
-        } else if digits < 19 {
-            mant = mant * 10 + d;
-            digits += 1;
-        } else {
-            exp10 = exp10.saturating_add(1);
-        }
-        i += 1;
-    }
-
-    if i < bytes.len() && bytes[i] == b'.' {
-        i += 1;
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
-            let d = (bytes[i] - b'0') as u64;
+    let mut exp10 = 0i32;
+    let mut e_val = 0i32;
+    let mut in_frac = false;
+    let mut in_exp = false;
+    let mut exp_neg = false;
+    for &b in rest {
+        if in_exp {
+            if b == b'-' {
+                exp_neg = true;
+            } else if b.is_ascii_digit() && e_val < 10_000 {
+                e_val = e_val * 10 + (b - b'0') as i32;
+            }
+        } else if b.is_ascii_digit() {
+            let d = (b - b'0') as u64;
             if mant == 0 && d == 0 {
-                exp10 = exp10.saturating_sub(1);
+                if in_frac {
+                    exp10 -= 1;
+                }
             } else if digits < 19 {
                 mant = mant * 10 + d;
                 digits += 1;
-                exp10 = exp10.saturating_sub(1);
+                if in_frac {
+                    exp10 -= 1;
+                }
+            } else if !in_frac {
+                exp10 += 1;
             }
-            i += 1;
+        } else if b == b'.' {
+            in_frac = true;
+        } else if matches!(b, b'e' | b'E') {
+            in_exp = true;
         }
     }
-
-    if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
-        i += 1;
-        let exp_neg = if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
-            let is_neg = bytes[i] == b'-';
-            i += 1;
-            is_neg
-        } else {
-            false
-        };
-        let mut e_val: i32 = 0;
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
-            if e_val < 10_000 {
-                e_val = e_val * 10 + (bytes[i] - b'0') as i32;
-            }
-            i += 1;
-        }
-        if exp_neg {
-            exp10 = exp10.saturating_sub(e_val);
-        } else {
-            exp10 = exp10.saturating_add(e_val);
-        }
-    }
-
-    if i != bytes.len() {
-        return None;
-    }
+    exp10 = if exp_neg {
+        exp10.saturating_sub(e_val)
+    } else {
+        exp10.saturating_add(e_val)
+    };
     if mant == 0 {
         return Some(0.0);
     }
-
-    let val = apply_pow10(mant as f64, exp10);
-    if !val.is_finite() {
+    if exp10 > 309 {
         return None;
     }
-    Some(if neg { -val } else { val })
-}
-
-fn pow10_pos(mut exp: u32) -> f64 {
-    const POWS: [f64; 9] = [1e1, 1e2, 1e4, 1e8, 1e16, 1e32, 1e64, 1e128, 1e256];
-    let mut acc = 1.0f64;
-    let mut idx = 0;
-    while exp > 0 && idx < POWS.len() {
-        if (exp & 1) != 0 {
-            acc *= POWS[idx];
-        }
-        exp >>= 1;
-        idx += 1;
+    if exp10 < -340 {
+        return Some(0.0);
     }
-    acc
-}
-
-fn apply_pow10(mut v: f64, exp10: i32) -> f64 {
-    if exp10 == 0 {
-        return v;
+    let mut v = mant as f64;
+    while exp10 > 0 {
+        v *= 10.0;
+        exp10 -= 1;
     }
-    if exp10 > 0 {
-        if exp10 > 309 {
-            return f64::INFINITY;
-        }
-        if exp10 > 300 {
-            v *= pow10_pos(300);
-            v *= pow10_pos((exp10 - 300) as u32);
-        } else {
-            v *= pow10_pos(exp10 as u32);
-        }
-        v
-    } else {
-        let neg_e = -exp10;
-        if neg_e > 340 {
-            return 0.0;
-        }
-        if neg_e > 300 {
-            v /= pow10_pos(300);
-            v /= pow10_pos((neg_e - 300) as u32);
-        } else {
-            v /= pow10_pos(neg_e as u32);
-        }
-        v
+    while exp10 < 0 {
+        v /= 10.0;
+        exp10 += 1;
     }
+    v.is_finite().then_some(if neg { -v } else { v })
 }
 
 struct Parser<'a> {
@@ -1044,268 +1219,204 @@ impl<'a> Parser<'a> {
     }
 
     fn skip_ws(&mut self) {
-        while let Some(b) = self.peek() {
-            if matches!(b, b' ' | b'\t' | b'\r' | b'\n') {
-                self.pos += 1;
-            } else {
-                break;
-            }
+        while matches!(self.peek(), Some(b' ' | b'\t' | b'\r' | b'\n')) {
+            self.pos += 1;
         }
     }
 
-    fn parse_value(&mut self, depth: usize) -> Result<Json, String> {
-        if depth > MAX_DEPTH {
-            return Err("JSON nesting depth exceeds limit".to_string());
+    fn eat_digits(&mut self) -> usize {
+        let start = self.pos;
+        while matches!(self.peek(), Some(b'0'..=b'9')) {
+            self.pos += 1;
         }
+        self.pos - start
+    }
+
+    #[inline(never)]
+    fn parse_value(&mut self, depth: usize) -> Option<Json> {
         self.skip_ws();
-        let b = self
-            .peek()
-            .ok_or_else(|| err_off("unexpected end of input", self.pos))?;
-        match b {
+        match self.peek()? {
             b'n' => self.parse_literal(b"null", Json::Null),
             b't' => self.parse_literal(b"true", Json::Bool(true)),
             b'f' => self.parse_literal(b"false", Json::Bool(false)),
             b'"' => self.parse_string().map(Json::Str),
-            b'[' => self.parse_array(depth + 1),
-            b'{' => self.parse_object(depth + 1),
+            b'[' if depth < MAX_DEPTH => {
+                self.pos += 1;
+                self.skip_ws();
+                let mut items = Vec::new();
+                if self.peek() == Some(b']') {
+                    self.pos += 1;
+                    return Some(Json::Arr(items));
+                }
+                loop {
+                    items.push(self.parse_value(depth + 1)?);
+                    self.skip_ws();
+                    match self.bump()? {
+                        b',' => {}
+                        b']' => return Some(Json::Arr(items)),
+                        _ => return None,
+                    }
+                }
+            }
+            b'{' if depth < MAX_DEPTH => {
+                self.pos += 1;
+                self.skip_ws();
+                let mut entries = Vec::new();
+                if self.peek() == Some(b'}') {
+                    self.pos += 1;
+                    return Some(Json::Obj(entries));
+                }
+                loop {
+                    self.skip_ws();
+                    if self.peek() != Some(b'"') {
+                        return None;
+                    }
+                    let key = self.parse_string()?;
+                    self.skip_ws();
+                    if self.bump() != Some(b':') {
+                        return None;
+                    }
+                    let val = self.parse_value(depth + 1)?;
+                    entries.push((key, val));
+                    self.skip_ws();
+                    match self.bump()? {
+                        b',' => {}
+                        b'}' => return Some(Json::Obj(entries)),
+                        _ => return None,
+                    }
+                }
+            }
             b'-' | b'0'..=b'9' => self.parse_number(),
-            _ => Err(err_off("unexpected character", self.pos)),
+            _ => None,
         }
     }
 
-    fn parse_literal(&mut self, lit: &[u8], val: Json) -> Result<Json, String> {
-        let start = self.pos;
-        if self.src.len().saturating_sub(self.pos) >= lit.len()
-            && &self.src[self.pos..self.pos + lit.len()] == lit
-        {
+    fn parse_literal(&mut self, lit: &[u8], val: Json) -> Option<Json> {
+        if self.src.get(self.pos..self.pos + lit.len()) == Some(lit) {
             self.pos += lit.len();
-            Ok(val)
+            Some(val)
         } else {
-            Err(err_off("invalid literal", start))
+            None
         }
     }
 
-    fn parse_array(&mut self, depth: usize) -> Result<Json, String> {
-        if depth > MAX_DEPTH {
-            return Err("JSON nesting depth exceeds limit".to_string());
-        }
-        self.pos += 1; // '['
-        self.skip_ws();
-        let mut items = Vec::new();
-        if self.peek() == Some(b']') {
-            self.pos += 1;
-            return Ok(Json::Arr(items));
-        }
-        loop {
-            let v = self.parse_value(depth)?;
-            items.push(v);
-            self.skip_ws();
-            match self.peek() {
-                Some(b',') => {
-                    self.pos += 1;
-                }
-                Some(b']') => {
-                    self.pos += 1;
-                    return Ok(Json::Arr(items));
-                }
-                _ => {
-                    return Err(err_off("expected ',' or ']' in array", self.pos));
-                }
-            }
-        }
-    }
-
-    fn parse_object(&mut self, depth: usize) -> Result<Json, String> {
-        if depth > MAX_DEPTH {
-            return Err("JSON nesting depth exceeds limit".to_string());
-        }
-        self.pos += 1; // '{'
-        self.skip_ws();
-        let mut entries = Vec::new();
-        if self.peek() == Some(b'}') {
-            self.pos += 1;
-            return Ok(Json::Obj(entries));
-        }
-        loop {
-            self.skip_ws();
-            if self.peek() != Some(b'"') {
-                return Err(err_off("expected object key string", self.pos));
-            }
-            let key = self.parse_string()?;
-            self.skip_ws();
-            if self.bump() != Some(b':') {
-                return Err(err_off("expected ':' after object key", self.pos));
-            }
-            let val = self.parse_value(depth)?;
-            entries.push((key, val));
-            self.skip_ws();
-            match self.peek() {
-                Some(b',') => {
-                    self.pos += 1;
-                }
-                Some(b'}') => {
-                    self.pos += 1;
-                    return Ok(Json::Obj(entries));
-                }
-                _ => {
-                    return Err(err_off("expected ',' or '}' in object", self.pos));
-                }
-            }
-        }
-    }
-
-    fn parse_string(&mut self) -> Result<String, String> {
-        let start = self.pos;
-        self.pos += 1; // '"'
+    #[inline(never)]
+    fn parse_string(&mut self) -> Option<String> {
+        self.pos += 1;
         let mut out = String::new();
         let mut chunk_start = self.pos;
         while let Some(b) = self.peek() {
-            if b == b'"' {
-                if self.pos > chunk_start {
-                    let s = std::str::from_utf8(&self.src[chunk_start..self.pos])
-                        .map_err(|_| err_off("invalid UTF-8 in string", start))?;
-                    out.push_str(s);
-                }
-                self.pos += 1;
-                return Ok(out);
-            }
             if b < 0x20 {
-                return Err(err_off("unescaped control character in string", self.pos));
+                return None;
             }
-            if b == b'\\' {
-                if self.pos > chunk_start {
-                    let s = std::str::from_utf8(&self.src[chunk_start..self.pos])
-                        .map_err(|_| err_off("invalid UTF-8 in string", start))?;
-                    out.push_str(s);
-                }
+            if b != b'"' && b != b'\\' {
                 self.pos += 1;
-                let esc = self
-                    .bump()
-                    .ok_or_else(|| err_off("unterminated escape", self.pos))?;
-                match esc {
-                    b'"' => out.push('"'),
-                    b'\\' => out.push('\\'),
-                    b'/' => out.push('/'),
-                    b'b' => out.push('\u{0008}'),
-                    b'f' => out.push('\u{000C}'),
-                    b'n' => out.push('\n'),
-                    b'r' => out.push('\r'),
-                    b't' => out.push('\t'),
-                    b'u' => {
-                        let code = self.parse_hex4()?;
-                        if (0xD800..=0xDBFF).contains(&code) {
-                            if self.src.len().saturating_sub(self.pos) < 2
-                                || self.src[self.pos] != b'\\'
-                                || self.src[self.pos + 1] != b'u'
-                            {
-                                return Err(err_off("unpaired high surrogate", self.pos));
-                            }
-                            self.pos += 2;
-                            let low = self.parse_hex4()?;
-                            if !(0xDC00..=0xDFFF).contains(&low) {
-                                return Err(err_off("invalid low surrogate", self.pos));
-                            }
-                            let cp =
-                                0x10000 + (((code as u32 - 0xD800) << 10) | (low as u32 - 0xDC00));
-                            let ch = char::from_u32(cp)
-                                .ok_or_else(|| err_off("invalid Unicode scalar", self.pos))?;
-                            out.push(ch);
-                        } else if (0xDC00..=0xDFFF).contains(&code) {
-                            return Err(err_off("unpaired low surrogate", self.pos));
-                        } else {
-                            let ch = char::from_u32(code as u32)
-                                .ok_or_else(|| err_off("invalid Unicode scalar", self.pos))?;
-                            out.push(ch);
+                continue;
+            }
+            if let Some(chunk) = self.src.get(chunk_start..self.pos) {
+                if !chunk.is_empty() {
+                    out.push_str(std::str::from_utf8(chunk).ok()?);
+                }
+            }
+            self.pos += 1;
+            if b == b'"' {
+                return Some(out);
+            }
+            let ch = match self.bump()? {
+                b'"' => '"',
+                b'\\' => '\\',
+                b'/' => '/',
+                b'b' => '\x08',
+                b'f' => '\x0c',
+                b'n' => '\n',
+                b'r' => '\r',
+                b't' => '\t',
+                b'u' => {
+                    let code = self.parse_hex4()?;
+                    let cp = if (0xD800..=0xDBFF).contains(&code) {
+                        if self.src.get(self.pos..self.pos + 2) != Some(b"\\u") {
+                            return None;
                         }
-                    }
-                    _ => {
-                        return Err(err_off("invalid escape sequence", self.pos - 1));
-                    }
+                        self.pos += 2;
+                        let low = self.parse_hex4()?;
+                        if !(0xDC00..=0xDFFF).contains(&low) {
+                            return None;
+                        }
+                        0x10000 + (((code as u32 - 0xD800) << 10) | (low as u32 - 0xDC00))
+                    } else if (0xDC00..=0xDFFF).contains(&code) {
+                        return None;
+                    } else {
+                        code as u32
+                    };
+                    char::from_u32(cp)?
                 }
-                chunk_start = self.pos;
-            } else {
-                self.pos += 1;
-            }
+                _ => return None,
+            };
+            out.push(ch);
+            chunk_start = self.pos;
         }
-        Err(err_off("unterminated string", start))
+        None
     }
 
-    fn parse_hex4(&mut self) -> Result<u16, String> {
-        if self.src.len().saturating_sub(self.pos) < 4 {
-            return Err(err_off("truncated \\uXXXX escape", self.pos));
-        }
+    fn parse_hex4(&mut self) -> Option<u16> {
+        let slice = self.src.get(self.pos..self.pos + 4)?;
         let mut val = 0u16;
-        for _ in 0..4 {
-            let b = self.src[self.pos];
-            let d = match b {
-                b'0'..=b'9' => (b - b'0') as u16,
-                b'a'..=b'f' => (b - b'a' + 10) as u16,
-                b'A'..=b'F' => (b - b'A' + 10) as u16,
-                _ => {
-                    return Err(err_off("invalid hex digit in \\uXXXX", self.pos));
-                }
+        for &b in slice {
+            let d = if b.is_ascii_digit() {
+                b - b'0'
+            } else if (b | 32).wrapping_sub(b'a') < 6 {
+                (b | 32) - b'a' + 10
+            } else {
+                return None;
             };
-            val = (val << 4) | d;
+            val = (val << 4) | d as u16;
             self.pos += 1;
         }
-        Ok(val)
+        Some(val)
     }
 
-    fn parse_number(&mut self) -> Result<Json, String> {
+    fn parse_number(&mut self) -> Option<Json> {
         let start = self.pos;
         if self.peek() == Some(b'-') {
             self.pos += 1;
         }
-        match self.peek() {
-            Some(b'0') => {
+        match self.peek()? {
+            b'0' => {
                 self.pos += 1;
                 if matches!(self.peek(), Some(b'0'..=b'9')) {
-                    return Err(err_off("leading zero in number", start));
+                    return None;
                 }
             }
-            Some(b'1'..=b'9') => {
-                self.pos += 1;
-                while matches!(self.peek(), Some(b'0'..=b'9')) {
-                    self.pos += 1;
-                }
+            b'1'..=b'9' => {
+                self.eat_digits();
             }
-            _ => return Err(err_off("invalid number", start)),
+            _ => return None,
         }
-
         let mut is_float = false;
         if self.peek() == Some(b'.') {
             is_float = true;
             self.pos += 1;
-            if !matches!(self.peek(), Some(b'0'..=b'9')) {
-                return Err(err_off("expected digit after decimal point", self.pos));
-            }
-            while matches!(self.peek(), Some(b'0'..=b'9')) {
-                self.pos += 1;
+            if self.eat_digits() == 0 {
+                return None;
             }
         }
-
         if matches!(self.peek(), Some(b'e' | b'E')) {
             is_float = true;
             self.pos += 1;
             if matches!(self.peek(), Some(b'+' | b'-')) {
                 self.pos += 1;
             }
-            if !matches!(self.peek(), Some(b'0'..=b'9')) {
-                return Err(err_off("expected digit in exponent", self.pos));
-            }
-            while matches!(self.peek(), Some(b'0'..=b'9')) {
-                self.pos += 1;
+            if self.eat_digits() == 0 {
+                return None;
             }
         }
-
-        let bytes = &self.src[start..self.pos];
+        let bytes = self.src.get(start..self.pos)?;
         if !is_float {
             if let Some(i) = crate::str::parse_i64(bytes) {
-                return Ok(Json::Int(i));
+                return Some(Json::Int(i));
             }
         }
-        let f = parse_f64_decimal(bytes).ok_or_else(|| err_off("invalid float", start))?;
-        Ok(Json::Float(f))
+        parse_f64_decimal(bytes).map(Json::Float)
     }
 }
 
@@ -1322,11 +1433,11 @@ pub fn push_escaped_str(s: &str, out: &mut String) {
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
             c if (c as u32) < 0x20 => {
-                let code = c as u32;
-                const HEX: &[u8; 16] = b"0123456789abcdef";
+                let code = c as u8;
+                let hex = |n: u8| if n < 10 { b'0' + n } else { b'a' + n - 10 } as char;
                 out.push_str("\\u00");
-                out.push(HEX[((code >> 4) & 0xf) as usize] as char);
-                out.push(HEX[(code & 0xf) as usize] as char);
+                out.push(hex(code >> 4));
+                out.push(hex(code & 0xf));
             }
             c => out.push(c),
         }
@@ -1335,27 +1446,17 @@ pub fn push_escaped_str(s: &str, out: &mut String) {
 }
 
 fn push_fixed9(scaled: u64, out: &mut String) {
-    const SCALE: u64 = 1_000_000_000;
-    let whole = scaled / SCALE;
-    let frac = scaled % SCALE;
-    push_u64(out, whole);
+    push_u64(out, scaled / 1_000_000_000);
     out.push('.');
-    if frac == 0 {
-        out.push('0');
-        return;
-    }
-    let mut digits = [b'0'; 9];
-    let mut rem = frac;
-    for i in (0..9).rev() {
-        digits[i] = b'0' + (rem % 10) as u8;
-        rem /= 10;
-    }
-    let mut end = 9;
-    while end > 1 && digits[end - 1] == b'0' {
-        end -= 1;
-    }
-    for &b in &digits[..end] {
-        out.push(b as char);
+    let mut rem = scaled % 1_000_000_000;
+    let mut div = 100_000_000u64;
+    loop {
+        out.push((b'0' + (rem / div) as u8) as char);
+        rem %= div;
+        div /= 10;
+        if rem == 0 || div == 0 {
+            break;
+        }
     }
 }
 
@@ -1370,35 +1471,26 @@ fn push_float(f: f64, out: &mut String) {
         out.push_str("0.0");
         return;
     }
-    let v = if f < 0.0 {
+    let mut v = if f < 0.0 {
         out.push('-');
         -f
     } else {
         f
     };
-
-    if v < 9_007_199_254_740_992.0 && v.fract() == 0.0 {
-        push_u64(out, v as u64);
-        out.push_str(".0");
-        return;
-    }
     if (1e-4..1e9).contains(&v) {
-        let scaled = (v * 1_000_000_000.0).round() as u64;
-        push_fixed9(scaled, out);
+        push_fixed9((v * 1_000_000_000.0 + 0.5) as u64, out);
         return;
     }
-
-    let mut m = v;
-    let mut exp: i32 = 0;
-    while m >= 10.0 {
-        m /= 10.0;
+    let mut exp = 0i32;
+    while v >= 10.0 {
+        v /= 10.0;
         exp += 1;
     }
-    while m < 1.0 {
-        m *= 10.0;
+    while v < 1.0 {
+        v *= 10.0;
         exp -= 1;
     }
-    let mut scaled = (m * 1_000_000_000.0).round() as u64;
+    let mut scaled = (v * 1_000_000_000.0 + 0.5) as u64;
     if scaled >= 10_000_000_000 {
         scaled /= 10;
         exp += 1;
@@ -1599,5 +1691,18 @@ mod tests {
         let pretty = orig.to_pretty();
         assert!(pretty.contains("\n  \"ctrl\": "));
         assert_eq!(parse(&pretty).unwrap(), orig);
+    }
+
+    #[test]
+    fn u32_arr_write_and_read() {
+        let mut w = Jw::new(false);
+        w.obj_open();
+        w.k_u32_arr("groups", &[0, 4, 2000, 65534]);
+        w.obj_close();
+        let doc = parse(&w.finish()).unwrap();
+        let mut r = JRead::new(&doc, "groups", "root").unwrap();
+        let groups = r.u32_arr("groups", false);
+        r.check().unwrap();
+        assert_eq!(groups, vec![0, 4, 2000, 65534]);
     }
 }

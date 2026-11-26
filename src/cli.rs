@@ -26,8 +26,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::vec::Vec;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Default, PartialEq)]
 pub enum Sub {
+    #[default]
     List,
     Table,
     Inject,
@@ -96,7 +97,7 @@ const ANY: u32 = ALL_SUBS;
 /// cannot be accepted and silently ignored, and the two unit tests below fail
 /// when the table and the help text disagree: adding a documented option
 /// without deciding its subcommands is a test failure, not a silent no-op.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum OptId {
     Help,
     Version,
@@ -159,14 +160,20 @@ enum OptId {
     Validate,
     Out,
     Tree,
+    NoAncestors,
     Label,
     Masker,
     ProfileName,
     RedactToken,
+    RedactTokenFile,
     RedactEnv,
     FromProfile,
     DecoyLevel,
     CleanEnv,
+    NoCleanEnv,
+    SameSession,
+    LabelDecoys,
+    InterleaveCmd,
     ExeMemfd,
     DecoyToken,
     Dumpable,
@@ -231,8 +238,9 @@ const OPT_NAMES: &str = concat!(
     "--create-users|--busy|--cpu|--dry-run|--plan|--json|--table|--verify|--wait|--elevate|",
     "--quiet,-q|--binaries|--require-binaries|--host-mem|--host-pid-max|--host-uptime|",
     "--live|--repeat-max|--cpu-util|--mem-util|--disk-util|--force|--module,-m|--lines|",
-    "--delay|--speed|--log-fmt|--pid|--validate|--out|--tree|--label|--masker|--profile-name|",
-    "--redact-token|--redact-env|--from-profile|--decoy-level|--clean-env|--exe-memfd|",
+    "--delay|--speed|--log-fmt|--pid|--validate|--out|--tree|--no-ancestors|--label|--masker|--profile-name|",
+    "--redact-token|--redact-token-file|--redact-env|--from-profile|--decoy-level|--clean-env|--no-clean-env|",
+    "--same-session|--label-decoys|--interleave-cmd|--exe-memfd|",
     "--decoy-token|--dumpable|--seccomp|--wchan|--jitter-ms|--churn|--masker-cmd|--decoys|",
     "--mode|--level|--control|--hard-negatives|--observer-uid|--blind-dir|--run-id|",
     "--target-pid|--target-cmd|--runs|--pick",
@@ -328,18 +336,28 @@ const OPT_META: &[(OptId, bool, u32)] = &[
             | Sub::Selftest.bit(),
     ),
     (OptId::Tree, true, Sub::Profile.bit()),
+    (OptId::NoAncestors, true, Sub::Profile.bit()),
     (OptId::Label, false, Sub::Profile.bit()),
     (OptId::Masker, false, Sub::Profile.bit()),
     (OptId::ProfileName, false, Sub::Profile.bit()),
     (
         OptId::RedactToken,
         false,
-        Sub::Profile.bit() | Sub::Verify.bit(),
+        Sub::Profile.bit() | Sub::Run.bit() | Sub::Verify.bit(),
     ),
-    (OptId::RedactEnv, false, Sub::Profile.bit()),
+    (
+        OptId::RedactTokenFile,
+        false,
+        Sub::Profile.bit() | Sub::Run.bit() | Sub::Verify.bit(),
+    ),
+    (OptId::RedactEnv, false, Sub::Profile.bit() | Sub::Run.bit()),
     (OptId::FromProfile, false, Sub::Inject.bit()),
     (OptId::DecoyLevel, false, Sub::Inject.bit()),
     (OptId::CleanEnv, true, Sub::Inject.bit()),
+    (OptId::NoCleanEnv, true, Sub::Inject.bit()),
+    (OptId::SameSession, true, Sub::Inject.bit()),
+    (OptId::LabelDecoys, false, Sub::Inject.bit()),
+    (OptId::InterleaveCmd, false, Sub::Inject.bit()),
     (OptId::ExeMemfd, true, Sub::Inject.bit()),
     (OptId::DecoyToken, false, Sub::Inject.bit() | Sub::Run.bit()),
     (OptId::Dumpable, false, Sub::Inject.bit()),
@@ -354,7 +372,7 @@ const OPT_META: &[(OptId, bool, u32)] = &[
     (OptId::Control, false, Sub::Run.bit()),
     (OptId::HardNegatives, false, Sub::Run.bit()),
     (OptId::ObserverUid, false, Sub::Run.bit()),
-    (OptId::BlindDir, false, Sub::Run.bit()),
+    (OptId::BlindDir, false, Sub::Run.bit() | Sub::Verify.bit()),
     (OptId::RunId, false, Sub::Run.bit()),
     (OptId::TargetPid, false, Sub::Run.bit()),
     (OptId::TargetCmd, false, Sub::Run.bit()),
@@ -366,6 +384,7 @@ const OPT_META: &[(OptId, bool, u32)] = &[
     ),
 ];
 
+#[derive(Default)]
 pub struct Args {
     pub sub: Sub,
     pub count: usize,
@@ -433,15 +452,21 @@ pub struct Args {
     pub validate_file: Option<Vec<u8>>,
     pub out_path: Option<Vec<u8>>,
     pub tree: bool,
+    pub no_ancestors: bool,
     pub label: Option<String>,
     pub masker: Option<String>,
     pub profile_name: Option<String>,
     pub redact_tokens: Vec<String>,
+    pub redact_token_files: Vec<String>,
     pub redact_envs: Vec<String>,
     /// `inject` decoy options (and shared `run` live options).
     pub from_profile: Option<Vec<u8>>,
     pub decoy_level: Option<u8>,
     pub clean_env: bool,
+    pub no_clean_env: bool,
+    pub same_session: bool,
+    pub label_decoys: usize,
+    pub interleave_cmd: Option<String>,
     pub exe_memfd: bool,
     pub decoy_token: Option<String>,
     pub dumpable: Option<u8>,
@@ -471,154 +496,78 @@ pub struct Args {
 impl Args {
     fn new() -> Args {
         Args {
-            sub: Sub::List,
-            count: 0,
-            seed: None,
             profile: b"server".to_vec(),
-            family: None,
             sort: true,
             uniq: true,
-            offset_min: 0,
-            local: false,
-            pidfile: None,
-            duration: 0,
             mem: true,
-            mem_cap_mb: 0,
-            phys_cap: None,
             tty: true,
             threads: true,
             user: true,
-            create_users: false,
-            busy: false,
-            dry_run: false,
-            wait: false,
-            binaries: false,
-            quiet: false,
-            want_help: false,
-            want_version: false,
-            elevate: false,
-            table: false,
-            live: false,
-            force: false,
-            no_exe: false,
-            verify: false,
-            cpu_pct: None,
-            mem_target_kb: None,
-            disk_mb: None,
-            no_root: false,
-            shadow_dir: None,
-            json: false,
             log_module: b"weblog".to_vec(),
             log_lines: 20,
-            log_delay_ms: 0,
-            log_fmt: None,
             speed: 1,
-            load_cpu: None,
-            load_mem: None,
-            load_disk: None,
-            plan: false,
-            require_binaries: false,
-            repeat_max: None,
-            host_mem_mb: None,
-            host_pid_max: None,
-            host_uptime: None,
-            run_dir: None,
-            target_pid: None,
-            validate_file: None,
-            out_path: None,
-            tree: false,
-            label: None,
-            masker: None,
-            profile_name: None,
-            redact_tokens: Vec::new(),
-            redact_envs: Vec::new(),
-            from_profile: None,
-            decoy_level: None,
-            clean_env: false,
-            exe_memfd: false,
-            decoy_token: None,
-            dumpable: None,
-            seccomp: None,
-            wchan: None,
-            jitter_ms: 0,
-            churn: 0,
-            masker_cmd: None,
             decoys: 50,
-            run_mode: harness::Mode::Both,
             run_level: 5,
-            run_control: harness::Control::C06Main,
-            hard_negatives: None,
-            observer_uid: None,
-            blind_dir: None,
-            run_id: None,
-            target_cmd: None,
-            runs: None,
-            pick: None,
-            seen: Vec::new(),
+            ..Args::default()
         }
     }
 
     /// Options that change what `unit` prints, in a stable order. Only the
     /// non-default values are forwarded, so a plain `psgen unit` stays short.
+    #[inline(never)]
     pub fn forwarded(&self) -> Vec<Vec<u8>> {
         let mut out: Vec<Vec<u8>> = Vec::new();
-        let mut push = |name: &str, value: Option<&[u8]>| {
+        fn push(out: &mut Vec<Vec<u8>>, name: &str, value: Option<&[u8]>) {
             out.push(name.as_bytes().to_vec());
             if let Some(v) = value {
                 out.push(v.to_vec());
             }
-        };
+        }
+        fn push_u(out: &mut Vec<Vec<u8>>, name: &str, val: Option<u64>) {
+            if let Some(n) = val {
+                push(out, name, Some(json::u64_str(n).as_bytes()));
+            }
+        }
+        fn push_b(out: &mut Vec<Vec<u8>>, cond: bool, name: &str) {
+            if cond {
+                push(out, name, None);
+            }
+        }
         if self.profile != b"server" {
-            push("-p", Some(&self.profile));
+            push(&mut out, "-p", Some(&self.profile));
         }
         if let Some(f) = self.family {
-            push("-f", Some(crate::corpus::family_name(f).as_bytes()));
+            push(
+                &mut out,
+                "-f",
+                Some(crate::corpus::family_name(f).as_bytes()),
+            );
         }
-        if self.duration > 0 {
-            push("-d", Some(json::u64_str(self.duration as u64).as_bytes()));
-        }
-        if !self.mem {
-            push("--no-mem", None);
-        }
-        if self.mem_cap_mb > 0 {
-            push("--mem-cap", Some(json::u64_str(self.mem_cap_mb).as_bytes()));
-        }
-        if let Some(kb) = self.mem_target_kb {
-            push("--mem-target", Some(json::u64_str(kb as u64).as_bytes()));
-        }
-        if let Some(mb) = self.phys_cap {
-            push("--phys-cap", Some(json::u64_str(mb).as_bytes()));
-        }
-        if let Some(mb) = self.disk_mb {
-            push("--disk", Some(json::u64_str(mb).as_bytes()));
-        }
-        if self.no_exe {
-            push("--no-exe", None);
-        }
+        push_u(
+            &mut out,
+            "-d",
+            (self.duration > 0).then_some(self.duration as u64),
+        );
+        push_b(&mut out, !self.mem, "--no-mem");
+        push_u(
+            &mut out,
+            "--mem-cap",
+            (self.mem_cap_mb > 0).then_some(self.mem_cap_mb),
+        );
+        push_u(&mut out, "--mem-target", self.mem_target_kb.map(u64::from));
+        push_u(&mut out, "--phys-cap", self.phys_cap);
+        push_u(&mut out, "--disk", self.disk_mb);
+        push_b(&mut out, self.no_exe, "--no-exe");
         if let Some(d) = &self.shadow_dir {
-            push("--shadow-dir", Some(d));
+            push(&mut out, "--shadow-dir", Some(d));
         }
-        if self.no_root {
-            push("--no-root", None);
-        }
-        if !self.tty {
-            push("--no-tty", None);
-        }
-        if !self.threads {
-            push("--no-threads", None);
-        }
-        if !self.user {
-            push("--no-user", None);
-        }
-        if self.busy {
-            push("--busy", None);
-        }
-        if let Some(pct) = self.cpu_pct {
-            push("--cpu", Some(json::u64_str(pct as u64).as_bytes()));
-        }
-        if self.verify {
-            push("--verify", None);
-        }
+        push_b(&mut out, self.no_root, "--no-root");
+        push_b(&mut out, !self.tty, "--no-tty");
+        push_b(&mut out, !self.threads, "--no-threads");
+        push_b(&mut out, !self.user, "--no-user");
+        push_b(&mut out, self.busy, "--busy");
+        push_u(&mut out, "--cpu", self.cpu_pct.map(u64::from));
+        push_b(&mut out, self.verify, "--verify");
         out
     }
 }
@@ -647,188 +596,118 @@ USAGE
   psgen selftest [--out DIR]    run planted-defect and discrimination guards
 
 COMMON
-  -n, --count N       rows or commands (list: all templates, table: 30,
-                      table --live: all, inject: 12). A count is met by
-                      repeating rows a real host runs more than once; a
-                      request that cannot be met at all prints a warning.
-  -s, --seed N        fix the selection and jitter; START and TIME still
-                      follow the wall clock
-  -p, --profile NAME  server (default), dev, desktop; weights which templates
-                      `list`, `table` and `inject` draw. `list` sorts its lines
-                      by default and `--no-sort` keeps draw order.
+  -n, --count N       rows/commands (list: all, table: 30, --live: all, inject: 12)
+  -s, --seed N        fix selection and jitter; START/TIME follow wall clock
+  -p, --profile NAME  server (default), dev, desktop; weights templates for
+                      list, table and inject
   -f, --family NAME   sys, web, db, ctr, dev, mon, sto, mail, desk, net
-      --utc-offset M  minutes east of UTC for the START column, -1440..1440
-                      (default 0); synthetic table only
-      --local         use the system timezone for the START column; overrides
-                      --utc-offset; synthetic table only
+      --utc-offset M  minutes east of UTC for START, -1440..1440 (default 0)
+      --local         use system timezone for START (overrides --utc-offset)
       --sort / --no-sort   list only
       --uniq / --no-uniq   list only
   -h, --help
   -V, --version
 
-An option that a subcommand does not use is a usage error (exit 2), not a
-silent no-op. That includes the mode-selected cases: a live table takes no
-clock or generator flags, and an `inject` preview takes no flag that needs a
-fork.
+Unused or mode-incompatible options exit 2.
 
 INJECT
-  -d, --duration S      lifetime in seconds (0 = until stopped; rows marked
-                        short use the 120 s default)
-      --pidfile FILE    write the spawned PIDs here; an existing file must be
-                        empty or a psgen pidfile. A header-only pidfile is
-                        written before the first stub is forked, so a later
-                        failure never leaves stubs with no record.
+  -d, --duration S      lifetime in seconds (0 = until stopped; short rows: 120 s)
+      --pidfile FILE    write spawned PIDs (must be empty or a psgen pidfile)
       --mem / --no-mem  pad VSZ and RSS (default on)
-      --mem-cap MiB     cap the planned RSS sum; each stub keeps a 4 MiB
-                        floor, so a cap at or below 4 MiB per stub is raised
-                        to it and warned about (0 = no cap, default)
-      --mem-target KiB  per-stub RSS target in KiB, clamped to the template's
-                        VSZ minus 4 MiB
-      --phys-cap MiB    physical budget for the arena, page tables and base
-                        RSS (0 = unlimited, omitted = the smaller of a quarter
-                        of RAM and half the cgroup limit)
-      --disk MiB        write this many MiB of temp data per stub
-      --exe / --no-exe  bind the template executable path (default on)
+      --mem-cap MiB     cap planned RSS sum; 4 MiB per-stub floor (0 = no cap)
+      --mem-target KiB  per-stub RSS target in KiB (clamped to VSZ - 4 MiB)
+      --phys-cap MiB    physical memory budget (0 = unlimited)
+      --disk MiB        write MiB of temp data per stub
+      --exe / --no-exe  bind template executable path (default on)
       --allow-proc-exe  alias of --no-exe: exec /proc/self/exe, no spoof
-      --shadow-dir DIR  directory for the shadow copy when the bind is
-                        unavailable or with --no-root; the copy goes in a
-                        per-run subdirectory. With --no-root it forces the
-                        shadow tier; ignored with --no-exe and when the bind
-                        tier is in use
-      --no-root         portable mode: no user switch, no mount namespace,
-                        no bind tier; the stub uses /proc/self/exe or --shadow-dir
-      --tty / --no-tty  give tty processes a real pty (default on);
-                        --no-tty also detaches every row from the caller's
-                        controlling terminal
-      --threads / --no-threads  give threaded processes a second thread (default on)
-      --user / --no-user  switch to the template user when running as root
-      --create-users    create missing template users with useradd; needs root
-                        and is ignored with --no-root or --no-user. With
-                        --dry-run no account is created, but the plan keeps the
-                        template's user name and reports it as one the run
-                        would create; the plan and the JSON mark such a row and
-                        name the accounts, and its uid is null because the
-                        account does not exist yet.
-      --busy            burn CPU for every row whose corpus CPU is non-zero
-      --cpu PCT         target cpu percent for every row; forces the busy path
-                        when non-zero, 0 clears it (0..100)
-      --dry-run         print user and command for what would be spawned; the
-                        exact two-column format is kept for existing callers.
-                        Nothing is spawned, so --table, --verify, --wait,
-                        --elevate and -q are usage errors here.
-      --plan            with --dry-run, print the resolved plan instead: exe
-                        tier, per-row user/VSZ/RSS/CPU/tty/threads/exe, parent
-                        links, the physical cost estimate, and the staging
-                        directory patterns the run would create (`<pid>` and
-                        `<i>` are filled at spawn). It exits non-zero for
-                        every preflight the real run would refuse.
-      --json            with --dry-run, print the plan as one JSON object; an
-                        alternative to --plan, not a companion
-      --table           after spawning, print the real ps aux table for the stubs
-      --verify          compare each stub's real VSZ/RSS with the planned
-                        value within 128 kB; has no effect with --no-mem
-      --wait            block for a non-zero --duration, then stop the stubs
-      --elevate         re-exec through sudo -n when not already root
-  -q, --quiet           suppress the inject summary
+      --shadow-dir DIR  shadow copy root when bind is unavailable or --no-root
+      --no-root         portable mode: no user switch, mount ns, or bind tier
+      --tty / --no-tty  give tty rows a real pty (default on)
+      --threads / --no-threads  give threaded rows a second thread (default on)
+      --user / --no-user  switch to template user when root (default on)
+      --create-users    create missing template users via useradd (needs root)
+      --busy            burn CPU for rows whose corpus CPU is non-zero
+      --cpu PCT         target CPU percent for every row (0..100)
+      --dry-run         print user and command without spawning
+      --plan            with --dry-run, print resolved plan and staging patterns
+      --json            with --dry-run, print plan as JSON (alternative to --plan)
+      --table           after spawning, print real ps aux table for the stubs
+      --verify          compare real VSZ/RSS with plan (has no effect with --no-mem)
+      --wait            block for non-zero --duration, then stop stubs
+      --elevate         re-exec through sudo -n when not root
+  -q, --quiet           suppress inject summary
       --from-profile FILE  spawn matched live decoy trees from profile JSON
       --decoy-level N      decoy fidelity level 1..6 (default 5)
-      --clean-env          memfd-name auth, no PSGEN_NONCE
+      --clean-env          memfd-name auth, no PSGEN_NONCE (default on)
+      --no-clean-env       opt out of clean-env auth under --from-profile
+      --same-session       opt out of per-tree setsid session isolation
+      --label-decoys N     also spawn N clean label-only decoys
+      --interleave-cmd CMD launch CMD interleaved among decoy spawns
       --exe-memfd          re-exec via memfd_create + execveat
       --decoy-token PREFIX decoy token prefix for memory scans
       --dumpable N         PR_SET_DUMPABLE override (0 or 1)
       --seccomp N          install N benign seccomp filters (0..8)
-      --wchan MODE         pause, epoll, poll, nanosleep, futex or read
+      --wchan MODE         pause, epoll, poll, nanosleep, futex, read or wait4
       --jitter-ms MS       startup jitter ceiling in ms
       --churn N            short-lived churn workers
       --masker-cmd CMD     spawn decoys via external masker command
 
 CORPUS AND CHECK
-      --binaries        report which template executables exist on this host
+      --binaries          report which template executables exist on this host
       --require-binaries  like --binaries, but exit 1 when any is missing
-  --host-mem MiB      generate for a host with this much memory instead of this
-                      one (table)
-  --host-pid-max N    generate for a host whose pid_max is N (table); PID 1
-                      is still shown, and the capacity below 3 is zero rows
-                      beside it
-  --host-uptime S     generate as if the host had been up S seconds (table)
-  --repeat-max N      how often one command may be repeated; 0 means no cap,
-                      omitted means the realistic bound. Raising it is what
-                      makes a count the corpus cannot supply reachable.
-  The corpus dump prints the sentinel @self for a template that runs as the
-  invoking user; list, table and inject replace it with the user's name (or
-  the decimal uid when the uid has no passwd entry).
+      --host-mem MiB      generate table for host memory MiB
+      --host-pid-max N    generate table for pid_max N; PID 1 is still shown
+      --host-uptime S     generate table as if host uptime is S seconds
+      --repeat-max N      max repeats per command (0 = no cap)
+  `corpus` prints @self for invoking-user templates; list/table/inject expand it.
 
 UNIT
-  The unit forwards the inject options it was given (-p, -f, -d, --no-mem,
-  --mem-cap, --mem-target, --phys-cap, --disk, --no-root, --no-user,
-  --no-tty, --no-threads, --no-exe, --shadow-dir, --cpu, --busy, --verify,
-  --create-users), caps -n at the inject cap of 500, and keeps its
-  RuntimeDirectory across a stop (RuntimeDirectoryPreserve=yes) so another
-  unit in the same directory is unaffected; the stop command removes this
-  unit's pidfile so the service can start again. --count, --seed and
-  --pidfile select the injected rows and the pidfile path.
+  Forwards inject flags, caps -n at 500, sets RuntimeDirectoryPreserve=yes.
 
 DOCTOR
-      --json            machine readable output; checks are objects with a
-                        name field, and core_ok says whether injection can work
-                        at all (the checks named proc_exe, fork, prctl_name)
-      --pidfile FILE    also report whether this pidfile can be written
+      --json            JSON output with checks[] and core_ok (proc_exe, fork, prctl_name)
+      --pidfile FILE    also check whether FILE can be written
 
 LOG
-  -m, --module NAME   weblog (default), bootlog, cargo, cc, download,
-                      docker_build, docker_rmi, terraform, ansible,
-                      kernel_compile, mkinitcpio, uv, composer, julia, list.
-                      Each module accepts aliases; `-m list` prints them.
-      --lines N       events to write (default 20, must be at least 1, capped
-                      at 200000); a weblog burst can produce multiple rows per
-                      event
+  -m, --module NAME   weblog (default), bootlog, cargo, cc, download, docker_build,
+                      docker_rmi, terraform, ansible, kernel_compile, mkinitcpio,
+                      uv, composer, julia, list (prints aliases)
+      --lines N       events to write (default 20, 1..200000)
       --delay MS      pause between events
-      --speed N       divide the delay by N (default 1, must be at least 1)
-      --log-fmt NAME  apache (weblog family only), json, syslog
+      --speed N       divide delay by N (default 1, >= 1)
+      --log-fmt NAME  apache (weblog only), json, syslog
 
 LOAD
-      --cpu-util PCT  burn this percent of one core
-      --mem-util PCT  touch and hold this percent of MemTotal, or of the cgroup
-                      limit when lower (0..95); refused above MemAvailable
-                      unless --force is given
+      --cpu-util PCT  burn PCT% of one core (0..100)
+      --mem-util PCT  hold PCT% of MemTotal/cgroup (0..95; --force overrides available)
       --disk-util MiB write and hold MiB of temp data
   -d, --duration S    stop after S seconds (0 = until killed)
-      --force         allow --mem-util above what is available
-  -q, --quiet         suppress the load summary
+      --force         allow --mem-util above MemAvailable
+  -q, --quiet         suppress load summary
 
 STOP
-      --force           ignore the boot id; a three-field line still checks
-                        starttime and comm, a two-field line still checks
-                        starttime, and a one-field line still requires the run
-                        nonce recorded in the pidfile header, so a line that
-                        cannot be identified is refused rather than signalled
-      --plan            print what would be signalled and stop nothing; never
-                        elevates, so it reports the caller's own privileges
-      --elevate         re-exec through sudo -n when not already root; a usage
-                        error with --plan
-  -q, --quiet           only print the summary line
-  The pidfile header carries the boot id and the run nonce; a header without a
-  boot id is refused, and a file with no `# psgen` header is refused unless
-  --force is given. A pidfile with CRLF line endings is refused by name, not
-  read as unidentifiable rows.
-  A pidfile from a live run is left in place, so the same path can be used
-  again; stop the run twice and the second call is a no-op. The summary counts
-  processes, not lines, and `skipped` counts lines.
+      --force         ignore boot id / missing '# psgen' header
+      --plan          print what would be signalled without stopping
+      --elevate       re-exec through sudo -n when not root (error with --plan)
+  -q, --quiet         only print the summary line
+  Leaves pidfile in place; rejects CRLF line endings.
 
 PROFILE
-      --pid PID / --validate FILE / --out FILE / --tree
+      --pid PID / --validate FILE / --out FILE / --tree / --no-ancestors
       --label STR / --masker STR / --profile-name STR
-      --redact-token STR / --redact-env VAR
+      --redact-token STR / --redact-token-file FILE / --redact-env VAR
 
 RUN
       --profile FILE / --out DIR / --decoys N / --seed N
       --mode MODE / --level N / --control ID / --hard-negatives SET
       --observer-uid UID / --blind-dir DIR / --run-id STR / --decoy-token PREFIX
+      --redact-token STR / --redact-token-file FILE / --redact-env VAR
       --live / --target-pid PID / --target-cmd CMD / --masker-cmd CMD
       --jitter-ms MS / --churn N
 
 SCORE, REPLAY, VERIFY AND SELFTEST
-      --runs DIRS / --pick FILE / --out FILE / --redact-token STR
+      --runs DIRS / --pick FILE / --out FILE
+      --redact-token STR / --redact-token-file FILE / --blind-dir DIR
 ";
 
 fn usage() -> Vec<u8> {
@@ -839,29 +718,39 @@ fn usage() -> Vec<u8> {
     out.v
 }
 
+const SUB_SPECS: &str = "list,ps|table|inject,spawn|stop,kill|corpus|check|unit|\
+doctor,probe,env|log,activity|load,lookbusy|profile|run|score|replay|verify|\
+selftest|help|version";
+
+const SUB_LIST: &[Sub] = &[
+    Sub::List,
+    Sub::Table,
+    Sub::Inject,
+    Sub::Stop,
+    Sub::Corpus,
+    Sub::Check,
+    Sub::Unit,
+    Sub::Doctor,
+    Sub::Log,
+    Sub::Load,
+    Sub::Profile,
+    Sub::Run,
+    Sub::Score,
+    Sub::Replay,
+    Sub::Verify,
+    Sub::Selftest,
+    Sub::Help,
+    Sub::Version,
+];
+
 fn set_sub(a: &mut Args, name: &[u8]) -> bool {
-    a.sub = match name {
-        b"list" | b"ps" => Sub::List,
-        b"table" => Sub::Table,
-        b"inject" | b"spawn" => Sub::Inject,
-        b"stop" | b"kill" => Sub::Stop,
-        b"corpus" => Sub::Corpus,
-        b"check" => Sub::Check,
-        b"unit" => Sub::Unit,
-        b"doctor" | b"probe" | b"env" => Sub::Doctor,
-        b"log" | b"activity" => Sub::Log,
-        b"load" | b"lookbusy" => Sub::Load,
-        b"profile" => Sub::Profile,
-        b"run" => Sub::Run,
-        b"score" => Sub::Score,
-        b"replay" => Sub::Replay,
-        b"verify" => Sub::Verify,
-        b"selftest" => Sub::Selftest,
-        b"help" => Sub::Help,
-        b"version" => Sub::Version,
-        _ => return false,
-    };
-    true
+    for (spec, &sub) in SUB_SPECS.split('|').zip(SUB_LIST.iter()) {
+        if spec.split(',').any(|k| k.as_bytes() == name) {
+            a.sub = sub;
+            return true;
+        }
+    }
+    false
 }
 
 fn take_value<'a>(
@@ -872,12 +761,13 @@ fn take_value<'a>(
     if let Some(v) = inline {
         return Some(v);
     }
-    if *i + 1 < args.len() && !args[*i + 1].starts_with(b"--") {
-        *i += 1;
-        Some(&args[*i])
-    } else {
-        None
+    if let Some(next) = args.get(*i + 1) {
+        if !next.starts_with(b"--") {
+            *i += 1;
+            return Some(next);
+        }
     }
+    None
 }
 
 #[inline(never)]
@@ -920,12 +810,16 @@ fn all_opts() -> Vec<OptRow> {
 
 #[inline(never)]
 fn abs_path(p: &[u8]) -> Vec<u8> {
-    let path = Path::new(OsStr::from_bytes(p));
-    if path.is_absolute() {
+    if p.first() == Some(&b'/') {
         return p.to_vec();
     }
-    match std::path::absolute(path) {
-        Ok(a) => a.as_os_str().as_bytes().to_vec(),
+    let rel = p.strip_prefix(b"./").unwrap_or(p);
+    match std::env::current_dir() {
+        Ok(d) => d
+            .join(OsStr::from_bytes(rel))
+            .as_os_str()
+            .as_bytes()
+            .to_vec(),
         Err(_) => p.to_vec(),
     }
 }
@@ -967,52 +861,64 @@ impl core::fmt::Display for ParseError {
 }
 
 fn sub_name(sub: Sub) -> &'static str {
-    match sub {
-        Sub::List => "list",
-        Sub::Table => "table",
-        Sub::Inject => "inject",
-        Sub::Stop => "stop",
-        Sub::Corpus => "corpus",
-        Sub::Check => "check",
-        Sub::Unit => "unit",
-        Sub::Doctor => "doctor",
-        Sub::Log => "log",
-        Sub::Load => "load",
-        Sub::Profile => "profile",
-        Sub::Run => "run",
-        Sub::Score => "score",
-        Sub::Replay => "replay",
-        Sub::Verify => "verify",
-        Sub::Selftest => "selftest",
-        Sub::Help => "help",
-        Sub::Version => "version",
-    }
+    SUB_SPECS
+        .split('|')
+        .nth(sub as usize)
+        .and_then(|s| s.split(',').next())
+        .unwrap_or("")
 }
 
+#[inline(never)]
 fn req_utf8(v: &[u8], name: &str) -> Result<String, ParseError> {
     core::str::from_utf8(v)
         .map(String::from)
         .map_err(|_| json::cat2("invalid ", name).into())
 }
 
-fn req_num(
-    v: &[u8],
-    name: &str,
-    lo: u64,
-    hi: u64,
-    range_err: &'static str,
-) -> Result<u64, ParseError> {
+const HI_U64: u16 = 1000;
+const HI_USIZE: u16 = 1001;
+const HI_U32: u16 = 1002;
+const HI_I32: u16 = 1003;
+const HI_DISK: u16 = 1004;
+
+#[inline(never)]
+fn req_num(v: &[u8], name: &str, lo: u8, hi_code: u16, has_msg: bool) -> Result<u64, ParseError> {
+    let hi: u64 = match hi_code {
+        HI_U64 => u64::MAX,
+        HI_USIZE => usize::MAX as u64,
+        HI_U32 => u32::MAX as u64,
+        HI_I32 => i32::MAX as u64,
+        HI_DISK => (u32::MAX as u64) / 1024,
+        x => x as u64,
+    };
     let n = str::parse_u64(v).ok_or_else(|| json::cat2("invalid ", name))?;
-    if n < lo || n > hi {
-        return Err(if range_err.is_empty() {
-            json::cat2("invalid ", name).into()
+    if n < lo as u64 || n > hi {
+        if !has_msg {
+            return Err(json::cat2("invalid ", name).into());
+        }
+        let msg = if hi_code >= 1000 {
+            json::cat3(
+                name,
+                " must be at least 1",
+                if name == "--host-mem" { " MiB" } else { "" },
+            )
+        } else if lo == 0 && hi_code == 1 {
+            json::cat2(name, " must be 0 or 1")
         } else {
-            range_err.into()
-        });
+            json::concat(&[
+                name,
+                " must be ",
+                &json::u64_str(lo as u64),
+                "..",
+                &json::u64_str(hi_code as u64),
+            ])
+        };
+        return Err(msg.into());
     }
     Ok(n)
 }
 
+#[inline(never)]
 fn err_unknown_val(flag: &str, v: &[u8], suffix: &str) -> ParseError {
     let mut s = String::with_capacity(64);
     s.push_str("unknown ");
@@ -1031,75 +937,184 @@ fn applies(sub: Sub, name: &str) -> bool {
     }
 }
 
-#[inline(never)]
-fn set_opt_str(slot: &mut Option<String>, v: &[u8], name: &str) -> Result<(), ParseError> {
-    *slot = Some(req_utf8(v, name)?);
-    Ok(())
+fn opt_str_slot(a: &mut Args, id: OptId) -> Option<&mut Option<String>> {
+    Some(match id {
+        OptId::Label => &mut a.label,
+        OptId::Masker => &mut a.masker,
+        OptId::ProfileName => &mut a.profile_name,
+        OptId::DecoyToken => &mut a.decoy_token,
+        OptId::MaskerCmd => &mut a.masker_cmd,
+        OptId::InterleaveCmd => &mut a.interleave_cmd,
+        OptId::RunId => &mut a.run_id,
+        OptId::TargetCmd => &mut a.target_cmd,
+        OptId::Runs => &mut a.runs,
+        OptId::Pick => &mut a.pick,
+        _ => return None,
+    })
+}
+
+fn vec_str_slot(a: &mut Args, id: OptId) -> Option<&mut Vec<String>> {
+    Some(match id {
+        OptId::RedactToken => &mut a.redact_tokens,
+        OptId::RedactTokenFile => &mut a.redact_token_files,
+        OptId::RedactEnv => &mut a.redact_envs,
+        _ => return None,
+    })
+}
+
+fn opt_bytes_slot(a: &mut Args, id: OptId) -> Option<(&mut Option<Vec<u8>>, bool)> {
+    Some(match id {
+        OptId::Validate => (&mut a.validate_file, false),
+        OptId::Out => (&mut a.out_path, false),
+        OptId::FromProfile => (&mut a.from_profile, false),
+        OptId::BlindDir => (&mut a.blind_dir, false),
+        OptId::Pidfile => (&mut a.pidfile, true),
+        OptId::ShadowDir => (&mut a.shadow_dir, true),
+        _ => return None,
+    })
+}
+
+fn bool_slot(a: &mut Args, id: OptId) -> Option<(&mut bool, bool)> {
+    Some(match id {
+        OptId::Help => (&mut a.want_help, true),
+        OptId::Version => (&mut a.want_version, true),
+        OptId::Local => (&mut a.local, true),
+        OptId::Sort => (&mut a.sort, true),
+        OptId::NoSort => (&mut a.sort, false),
+        OptId::Uniq => (&mut a.uniq, true),
+        OptId::NoUniq => (&mut a.uniq, false),
+        OptId::Mem => (&mut a.mem, true),
+        OptId::NoMem => (&mut a.mem, false),
+        OptId::Tty => (&mut a.tty, true),
+        OptId::NoTty => (&mut a.tty, false),
+        OptId::Threads => (&mut a.threads, true),
+        OptId::NoThreads => (&mut a.threads, false),
+        OptId::User => (&mut a.user, true),
+        OptId::NoUser => (&mut a.user, false),
+        OptId::CreateUsers => (&mut a.create_users, true),
+        OptId::Busy => (&mut a.busy, true),
+        OptId::DryRun => (&mut a.dry_run, true),
+        OptId::Plan => (&mut a.plan, true),
+        OptId::Wait => (&mut a.wait, true),
+        OptId::Binaries => (&mut a.binaries, true),
+        OptId::Elevate => (&mut a.elevate, true),
+        OptId::Table => (&mut a.table, true),
+        OptId::Live => (&mut a.live, true),
+        OptId::Force => (&mut a.force, true),
+        OptId::Verify => (&mut a.verify, true),
+        OptId::Exe => (&mut a.no_exe, false),
+        OptId::NoExe => (&mut a.no_exe, true),
+        OptId::NoRoot => (&mut a.no_root, true),
+        OptId::Json => (&mut a.json, true),
+        OptId::Quiet => (&mut a.quiet, true),
+        OptId::Tree => (&mut a.tree, true),
+        OptId::NoAncestors => (&mut a.no_ancestors, true),
+        OptId::NoCleanEnv => (&mut a.no_clean_env, true),
+        OptId::SameSession => (&mut a.same_session, true),
+        OptId::ExeMemfd => (&mut a.exe_memfd, true),
+        _ => return None,
+    })
 }
 
 #[inline(never)]
 fn apply_opt(a: &mut Args, opt: &OptRow, v: &[u8]) -> Result<(), ParseError> {
-    const UMAX: u64 = usize::MAX as u64;
-    const U32M: u64 = u32::MAX as u64;
+    const NUM_SPECS: &[(OptId, u8, u16, bool)] = &[
+        (OptId::Count, 0, HI_USIZE, false),
+        (OptId::Decoys, 0, HI_USIZE, false),
+        (OptId::LabelDecoys, 0, 500, true),
+        (OptId::RepeatMax, 0, HI_USIZE, false),
+        (OptId::Lines, 1, HI_USIZE, true),
+        (OptId::Duration, 0, HI_U32, false),
+        (OptId::JitterMs, 0, HI_U32, false),
+        (OptId::Churn, 0, HI_U32, false),
+        (OptId::MemTarget, 0, HI_U32, false),
+        (OptId::ObserverUid, 0, HI_U32, false),
+        (OptId::Seed, 0, HI_U64, false),
+        (OptId::MemCap, 0, HI_U64, false),
+        (OptId::PhysCap, 0, HI_U64, false),
+        (OptId::Delay, 0, HI_U64, false),
+        (OptId::DiskUtil, 0, HI_U64, false),
+        (OptId::Disk, 0, HI_DISK, false),
+        (OptId::Pid, 1, HI_I32, false),
+        (OptId::TargetPid, 1, HI_I32, false),
+        (OptId::Cpu, 0, 100, true),
+        (OptId::Speed, 1, HI_U64, true),
+        (OptId::CpuUtil, 0, 100, true),
+        (OptId::MemUtil, 0, 95, true),
+        (OptId::HostMem, 1, HI_U64, true),
+        (OptId::HostPidMax, 1, HI_U64, true),
+        (OptId::HostUptime, 1, HI_U64, true),
+        (OptId::DecoyLevel, 1, 6, true),
+        (OptId::Dumpable, 0, 1, true),
+        (OptId::Seccomp, 0, 8, true),
+        (OptId::Level, 1, 6, true),
+    ];
+
     let name = opt.name;
-    match opt.id {
-        OptId::Help => a.want_help = true,
-        OptId::Version => a.want_version = true,
-        OptId::Local => a.local = true,
-        OptId::Sort => a.sort = true,
-        OptId::NoSort => a.sort = false,
-        OptId::Uniq => a.uniq = true,
-        OptId::NoUniq => a.uniq = false,
-        OptId::Mem => a.mem = true,
-        OptId::NoMem => a.mem = false,
-        OptId::Tty => a.tty = true,
-        OptId::NoTty => a.tty = false,
-        OptId::Threads => a.threads = true,
-        OptId::NoThreads => a.threads = false,
-        OptId::User => a.user = true,
-        OptId::NoUser => a.user = false,
-        OptId::CreateUsers => a.create_users = true,
-        OptId::Busy => a.busy = true,
-        OptId::DryRun => a.dry_run = true,
-        OptId::Plan => a.plan = true,
-        OptId::Wait => a.wait = true,
-        OptId::Binaries => a.binaries = true,
+    let id = opt.id;
+    if let Some((slot, val)) = bool_slot(a, id) {
+        *slot = val;
+        return Ok(());
+    }
+    if let Some(slot) = opt_str_slot(a, id) {
+        *slot = Some(req_utf8(v, name)?);
+        return Ok(());
+    }
+    if let Some(slot) = vec_str_slot(a, id) {
+        slot.push(req_utf8(v, name)?);
+        return Ok(());
+    }
+    if let Some((slot, abs)) = opt_bytes_slot(a, id) {
+        *slot = Some(if abs { abs_path(v) } else { v.to_vec() });
+        return Ok(());
+    }
+    if let Some(&(_, lo, hi, has_msg)) = NUM_SPECS.iter().find(|s| s.0 == id) {
+        let n = req_num(v, name, lo, hi, has_msg)?;
+        match id {
+            OptId::Count => a.count = n as usize,
+            OptId::Decoys => a.decoys = n as usize,
+            OptId::LabelDecoys => a.label_decoys = n as usize,
+            OptId::RepeatMax => a.repeat_max = Some(n as usize),
+            OptId::Lines => a.log_lines = n as usize,
+            OptId::Duration => a.duration = n as u32,
+            OptId::JitterMs => a.jitter_ms = n as u32,
+            OptId::Churn => a.churn = n as u32,
+            OptId::MemTarget => a.mem_target_kb = Some(n as u32),
+            OptId::ObserverUid => a.observer_uid = Some(n as u32),
+            OptId::Seed => a.seed = Some(n),
+            OptId::MemCap => a.mem_cap_mb = n,
+            OptId::PhysCap => a.phys_cap = Some(n),
+            OptId::Delay => a.log_delay_ms = n,
+            OptId::DiskUtil => a.load_disk = Some(n),
+            OptId::Disk => a.disk_mb = Some(n),
+            OptId::Pid | OptId::TargetPid => a.target_pid = Some(n as i32),
+            OptId::Cpu => a.cpu_pct = Some(n as u32),
+            OptId::Speed => a.speed = n,
+            OptId::CpuUtil => a.load_cpu = Some(n as u32),
+            OptId::MemUtil => a.load_mem = Some(n as u32),
+            OptId::HostMem => a.host_mem_mb = Some(n),
+            OptId::HostPidMax => a.host_pid_max = Some(n),
+            OptId::HostUptime => a.host_uptime = Some(n),
+            OptId::DecoyLevel => a.decoy_level = Some(n as u8),
+            OptId::Dumpable => a.dumpable = Some(n as u8),
+            OptId::Seccomp => a.seccomp = Some(n as u8),
+            OptId::Level => a.run_level = n as u8,
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    match id {
         OptId::RequireBinaries => {
             a.binaries = true;
             a.require_binaries = true;
         }
-        OptId::Elevate => a.elevate = true,
-        OptId::Table => a.table = true,
-        OptId::Live => a.live = true,
-        OptId::Force => a.force = true,
-        OptId::Verify => a.verify = true,
-        OptId::Exe => a.no_exe = false,
-        OptId::NoExe => a.no_exe = true,
-        OptId::NoRoot => a.no_root = true,
-        OptId::Json => a.json = true,
-        OptId::Quiet => a.quiet = true,
-        OptId::Tree => a.tree = true,
-        OptId::CleanEnv => a.clean_env = true,
-        OptId::ExeMemfd => a.exe_memfd = true,
-        OptId::Label => set_opt_str(&mut a.label, v, name)?,
-        OptId::Masker => set_opt_str(&mut a.masker, v, name)?,
-        OptId::ProfileName => set_opt_str(&mut a.profile_name, v, name)?,
-        OptId::DecoyToken => set_opt_str(&mut a.decoy_token, v, name)?,
-        OptId::MaskerCmd => set_opt_str(&mut a.masker_cmd, v, name)?,
-        OptId::RunId => set_opt_str(&mut a.run_id, v, name)?,
-        OptId::TargetCmd => set_opt_str(&mut a.target_cmd, v, name)?,
-        OptId::Runs => set_opt_str(&mut a.runs, v, name)?,
-        OptId::Pick => set_opt_str(&mut a.pick, v, name)?,
-        OptId::Validate => a.validate_file = Some(v.to_vec()),
-        OptId::Out => a.out_path = Some(v.to_vec()),
-        OptId::FromProfile => a.from_profile = Some(v.to_vec()),
-        OptId::BlindDir => a.blind_dir = Some(v.to_vec()),
-        OptId::Pidfile => a.pidfile = Some(abs_path(v)),
-        OptId::ShadowDir => a.shadow_dir = Some(abs_path(v)),
+        OptId::CleanEnv => {
+            a.clean_env = true;
+            a.no_clean_env = false;
+        }
         OptId::Profile => a.profile = v.to_vec(),
         OptId::Module => a.log_module = v.to_vec(),
-        OptId::RedactToken => a.redact_tokens.push(req_utf8(v, name)?),
-        OptId::RedactEnv => a.redact_envs.push(req_utf8(v, name)?),
         OptId::Family => {
             a.family = Some(corpus::family_id(v).ok_or_else(|| {
                 err_unknown_val("--family", v, "; see `--help` for the accepted set")
@@ -1117,81 +1132,21 @@ fn apply_opt(a: &mut Args, opt: &OptRow, v: &[u8]) -> Result<(), ParseError> {
             }
             a.offset_min = m;
         }
-        OptId::Wchan => {
+        OptId::Wchan | OptId::Mode | OptId::Control | OptId::HardNegatives => {
             let s = req_utf8(v, name)?;
-            a.wchan =
-                Some(inject::parse_wchan_mode(&s).ok_or(
-                    "invalid --wchan; expected pause, epoll, poll, nanosleep, futex or read",
-                )?);
+            match id {
+                OptId::Wchan => {
+                    a.wchan = Some(inject::parse_wchan_mode(&s).ok_or(
+                        "invalid --wchan; expected pause, epoll, poll, nanosleep, futex, read or wait4",
+                    )?);
+                }
+                OptId::Mode => a.run_mode = harness::Mode::parse(&s)?,
+                OptId::Control => a.run_control = harness::Control::parse(&s)?,
+                OptId::HardNegatives => a.hard_negatives = Some(harness::HardNeg::parse_list(&s)?),
+                _ => {}
+            }
         }
-        OptId::Mode => a.run_mode = harness::Mode::parse(&req_utf8(v, name)?)?,
-        OptId::Control => a.run_control = harness::Control::parse(&req_utf8(v, name)?)?,
-        OptId::HardNegatives => {
-            a.hard_negatives = Some(harness::HardNeg::parse_list(&req_utf8(v, name)?)?);
-        }
-        OptId::Count => a.count = req_num(v, name, 0, UMAX, "")? as usize,
-        OptId::Decoys => a.decoys = req_num(v, name, 0, UMAX, "")? as usize,
-        OptId::RepeatMax => a.repeat_max = Some(req_num(v, name, 0, UMAX, "")? as usize),
-        OptId::Lines => {
-            a.log_lines = req_num(v, name, 1, UMAX, "--lines must be at least 1")? as usize
-        }
-        OptId::Duration => a.duration = req_num(v, name, 0, U32M, "")? as u32,
-        OptId::JitterMs => a.jitter_ms = req_num(v, name, 0, U32M, "")? as u32,
-        OptId::Churn => a.churn = req_num(v, name, 0, U32M, "")? as u32,
-        OptId::MemTarget => a.mem_target_kb = Some(req_num(v, name, 0, U32M, "")? as u32),
-        OptId::ObserverUid => a.observer_uid = Some(req_num(v, name, 0, U32M, "")? as u32),
-        OptId::Seed => a.seed = Some(req_num(v, name, 0, u64::MAX, "")?),
-        OptId::MemCap => a.mem_cap_mb = req_num(v, name, 0, u64::MAX, "")?,
-        OptId::PhysCap => a.phys_cap = Some(req_num(v, name, 0, u64::MAX, "")?),
-        OptId::Delay => a.log_delay_ms = req_num(v, name, 0, u64::MAX, "")?,
-        OptId::DiskUtil => a.load_disk = Some(req_num(v, name, 0, u64::MAX, "")?),
-        OptId::Disk => a.disk_mb = Some(req_num(v, name, 0, U32M / 1024, "")?),
-        OptId::Pid | OptId::TargetPid => {
-            a.target_pid = Some(req_num(v, name, 1, i32::MAX as u64, "")? as i32)
-        }
-        OptId::Cpu => a.cpu_pct = Some(req_num(v, name, 0, 100, "--cpu must be 0..100")? as u32),
-        OptId::Speed => a.speed = req_num(v, name, 1, u64::MAX, "--speed must be at least 1")?,
-        OptId::CpuUtil => {
-            a.load_cpu = Some(req_num(v, name, 0, 100, "--cpu-util must be 0..100")? as u32)
-        }
-        OptId::MemUtil => {
-            a.load_mem = Some(req_num(v, name, 0, 95, "--mem-util must be 0..95")? as u32)
-        }
-        OptId::HostMem => {
-            a.host_mem_mb = Some(req_num(
-                v,
-                name,
-                1,
-                u64::MAX,
-                "--host-mem must be at least 1 MiB",
-            )?)
-        }
-        OptId::HostPidMax => {
-            a.host_pid_max = Some(req_num(
-                v,
-                name,
-                1,
-                u64::MAX,
-                "--host-pid-max must be at least 1",
-            )?)
-        }
-        OptId::HostUptime => {
-            a.host_uptime = Some(req_num(
-                v,
-                name,
-                1,
-                u64::MAX,
-                "--host-uptime must be at least 1",
-            )?)
-        }
-        OptId::DecoyLevel => {
-            a.decoy_level = Some(req_num(v, name, 1, 6, "--decoy-level must be 1..6")? as u8)
-        }
-        OptId::Dumpable => {
-            a.dumpable = Some(req_num(v, name, 0, 1, "--dumpable must be 0 or 1")? as u8)
-        }
-        OptId::Seccomp => a.seccomp = Some(req_num(v, name, 0, 8, "--seccomp must be 0..8")? as u8),
-        OptId::Level => a.run_level = req_num(v, name, 1, 6, "--level must be 1..6")? as u8,
+        _ => {}
     }
     Ok(())
 }
@@ -1202,14 +1157,13 @@ pub fn parse(args: &[Vec<u8>]) -> Result<Args, ParseError> {
     let mut i = 1usize;
     let mut saw_sub = false;
     let mut stop_options = false;
-    while i < args.len() {
-        let arg = &args[i];
+    while let Some(arg) = args.get(i) {
         if !stop_options && arg == b"--" {
             stop_options = true;
             i += 1;
             continue;
         }
-        if !stop_options && !arg.is_empty() && arg[0] == b'-' && arg.len() > 1 {
+        if !stop_options && arg.len() > 1 && arg.first() == Some(&b'-') {
             let (name, inline) = match str::find(arg, b"=") {
                 Some(pos) => (&arg[..pos], Some(&arg[pos + 1..])),
                 None => (&arg[..], None),
@@ -1299,6 +1253,7 @@ fn run_mode(a: &Args) -> Run {
     }
 }
 
+#[inline(never)]
 fn reject_if_seen(a: &Args, name: &str, why: &str) -> Result<(), ParseError> {
     if a.seen.contains(&name) {
         Err(json::cat3(name, " ", why).into())
@@ -1307,11 +1262,21 @@ fn reject_if_seen(a: &Args, name: &str, why: &str) -> Result<(), ParseError> {
     }
 }
 
+#[inline(never)]
 fn reject_csv(a: &Args, names_csv: &str, why: &str) -> Result<(), ParseError> {
     for name in names_csv.split(',') {
         reject_if_seen(a, name, why)?;
     }
     Ok(())
+}
+
+#[inline(never)]
+fn check_forbid(cond: bool, msg: &'static str) -> Result<(), ParseError> {
+    if cond {
+        Err(ParseError::Static(msg))
+    } else {
+        Ok(())
+    }
 }
 
 /// Reject an option the chosen mode cannot act on.
@@ -1343,32 +1308,34 @@ fn forbid(a: &Args) -> Result<(), ParseError> {
                         reject_if_seen(a, flag, why)?;
                     }
                 }
-                if a.json && a.plan {
-                    return Err("--plan and --json encode the same preview; use one of them".into());
-                }
+                check_forbid(
+                    a.json && a.plan,
+                    "--plan and --json encode the same preview; use one of them",
+                )?;
             }
             Run::Spawn => {
-                if a.json {
-                    return Err("--json on inject needs --dry-run: it encodes the plan".into());
-                }
-                if a.plan {
-                    return Err("--plan on inject needs --dry-run: it is the preview".into());
-                }
-                if a.wait && a.duration == 0 {
-                    return Err(
-                        "--wait needs --duration: without one the run is stopped by `psgen stop`"
-                            .into(),
-                    );
-                }
+                check_forbid(
+                    a.json,
+                    "--json on inject needs --dry-run: it encodes the plan",
+                )?;
+                check_forbid(
+                    a.plan,
+                    "--plan on inject needs --dry-run: it is the preview",
+                )?;
+                check_forbid(
+                    a.wait && a.duration == 0,
+                    "--wait needs --duration: without one the run is stopped by `psgen stop`",
+                )?;
             }
         }
-        if a.from_profile.is_some() && a.masker_cmd.is_some() {
-            return Err("--from-profile and --masker-cmd are mutually exclusive".into());
-        }
+        check_forbid(
+            a.from_profile.is_some() && a.masker_cmd.is_some(),
+            "--from-profile and --masker-cmd are mutually exclusive",
+        )?;
         if a.from_profile.is_none() {
             reject_csv(
                 a,
-                "--decoy-level,--clean-env,--exe-memfd,--dumpable,--seccomp,--wchan",
+                "--decoy-level,--clean-env,--no-clean-env,--same-session,--label-decoys,--interleave-cmd,--exe-memfd,--dumpable,--seccomp,--wchan",
                 "requires --from-profile",
             )?;
             if a.masker_cmd.is_none() {
@@ -1379,63 +1346,63 @@ fn forbid(a: &Args) -> Result<(), ParseError> {
                 )?;
             }
         }
-        if (a.from_profile.is_some() || a.masker_cmd.is_some()) && a.dry_run {
-            return Err("--dry-run does not apply with --from-profile or --masker-cmd".into());
-        }
+        check_forbid(
+            (a.from_profile.is_some() || a.masker_cmd.is_some()) && a.dry_run,
+            "--dry-run does not apply with --from-profile or --masker-cmd",
+        )?;
     }
-    if a.sub == Sub::Stop && a.plan && a.elevate {
-        return Err(
-            "--elevate does not apply with --plan: a plan never elevates, so it would report \
-             a verdict the real run cannot reach"
-                .into(),
-        );
-    }
+    check_forbid(
+        a.sub == Sub::Stop && a.plan && a.elevate,
+        "--elevate does not apply with --plan: a plan never elevates, so it would report a verdict the real run cannot reach",
+    )?;
     if a.sub == Sub::Profile {
-        if a.target_pid.is_some() && a.validate_file.is_some() {
-            return Err("--pid and --validate are mutually exclusive".into());
-        }
-        if a.target_pid.is_none() && a.validate_file.is_none() {
-            return Err("profile requires --pid or --validate".into());
-        }
+        check_forbid(
+            a.target_pid.is_some() && a.validate_file.is_some(),
+            "--pid and --validate are mutually exclusive",
+        )?;
+        check_forbid(
+            a.target_pid.is_none() && a.validate_file.is_none(),
+            "profile requires --pid or --validate",
+        )?;
         if a.validate_file.is_some() {
             reject_csv(
                 a,
-                "--tree,--label,--masker,--profile-name,--redact-env,--out",
+                "--tree,--no-ancestors,--label,--masker,--profile-name,--redact-env,--out",
                 "does not apply with --validate",
             )?;
         }
     }
     if a.sub == Sub::Run {
-        if !a.seen.contains(&"--profile") {
-            return Err("run requires --profile".into());
-        }
-        if a.out_path.is_none() {
-            return Err("run requires --out".into());
-        }
-        if a.target_pid.is_some() && a.target_cmd.is_some() {
-            return Err("--target-pid and --target-cmd are mutually exclusive".into());
-        }
+        check_forbid(
+            !a.seen.contains(&"--profile")
+                && !(a.live && (a.target_cmd.is_some() || a.target_pid.is_some())),
+            "run requires --profile (or --live with --target-cmd/--target-pid)",
+        )?;
+        check_forbid(a.out_path.is_none(), "run requires --out")?;
+        check_forbid(
+            a.target_pid.is_some() && a.target_cmd.is_some(),
+            "--target-pid and --target-cmd are mutually exclusive",
+        )?;
     }
     if a.sub == Sub::Score {
-        if a.run_dir.is_some() && a.runs.is_some() {
-            return Err("use either <run-dir> or --runs, not both".into());
-        }
-        if a.run_dir.is_none() && a.runs.is_none() {
-            return Err("score requires <run-dir> or --runs".into());
-        }
+        check_forbid(
+            a.run_dir.is_some() && a.runs.is_some(),
+            "use either <run-dir> or --runs, not both",
+        )?;
+        check_forbid(
+            a.run_dir.is_none() && a.runs.is_none(),
+            "score requires <run-dir> or --runs",
+        )?;
         let _ = parse_score_pairs(a)?;
     }
     if a.sub == Sub::Replay {
-        if a.run_dir.is_none() {
-            return Err("replay requires <run-dir>".into());
-        }
-        if a.pick.is_none() {
-            return Err("replay requires --pick".into());
-        }
+        check_forbid(a.run_dir.is_none(), "replay requires <run-dir>")?;
+        check_forbid(a.pick.is_none(), "replay requires --pick")?;
     }
-    if a.sub == Sub::Verify && a.run_dir.is_none() {
-        return Err("verify requires <run-dir>".into());
-    }
+    check_forbid(
+        a.sub == Sub::Verify && a.run_dir.is_none(),
+        "verify requires <run-dir>",
+    )?;
     Ok(())
 }
 
@@ -1448,6 +1415,7 @@ fn split_csv_paths(raw: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+#[inline(never)]
 fn parse_score_pairs(a: &Args) -> Result<Vec<(PathBuf, PathBuf)>, ParseError> {
     if let Some(ref rd) = a.run_dir {
         let dir = PathBuf::from(OsStr::from_bytes(rd));
@@ -1478,6 +1446,7 @@ fn parse_score_pairs(a: &Args) -> Result<Vec<(PathBuf, PathBuf)>, ParseError> {
     Ok(dirs.into_iter().zip(picks).collect())
 }
 
+#[inline(never)]
 fn elevate(argv: &[Vec<u8>], args: &Args) -> Option<i32> {
     // A preview never elevates: `--plan` describes what the caller's own
     // privileges would reach, and re-execing through sudo would answer a
@@ -1486,10 +1455,7 @@ fn elevate(argv: &[Vec<u8>], args: &Args) -> Option<i32> {
     if !args.elevate || preview || sys::geteuid() == 0 {
         return None;
     }
-    let self_exe = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(_) => return None,
-    };
+    let self_exe = std::env::current_exe().ok()?;
     let probe = sys::run_cmd(b"sudo", &[b"sudo", b"-n", b"true"], None, false);
     if !matches!(probe, Ok((0, _))) {
         sys::err(b"psgen: sudo -n is not available; continuing unprivileged\n");
@@ -1501,17 +1467,16 @@ fn elevate(argv: &[Vec<u8>], args: &Args) -> Option<i32> {
     cmd_argv.push(b"-n");
     cmd_argv.push(self_b);
     for a in argv.iter().skip(1) {
-        if a == b"--elevate" {
-            continue;
+        if a != b"--elevate" {
+            cmd_argv.push(a.as_slice());
         }
-        cmd_argv.push(a.as_slice());
     }
     match sys::run_cmd(b"sudo", &cmd_argv, None, false) {
         Ok((code, _)) => Some(code),
         Err(e) => {
             let mut out = Buf::new();
-            out.push_str("psgen: cannot run sudo: ");
-            out.push_str(&std::io::Error::from_raw_os_error(e).to_string());
+            sys::buf_push_s(&mut out, "psgen: cannot run sudo: ");
+            sys::push_errno(&mut out, e);
             out.push(b'\n');
             sys::err(out.as_bytes());
             Some(1)
@@ -1519,55 +1484,45 @@ fn elevate(argv: &[Vec<u8>], args: &Args) -> Option<i32> {
     }
 }
 
+#[inline(never)]
 fn print_notes(prep: &inject::Prep, args: &Args) {
     for w in &prep.warnings {
-        let mut msg = w.clone();
-        // `prepare()` runs with `create = false` under --dry-run, so it adds
-        // the "pass --create-users" hint even when the flag is already on the
-        // command line. The hint exists for a caller who did *not* ask; here
-        // the account is already reported as one the run would create.
-        if args.dry_run && args.create_users {
-            msg = msg.replace(" (pass --create-users to create it)", "");
-        }
-        let mut out = Buf::new();
-        out.push_str("psgen: ");
-        out.push_str(&msg);
-        out.push(b'\n');
-        sys::err(out.as_bytes());
+        let msg = if args.dry_run && args.create_users {
+            w.replace(" (pass --create-users to create it)", "")
+        } else {
+            w.clone()
+        };
+        sys::err_parts(&[msg.as_bytes()]);
     }
     let c = &prep.caps;
     let reduced = (!c.pty && args.tty) || (c.root && !c.user_switch && args.user);
     if reduced {
         let mut out = Buf::new();
-        out.push_str("psgen: reduced capability:");
+        sys::buf_push_s(&mut out, "psgen: reduced capability:");
         if !c.pty {
-            out.push_str(" pty=no");
+            sys::buf_push_s(&mut out, " pty=no");
         }
         if c.root && !c.user_switch {
-            out.push_str(" user_switch=no");
+            sys::buf_push_s(&mut out, " user_switch=no");
         }
-        out.push_str(" (run `psgen doctor` for the errno)\n");
+        sys::buf_push_s(&mut out, " (run `psgen doctor` for the errno)\n");
         sys::err(out.as_bytes());
     }
     if !c.memfd {
-        if c.memfd_untested {
-            sys::err(
-                b"psgen: the capability probe could not fork, so memfd_create is untested; the arena may fall back to an unlinked temp file and the run will refuse if a stub config needs a memfd\n",
-            );
+        sys::err(if c.memfd_untested {
+            b"psgen: the capability probe could not fork, so memfd_create is untested; the arena may fall back to an unlinked temp file and the run will refuse if a stub config needs a memfd\n"
         } else {
-            sys::err(
-                b"psgen: memfd_create denied; the arena falls back to an unlinked temp file, but a stub config cannot, so the run will refuse when it reaches the config\n",
-            );
-        }
+            b"psgen: memfd_create denied; the arena falls back to an unlinked temp file, but a stub config cannot, so the run will refuse when it reaches the config\n"
+        });
     }
     if !prep.created.is_empty() {
         let mut out = Buf::new();
-        out.push_str("psgen: created users:");
+        sys::buf_push_s(&mut out, "psgen: created users:");
         for u in &prep.created {
             out.push(b' ');
-            out.push_bytes(u);
+            sys::buf_push_b(&mut out, u);
         }
-        out.push_str(" (remove with userdel when done)\n");
+        sys::buf_push_s(&mut out, " (remove with userdel when done)\n");
         sys::err(out.as_bytes());
     }
 }
@@ -1575,31 +1530,24 @@ fn print_notes(prep: &inject::Prep, args: &Args) {
 fn print_failures(result: &inject::SpawnResult) {
     for (id, status) in &result.failed_ids {
         let mut m = Buf::new();
-        m.push_str("psgen: row ");
-        m.push_u64(*id as u64);
-        m.push_str(" failed");
+        sys::buf_push_s(&mut m, "psgen: row ");
+        sys::buf_push_u(&mut m, *id as u64);
+        sys::buf_push_s(&mut m, " failed");
         if *status < 0 {
-            m.push_str(": ");
-            m.push_str(&std::io::Error::from_raw_os_error(-*status).to_string());
+            sys::buf_push_s(&mut m, ": ");
+            sys::push_errno(&mut m, -*status);
         }
         m.push(b'\n');
         sys::err(m.as_bytes());
     }
     for (pid, id, wv, gv, wr, gr) in &result.mismatches {
         let mut m = Buf::new();
-        m.push_str("psgen: pid ");
-        m.push_u64(*pid as u64);
-        m.push_str(" row ");
-        m.push_u64(*id as u64);
-        m.push_str(" VSZ ");
-        m.push_u64(*gv);
-        m.push(b'/');
-        m.push_u64(*wv);
-        m.push_str(" RSS ");
-        m.push_u64(*gr);
-        m.push(b'/');
-        m.push_u64(*wr);
-        m.push(b'\n');
+        bp_kvs_u(
+            &mut m,
+            "psgen: pid | row | VSZ |/| RSS |/",
+            &[*pid as u64, *id as u64, *gv, *wv, *gr, *wr],
+        );
+        bp_c(&mut m, b'\n');
         sys::err(m.as_bytes());
     }
 }
@@ -1611,99 +1559,195 @@ fn phys_uses_kib(est_kb: u64, budget_kb: u64) -> bool {
 }
 
 #[inline(never)]
+fn bp_c(b: &mut Buf, c: u8) {
+    b.push(c);
+}
+
+#[inline(never)]
+fn bp_kv_s(b: &mut Buf, k: &str, v: &str) {
+    sys::buf_push_s(b, k);
+    sys::buf_push_s(b, v);
+}
+
+#[inline(never)]
+fn bp_kv_b(b: &mut Buf, k: &str, v: &[u8]) {
+    sys::buf_push_s(b, k);
+    sys::buf_push_b(b, v);
+}
+
+#[inline(never)]
+fn bp_kv_u(b: &mut Buf, k: &str, v: u64) {
+    sys::buf_push_s(b, k);
+    sys::buf_push_u(b, v);
+}
+
+#[inline(never)]
+fn bp_cnt(b: &mut Buf, pre: &str, n: u64, suf: &str) {
+    sys::buf_push_s(b, pre);
+    sys::buf_push_u(b, n);
+    sys::buf_push_s(b, suf);
+}
+
+#[inline(never)]
+fn bp_plural(b: &mut Buf, n: u64, sg: &str, pl: &str) {
+    sys::buf_push_u(b, n);
+    sys::buf_push_s(b, if n == 1 { sg } else { pl });
+}
+
+#[inline(never)]
+fn bp_mem_unit(b: &mut Buf, kb: u64, kib: bool, suf: &str) {
+    sys::buf_push_u(b, if kib { kb } else { kb / 1024 });
+    sys::buf_push_s(b, if kib { " KiB" } else { " MiB" });
+    sys::buf_push_s(b, suf);
+}
+
+#[inline(never)]
+fn jp_k(b: &mut Buf, k: &str) {
+    bp_kv_s(b, ",\"", k);
+    sys::buf_push_s(b, "\":");
+}
+
+#[inline(never)]
+fn jp_s(b: &mut Buf, k: &str, v: &[u8]) {
+    jp_k(b, k);
+    json_escape(b, v);
+}
+
+#[inline(never)]
+fn jp_u(b: &mut Buf, k: &str, v: u64) {
+    jp_k(b, k);
+    sys::buf_push_u(b, v);
+}
+
+#[inline(never)]
+fn jp_b(b: &mut Buf, k: &str, v: bool) {
+    jp_k(b, k);
+    sys::buf_push_s(b, bool_str(v));
+}
+
+#[inline(never)]
+fn jp_opt_u(b: &mut Buf, k: &str, v: Option<u64>) {
+    jp_k(b, k);
+    match v {
+        Some(n) => sys::buf_push_u(b, n),
+        None => sys::buf_push_s(b, "null"),
+    }
+}
+
+#[inline(never)]
+fn jp_arr(b: &mut Buf, k: &str, items: &[Vec<u8>]) {
+    jp_k(b, k);
+    bp_c(b, b'[');
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            bp_c(b, b',');
+        }
+        json_escape(b, item);
+    }
+    bp_c(b, b']');
+}
+
+#[inline(never)]
+fn jp_bools(b: &mut Buf, keys_csv: &str, vals: &[bool]) {
+    for (k, &v) in keys_csv.split(',').zip(vals.iter()) {
+        jp_b(b, k, v);
+    }
+}
+
+#[inline(never)]
+fn jp_u64s(b: &mut Buf, keys_csv: &str, vals: &[u64]) {
+    for (k, &v) in keys_csv.split(',').zip(vals.iter()) {
+        jp_u(b, k, v);
+    }
+}
+
+#[inline(never)]
+fn bp_kvs_s(b: &mut Buf, keys_pipe: &str, vals: &[&str]) {
+    for (k, &v) in keys_pipe.split('|').zip(vals.iter()) {
+        bp_kv_s(b, k, v);
+    }
+}
+
+#[inline(never)]
+fn bp_kvs_u(b: &mut Buf, keys_pipe: &str, vals: &[u64]) {
+    for (k, &v) in keys_pipe.split('|').zip(vals.iter()) {
+        bp_kv_u(b, k, v);
+    }
+}
+
+#[inline(never)]
+fn rm_bytes(p: &[u8]) {
+    let _ = std::fs::remove_file(Path::new(OsStr::from_bytes(p)));
+}
+
+#[inline(never)]
 fn print_summary(prep: &inject::Prep, result: &inject::SpawnResult, args: &Args) {
     print_failures(result);
     if args.quiet {
         return;
     }
     let mut out = Buf::new();
-    out.push_str("spawned ");
-    out.push_u64(result.pids.len() as u64);
-    out.push_str(" processes");
+    bp_cnt(&mut out, "spawned ", result.pids.len() as u64, " processes");
     if let Some(path) = &args.pidfile {
         if result.pidfile_ok {
-            out.push_str(", pids in ");
-            out.push_bytes(path);
+            bp_kv_b(&mut out, ", pids in ", path);
         } else {
-            out.push_str("; the pidfile was not written");
+            sys::buf_push_s(&mut out, "; the pidfile was not written");
         }
     } else {
-        out.push_str(" (pass --pidfile FILE to be able to stop them)");
+        sys::buf_push_s(&mut out, " (pass --pidfile FILE to be able to stop them)");
         if !result.temps.is_empty() {
-            out.push_str("; temp dirs:");
+            sys::buf_push_s(&mut out, "; temp dirs:");
             for t in &result.temps {
-                out.push(b' ');
-                out.push_bytes(t.as_os_str().as_bytes());
+                bp_kv_b(&mut out, " ", t.as_os_str().as_bytes());
             }
-            out.push_str(" (remove them with rm -rf when the run ends)");
+            sys::buf_push_s(&mut out, " (remove them with rm -rf when the run ends)");
         }
     }
-    if result.failed > 0 {
-        out.push_str(", ");
-        out.push_u64(result.failed as u64);
-        out.push_str(" failed");
+    for (n, label) in [
+        result.failed,
+        result.missing,
+        result.warned,
+        result.mismatches.len(),
+    ]
+    .into_iter()
+    .zip(" failed| did not report| reported a setup deviation| outside 128 kB".split('|'))
+    {
+        if n > 0 {
+            bp_cnt(&mut out, ", ", n as u64, label);
+        }
     }
-    if result.missing > 0 {
-        out.push_str(", ");
-        out.push_u64(result.missing as u64);
-        out.push_str(" did not report");
-    }
-    if result.warned > 0 {
-        out.push_str(", ");
-        out.push_u64(result.warned as u64);
-        out.push_str(" reported a setup deviation");
-    }
-    if !result.mismatches.is_empty() {
-        out.push_str(", ");
-        out.push_u64(result.mismatches.len() as u64);
-        out.push_str(" outside 128 kB");
-    }
-    out.push(b'\n');
-    out.push_str("exe tier ");
-    out.push_str(result.tier.name());
+    bp_kv_s(&mut out, "\nexe tier ", result.tier.name());
     if result.tty_wanted > 0 {
-        out.push_str(", tty ");
-        out.push_u64(result.tty_real as u64);
-        out.push_str(" real, ");
-        out.push_u64(result.tty_degraded as u64);
-        out.push_str(" degraded");
+        bp_cnt(&mut out, ", tty ", result.tty_real as u64, " real");
+        bp_cnt(&mut out, ", ", result.tty_degraded as u64, " degraded");
     }
-    out.push(b'\n');
+    bp_c(&mut out, b'\n');
     if result.dev_exe + result.dev_user + result.dev_disk + result.dev_mem > 0 {
-        out.push_str("deviations: user ");
-        out.push_u64(result.dev_user as u64);
-        out.push_str(", exe ");
-        out.push_u64(result.dev_exe as u64);
-        out.push_str(", mem ");
-        out.push_u64(result.dev_mem as u64);
-        out.push_str(", disk ");
-        out.push_u64(result.dev_disk as u64);
-        out.push(b'\n');
+        bp_kvs_u(
+            &mut out,
+            "deviations: user |, exe |, mem |, disk ",
+            &[
+                result.dev_user as u64,
+                result.dev_exe as u64,
+                result.dev_mem as u64,
+                result.dev_disk as u64,
+            ],
+        );
+        bp_c(&mut out, b'\n');
     }
     if args.mem && prep.phys_estimate_kb > 0 {
         let show_kib = phys_uses_kib(prep.phys_estimate_kb, prep.phys_budget_kb);
-        out.push_str("reported RSS is shared; estimated physical cost ");
-        if show_kib {
-            out.push_u64(prep.phys_estimate_kb);
-            out.push_str(" KiB");
-        } else {
-            out.push_u64(prep.phys_estimate_kb / 1024);
-            out.push_str(" MiB");
-        }
+        sys::buf_push_s(&mut out, "reported RSS is shared; estimated physical cost ");
+        bp_mem_unit(&mut out, prep.phys_estimate_kb, show_kib, "");
         if prep.phys_scale < 1.0 {
-            out.push_str(", scaled to fit the physical budget");
+            sys::buf_push_s(&mut out, ", scaled to fit the physical budget");
             if prep.phys_budget_kb > 0 {
-                out.push_str(" of ");
-                if show_kib {
-                    out.push_u64(prep.phys_budget_kb);
-                    out.push_str(" KiB");
-                } else {
-                    out.push_u64(prep.phys_budget_kb / 1024);
-                    out.push_str(" MiB");
-                }
+                sys::buf_push_s(&mut out, " of ");
+                bp_mem_unit(&mut out, prep.phys_budget_kb, show_kib, "");
             }
         }
-        out.push(b'\n');
+        bp_c(&mut out, b'\n');
     }
     if args.table {
         sys::err(out.as_bytes());
@@ -1739,68 +1783,67 @@ fn pidfile_error(path: &[u8]) -> Buf {
     pidfile_error_bytes(path, probe::PIDFILE_PENDING_BYTES)
 }
 
+#[inline(never)]
 fn pidfile_error_bytes(path: &[u8], bytes: usize) -> Buf {
     let mut out = Buf::new();
-    out.push_str("psgen: cannot write the pidfile ");
-    out.push_bytes(path);
-    if path.is_empty() {
-        out.push_str(": the path is empty");
+    bp_kv_b(&mut out, "psgen: cannot write the pidfile ", path);
+    let tail: &str = if path.is_empty() {
+        ": the path is empty"
     } else if sys::is_dir(path) {
-        out.push_str(": the path is a directory");
+        ": the path is a directory"
     } else if let Err(probe::TargetProblem::Unreadable(e)) = probe::pidfile_target(path) {
         // "Not an empty file or a psgen pidfile" would be a lie here: the path
         // could not be examined, which is a different problem with a different
         // fix (a shorter name, or a directory the caller can search).
-        out.push_str(": the path cannot be examined (");
-        out.push_str(&std::io::Error::from_raw_os_error(e).to_string());
-        out.push(b')');
+        sys::buf_push_s(&mut out, ": the path cannot be examined (");
+        sys::push_errno(&mut out, e);
+        ")"
     } else if !probe::pidfile_target_ok(path) {
-        out.push_str(": the path is not an empty file or a psgen pidfile");
+        ": the path is not an empty file or a psgen pidfile"
     } else {
         let parent = pidfile_parent(path);
-        out.push_str(": the parent ");
-        out.push_bytes(parent);
-        if !std::path::Path::new(std::ffi::OsStr::from_bytes(parent)).exists() {
-            out.push_str(" does not exist");
+        bp_kv_b(&mut out, ": the parent ", parent);
+        if !Path::new(OsStr::from_bytes(parent)).exists() {
+            " does not exist"
         } else if !sys::is_dir(parent) {
-            out.push_str(" is not a directory");
+            " is not a directory"
         } else if !sys::access(parent, sys::W_OK) {
-            out.push_str(" is not writable");
+            " is not writable"
         } else if probe::pidfile_creatable_errno_bytes(path, bytes) == libc::EFBIG {
             // The one failure a writable parent does not explain. Naming the
             // limit is the difference between a fixable setting and a mystery.
-            out.push_str(" is writable but RLIMIT_FSIZE is too small for the pidfile");
+            " is writable but RLIMIT_FSIZE is too small for the pidfile"
         } else {
             // The parent is writable, so the failure was the target name
             // itself. NAME_MAX is one cause, not the only one: PATH_MAX, a
             // filesystem quota, or an unreadable target can fail here too.
-            out.push_str(" is writable but the file could not be created");
-            out.push_str(" (the name may exceed NAME_MAX once the temporary");
-            out.push_str(" suffix is added, or the filesystem refused it)");
+            " is writable but the file could not be created (the name may exceed NAME_MAX once the temporary suffix is added, or the filesystem refused it)"
         }
-    }
+    };
+    sys::buf_push_s(&mut out, tail);
     out
 }
 
 /// Refuse to overwrite a pidfile that still records live stubs or cannot be
 /// read. Returns `true` when the pidfile is absent or has zero live rows.
+#[inline(never)]
 fn check_pidfile_inactive(p: &[u8]) -> bool {
     match inject::live_pidfile_rows(p) {
         Some(0) => true,
         Some(_) => {
-            let mut out = Buf::new();
-            out.push_str("psgen: the pidfile ");
-            out.push_bytes(p);
-            out.push_str(" records live processes; stop them first or choose another --pidfile\n");
-            sys::err(out.as_bytes());
+            sys::err_parts(&[
+                b"the pidfile ",
+                p,
+                b" records live processes; stop them first or choose another --pidfile",
+            ]);
             false
         }
         None => {
-            let mut out = Buf::new();
-            out.push_str("psgen: cannot read the existing pidfile ");
-            out.push_bytes(p);
-            out.push_str("; remove it or choose another --pidfile\n");
-            sys::err(out.as_bytes());
+            sys::err_parts(&[
+                b"cannot read the existing pidfile ",
+                p,
+                b"; remove it or choose another --pidfile",
+            ]);
             false
         }
     }
@@ -1814,6 +1857,7 @@ fn check_pidfile_inactive(p: &[u8]) -> bool {
 /// contract, so the default invocation keeps it; an explicit `-p` names a
 /// weighting and therefore selects the counted path, where the profile is
 /// consulted and the first row stays the first in-scope corpus row.
+#[inline(never)]
 fn list_target(args: &Args) -> usize {
     let weighted = args.seen.contains(&"--profile");
     if args.count == 0 && !weighted {
@@ -1850,6 +1894,7 @@ fn lists_count(args: &Args) -> bool {
 /// contribute more than one row. What a caller does need to hear is the case
 /// where even that cannot reach the number, which happens for a family whose
 /// templates all run once and cannot vary (`list -f mail -n 50`).
+#[inline(never)]
 fn shortfall(
     family: Option<u8>,
     got: usize,
@@ -1862,44 +1907,33 @@ fn shortfall(
         return;
     }
     let mut out = Buf::new();
-    out.push_str("psgen: ");
-    out.push_u64(got as u64);
-    out.push_str(if got == 1 { " row" } else { " rows" });
-    out.push_str(" of ");
-    out.push_u64(want as u64);
-    out.push_str(" could be produced");
+    sys::buf_push_s(&mut out, "psgen: ");
+    bp_plural(&mut out, got as u64, " row", " rows");
+    bp_cnt(&mut out, " of ", want as u64, " could be produced");
     match family {
-        Some(f) => {
-            out.push_str(" for family ");
-            out.push_str(corpus::family_name(f));
-        }
-        None => out.push_str(" for this host"),
+        Some(f) => bp_kv_s(&mut out, " for family ", corpus::family_name(f)),
+        None => sys::buf_push_s(&mut out, " for this host"),
     }
     if let Some(r) = reason {
-        out.push_str(": ");
-        out.push_str(r);
+        bp_kv_s(&mut out, ": ", r);
     }
-    // `list` rejects `--repeat-max`, so recommending it there names an option
-    // the same run refuses (issue #9b). `--no-uniq` does not invent new
-    // command lines: it repeats the lines the templates already produced, so
-    // the warning quotes the distinct supply instead of promising padding
-    // that does not exist.
     if list {
-        out.push_str("; a list never repeats a command (");
-        out.push_u64(distinct);
-        out.push_str(if distinct == 1 {
-            " distinct line"
-        } else {
-            " distinct lines"
-        });
-        out.push_str(" can be produced; --no-uniq pads by repeating them). Ask for fewer lines.");
+        sys::buf_push_s(&mut out, "; a list never repeats a command (");
+        bp_plural(&mut out, distinct, " distinct line", " distinct lines");
+        sys::buf_push_s(
+            &mut out,
+            " can be produced; --no-uniq pads by repeating them). Ask for fewer lines.\n",
+        );
     } else {
-        out.push_str(". Use --repeat-max N to allow more repeats, or ask for fewer rows.");
+        sys::buf_push_s(
+            &mut out,
+            ". Use --repeat-max N to allow more repeats, or ask for fewer rows.\n",
+        );
     }
-    out.push(b'\n');
     sys::err(out.as_bytes());
 }
 
+#[inline(never)]
 fn json_escape(out: &mut Buf, s: &[u8]) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     out.push(b'"');
@@ -2018,6 +2052,7 @@ pub const UNKNOWN_ID: u32 = u32::MAX;
 /// The predicate mirrors `spawn()` exactly: a bind-tier row whose template
 /// executable is missing needs a directory even without `--disk`, because the
 /// stub's exe is written there.
+#[inline(never)]
 fn staging_patterns(rows: &[gen::Proc], prep: &inject::Prep, args: &Args) -> Vec<Vec<u8>> {
     let mut out: Vec<Vec<u8>> = Vec::new();
     if prep.tier == inject::ExeTier::Shadow {
@@ -2074,155 +2109,112 @@ fn staging_parents(dirs: &[Vec<u8>]) -> Vec<Vec<u8>> {
 /// `--dry-run --plan`: everything `prepare()` decided, per row.
 #[inline(never)]
 fn print_plan(rows: &[gen::Proc], prep: &inject::Prep, create: &[Vec<u8>], args: &Args) {
+    let on_off = |b: bool| if b { "on" } else { "off" };
+    let yes_no = |b: bool| if b { "yes" } else { "no" };
     let mut out = Buf::new();
-    out.push_str("tier ");
-    out.push_str(prep.tier.name());
-    // `--shadow-dir` is used only by the shadow tier; naming it otherwise
-    // advertised a directory the run never touches.
+    bp_kv_s(&mut out, "tier ", prep.tier.name());
     if prep.tier == inject::ExeTier::Shadow {
         if let Some(d) = &prep.shadow_root {
-            out.push_str(" from ");
-            out.push_bytes(d);
+            bp_kv_b(&mut out, " from ", d);
         }
     }
-    out.push_str("   mem ");
-    out.push_str(if args.mem { "on" } else { "off" });
-    out.push_str(", tty ");
-    // The plan describes the run that would start, so a host without a pty
-    // master says the rows will be detached rather than promising a terminal
-    // the run cannot give them.
-    out.push_str(if !args.tty {
+    let tty_s = if !args.tty {
         "off"
     } else if prep.caps.pty {
         "on"
     } else {
         "unavailable on this host"
-    });
-    out.push_str(", threads ");
-    out.push_str(if args.threads { "on" } else { "off" });
-    out.push_str(", busy ");
-    out.push_str(if args.busy || args.cpu_pct.unwrap_or(0) > 0 {
-        "on"
-    } else {
-        "off"
-    });
-    out.push(b'\n');
+    };
+    bp_kvs_s(
+        &mut out,
+        "   mem |, tty |, threads |, busy ",
+        &[
+            on_off(args.mem),
+            tty_s,
+            on_off(args.threads),
+            on_off(args.busy || args.cpu_pct.unwrap_or(0) > 0),
+        ],
+    );
     let roots = rows.iter().filter(|p| p.parent.is_none()).count();
     let rss: u64 = rows.iter().map(|p| p.rss).sum();
-    out.push_str("plan: ");
-    out.push_u64(rows.len() as u64);
-    out.push_str(if rows.len() == 1 {
-        " stub, "
-    } else {
-        " stubs, "
-    });
-    out.push_u64(roots as u64);
-    out.push_str(if roots == 1 {
-        " root; rss "
-    } else {
-        " roots; rss "
-    });
-    out.push_u64(rss / 1024);
-    out.push_str(" MiB shared");
+    sys::buf_push_s(&mut out, "\nplan: ");
+    bp_plural(&mut out, rows.len() as u64, " stub, ", " stubs, ");
+    bp_plural(&mut out, roots as u64, " root; rss ", " roots; rss ");
+    bp_cnt(&mut out, "", rss / 1024, " MiB shared");
     if args.mem && prep.phys_estimate_kb > 0 {
         let show_kib = phys_uses_kib(prep.phys_estimate_kb, prep.phys_budget_kb);
-        out.push_str(", ~");
-        if show_kib {
-            out.push_u64(prep.phys_estimate_kb);
-            out.push_str(" KiB physical");
-        } else {
-            out.push_u64(prep.phys_estimate_kb / 1024);
-            out.push_str(" MiB physical");
-        }
+        sys::buf_push_s(&mut out, ", ~");
+        bp_mem_unit(&mut out, prep.phys_estimate_kb, show_kib, " physical");
         if prep.phys_budget_kb > 0 {
-            out.push_str(" (budget ");
-            if show_kib {
-                out.push_u64(prep.phys_budget_kb);
-                out.push_str(" KiB)");
-            } else {
-                out.push_u64(prep.phys_budget_kb / 1024);
-                out.push_str(" MiB)");
-            }
+            sys::buf_push_s(&mut out, " (budget ");
+            bp_mem_unit(&mut out, prep.phys_budget_kb, show_kib, ")");
         }
         if prep.phys_scale < 1.0 {
-            out.push_str(", scaled");
+            sys::buf_push_s(&mut out, ", scaled");
         }
     }
     let disk = args.disk_mb.unwrap_or(0).saturating_mul(rows.len() as u64);
     if disk > 0 {
-        out.push_str("; disk ");
-        out.push_u64(disk);
-        out.push_str(" MiB total over ");
-        out.push_u64(rows.len() as u64);
-        out.push_str(" stubs");
+        bp_cnt(&mut out, "; disk ", disk, " MiB total over ");
+        bp_cnt(&mut out, "", rows.len() as u64, " stubs");
     }
     let dirs = staging_patterns(rows, prep, args);
-    out.push_str("; staging ");
-    out.push_u64(dirs.len() as u64);
-    out.push_str(if dirs.len() == 1 {
-        " directory pattern"
-    } else {
-        " directory patterns"
-    });
+    sys::buf_push_s(&mut out, "; staging ");
+    bp_plural(
+        &mut out,
+        dirs.len() as u64,
+        " directory pattern",
+        " directory patterns",
+    );
     let parents = staging_parents(&dirs);
     if !parents.is_empty() {
-        out.push_str(" under ");
+        sys::buf_push_s(&mut out, " under ");
         for (i, p) in parents.iter().enumerate() {
             if i > 0 {
-                out.push_str(", ");
+                sys::buf_push_s(&mut out, ", ");
             }
-            out.push_bytes(p);
+            sys::buf_push_b(&mut out, p);
         }
     }
-    out.push(b'\n');
+    bp_c(&mut out, b'\n');
     for (i, p) in rows.iter().enumerate() {
-        out.push_str("row ");
-        out.push_u64(i as u64);
-        out.push_str(if p.parent.is_none() {
-            " root "
-        } else {
-            " child "
-        });
-        out.push_str("user=");
-        out.push_bytes(&p.user);
-        if create.contains(&p.user) {
-            // The identity the real run would use, reported without making an
-            // account to prove it. The uid is unknown until then.
-            out.push_str(" (would create)");
-        }
-        out.push_str(" vsz=");
-        out.push_u64(p.vsz);
-        out.push_str(" rss=");
-        out.push_u64(p.rss);
-        out.push_str(" cpu=");
-        out.push_tenths_plain(p.cpu);
-        out.push_str(" tty=");
-        out.push_str(
-            if p.flags & corpus::F_TTY != 0 && args.tty && prep.caps.pty {
-                "yes"
+        bp_kv_u(&mut out, "row ", i as u64);
+        bp_kv_b(
+            &mut out,
+            if p.parent.is_none() {
+                " root user="
             } else {
-                "no"
+                " child user="
             },
+            &p.user,
         );
-        out.push_str(" threads=");
-        out.push_str(if p.flags & corpus::F_THREADS != 0 {
-            "yes"
-        } else {
-            "no"
-        });
-        out.push_str(" exe=");
-        let exe = gen::template_exe(&corpus::CORPUS[p.tmpl]);
-        out.push_bytes(&exe);
-        if let Some(par) = p.parent {
-            out.push_str(" parent=");
-            out.push_u64(par as u64);
+        if create.contains(&p.user) {
+            sys::buf_push_s(&mut out, " (would create)");
         }
-        out.push(b'\n');
+        bp_kvs_u(&mut out, " vsz=| rss=", &[p.vsz, p.rss]);
+        sys::buf_push_s(&mut out, " cpu=");
+        out.push_tenths_plain(p.cpu);
+        bp_kvs_s(
+            &mut out,
+            " tty=| threads=",
+            &[
+                yes_no(p.flags & corpus::F_TTY != 0 && args.tty && prep.caps.pty),
+                yes_no(p.flags & corpus::F_THREADS != 0),
+            ],
+        );
+        bp_kv_b(
+            &mut out,
+            " exe=",
+            &gen::template_exe(&corpus::CORPUS[p.tmpl]),
+        );
+        if let Some(par) = p.parent {
+            bp_kv_u(&mut out, " parent=", par as u64);
+        }
+        bp_c(&mut out, b'\n');
     }
     for d in &dirs {
-        out.push_str("staging pattern ");
-        out.push_bytes(d);
-        out.push(b'\n');
+        bp_kv_b(&mut out, "staging pattern ", d);
+        bp_c(&mut out, b'\n');
     }
     sys::out(out.as_bytes());
 }
@@ -2231,123 +2223,104 @@ fn print_plan(rows: &[gen::Proc], prep: &inject::Prep, create: &[Vec<u8>], args:
 #[inline(never)]
 fn print_json_plan(rows: &[gen::Proc], prep: &inject::Prep, create: &[Vec<u8>], args: &Args) {
     let mut out = Buf::new();
-    out.push_str("{\"version\":");
+    sys::buf_push_s(&mut out, "{\"version\":");
     json_escape(&mut out, crate::version::VERSION.as_bytes());
-    out.push_str(",\"tier\":");
-    json_escape(&mut out, prep.tier.name().as_bytes());
-    out.push_str(",\"shadow_root\":");
+    jp_s(&mut out, "tier", prep.tier.name().as_bytes());
+    jp_k(&mut out, "shadow_root");
     match &prep.shadow_root {
         Some(d) if prep.tier == inject::ExeTier::Shadow => json_escape(&mut out, d),
-        _ => out.push_str("null"),
+        _ => sys::buf_push_s(&mut out, "null"),
     }
-    out.push_str(",\"stubs\":");
-    out.push_u64(rows.len() as u64);
-    out.push_str(",\"roots\":");
-    out.push_u64(rows.iter().filter(|p| p.parent.is_none()).count() as u64);
-    out.push_str(",\"mem\":");
-    out.push_str(bool_str(args.mem));
-    out.push_str(",\"tty\":");
-    out.push_str(bool_str(args.tty && prep.caps.pty));
-    out.push_str(",\"threads\":");
-    out.push_str(bool_str(args.threads));
-    out.push_str(",\"busy\":");
-    out.push_str(bool_str(args.busy || args.cpu_pct.unwrap_or(0) > 0));
-    out.push_str(",\"rss_kb\":");
-    out.push_u64(rows.iter().map(|p| p.rss).sum());
-    out.push_str(",\"phys_kb\":");
-    out.push_u64(prep.phys_estimate_kb);
-    out.push_str(",\"budget_kb\":");
-    out.push_u64(prep.phys_budget_kb);
-    out.push_str(",\"phys_scale\":");
-    out.push_u64((prep.phys_scale * 1000.0) as u64);
-    // Two names, because the per-stub and total figures differ by the stub
-    // count and one name cannot say which it is.
-    out.push_str(",\"disk_mb_per_stub\":");
-    out.push_u64(args.disk_mb.unwrap_or(0));
-    out.push_str(",\"disk_mb_total\":");
-    out.push_u64(args.disk_mb.unwrap_or(0).saturating_mul(rows.len() as u64));
+    jp_u64s(
+        &mut out,
+        "stubs,roots",
+        &[
+            rows.len() as u64,
+            rows.iter().filter(|p| p.parent.is_none()).count() as u64,
+        ],
+    );
+    jp_bools(
+        &mut out,
+        "mem,tty,threads,busy",
+        &[
+            args.mem,
+            args.tty && prep.caps.pty,
+            args.threads,
+            args.busy || args.cpu_pct.unwrap_or(0) > 0,
+        ],
+    );
+    let disk_per = args.disk_mb.unwrap_or(0);
+    jp_u64s(
+        &mut out,
+        "rss_kb,phys_kb,budget_kb,phys_scale,disk_mb_per_stub,disk_mb_total",
+        &[
+            rows.iter().map(|p| p.rss).sum(),
+            prep.phys_estimate_kb,
+            prep.phys_budget_kb,
+            (prep.phys_scale * 1000.0) as u64,
+            disk_per,
+            disk_per.saturating_mul(rows.len() as u64),
+        ],
+    );
     let dirs = staging_patterns(rows, prep, args);
-    out.push_str(",\"staging_dirs\":[");
-    for (i, d) in dirs.iter().enumerate() {
-        if i > 0 {
-            out.push(b',');
-        }
-        json_escape(&mut out, d);
-    }
-    out.push_str("],\"would_create\":[");
-    for (i, name) in create.iter().enumerate() {
-        if i > 0 {
-            out.push(b',');
-        }
-        json_escape(&mut out, name);
-    }
-    out.push_str("],\"rows\":[");
+    jp_arr(&mut out, "staging_dirs", &dirs);
+    jp_arr(&mut out, "would_create", create);
+    sys::buf_push_s(&mut out, ",\"rows\":[");
     for (i, p) in rows.iter().enumerate() {
         if i > 0 {
-            out.push(b',');
+            bp_c(&mut out, b',');
         }
-        out.push_str("{\"row\":");
-        out.push_u64(i as u64);
-        out.push_str(",\"role\":");
-        out.push_str(if p.parent.is_none() {
-            "\"root\""
-        } else {
-            "\"child\""
-        });
-        out.push_str(",\"user\":");
-        json_escape(&mut out, &p.user);
-        out.push_str(",\"uid\":");
-        // An account the run would create has no uid yet. `null` says so;
-        // printing 0 claimed the row would run as root.
-        if p.uid == UNKNOWN_ID {
-            out.push_str("null");
-        } else {
-            out.push_u64(p.uid as u64);
-        }
-        out.push_str(",\"gid\":");
-        if p.gid == UNKNOWN_ID {
-            out.push_str("null");
-        } else {
-            out.push_u64(p.gid as u64);
-        }
-        out.push_str(",\"vsz_kb\":");
-        out.push_u64(p.vsz);
-        out.push_str(",\"rss_kb\":");
-        out.push_u64(p.rss);
-        out.push_str(",\"cpu_tenths\":");
-        out.push_u64(p.cpu as u64);
-        out.push_str(",\"tty\":");
-        out.push_str(bool_str(
-            p.flags & corpus::F_TTY != 0 && args.tty && prep.caps.pty,
-        ));
-        out.push_str(",\"threads\":");
-        out.push_str(bool_str(p.flags & corpus::F_THREADS != 0));
-        out.push_str(",\"busy\":");
-        out.push_str(bool_str(p.flags & corpus::F_BUSY != 0));
-        out.push_str(",\"exe\":");
-        json_escape(&mut out, &gen::template_exe(&corpus::CORPUS[p.tmpl]));
-        out.push_str(",\"cmd\":");
-        json_escape(&mut out, &p.cmd);
-        out.push_str(",\"parent\":");
-        match p.parent {
-            Some(par) => out.push_u64(par as u64),
-            None => out.push_str("null"),
-        }
-        out.push(b'}');
+        bp_kv_u(&mut out, "{\"row\":", i as u64);
+        jp_s(
+            &mut out,
+            "role",
+            if p.parent.is_none() {
+                b"root"
+            } else {
+                b"child"
+            },
+        );
+        jp_s(&mut out, "user", &p.user);
+        jp_opt_u(
+            &mut out,
+            "uid",
+            (p.uid != UNKNOWN_ID).then_some(p.uid as u64),
+        );
+        jp_opt_u(
+            &mut out,
+            "gid",
+            (p.gid != UNKNOWN_ID).then_some(p.gid as u64),
+        );
+        jp_u64s(
+            &mut out,
+            "vsz_kb,rss_kb,cpu_tenths",
+            &[p.vsz, p.rss, p.cpu as u64],
+        );
+        jp_bools(
+            &mut out,
+            "tty,threads,busy",
+            &[
+                p.flags & corpus::F_TTY != 0 && args.tty && prep.caps.pty,
+                p.flags & corpus::F_THREADS != 0,
+                p.flags & corpus::F_BUSY != 0,
+            ],
+        );
+        jp_s(&mut out, "exe", &gen::template_exe(&corpus::CORPUS[p.tmpl]));
+        jp_s(&mut out, "cmd", &p.cmd);
+        jp_opt_u(&mut out, "parent", p.parent.map(|par| par as u64));
+        bp_c(&mut out, b'}');
     }
-    out.push_str("]}\n");
+    sys::buf_push_s(&mut out, "]}\n");
     sys::out(out.as_bytes());
 }
 
+#[inline(never)]
 fn err_line(msg: &str) -> i32 {
-    let mut out = Buf::new();
-    out.push_str("psgen: ");
-    out.push_str(msg);
-    out.push(b'\n');
-    sys::err(out.as_bytes());
+    sys::err_parts(&[msg.as_bytes()]);
     1
 }
 
+#[inline(never)]
 fn write_text_output(out_path: Option<&[u8]>, text: &str) -> Result<(), String> {
     let mut bytes = Vec::with_capacity(text.len() + 1);
     bytes.extend_from_slice(text.as_bytes());
@@ -2371,6 +2344,7 @@ fn write_text_output(out_path: Option<&[u8]>, text: &str) -> Result<(), String> 
     }
 }
 
+#[inline(never)]
 fn load_profile_file(path: &[u8], forbidden: &[&str]) -> Result<profile::Profile, String> {
     let p = Path::new(OsStr::from_bytes(path));
     let text = json::read_str(p)?;
@@ -2407,12 +2381,26 @@ fn apply_decoy_overrides(node: &mut inject::DecoyNodeSpec, args: &Args) {
     }
 }
 
+#[inline(never)]
+fn resolve_redact_tokens(args: &Args) -> Result<Vec<String>, String> {
+    let mut out = args.redact_tokens.clone();
+    for f in &args.redact_token_files {
+        for tok in profile::read_redact_tokens_file(f)? {
+            if !out.contains(&tok) {
+                out.push(tok);
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_decoy_trees(
     prof: &profile::Profile,
     count: usize,
     level: u8,
     token_prefix: Option<&str>,
+    use_tokens: bool,
     force_token: bool,
     jitter_ms: u32,
     seed: u64,
@@ -2421,7 +2409,17 @@ fn build_decoy_trees(
     let mut rng = Rng::new(seed ^ 0x9e37_79b9_7f4a_7c15);
     let mut trees = Vec::with_capacity(count);
     for _ in 0..count {
-        let tok = token_prefix.map(|pfx| inject::make_decoy_token(pfx, &mut rng));
+        let tok = if use_tokens {
+            Some(inject::make_shaped_decoy_token(
+                token_prefix,
+                prof.memory.token_len,
+                prof.memory.token_charset.as_deref(),
+                prof.memory.token_sha256.as_deref(),
+                &mut rng,
+            ))
+        } else {
+            None
+        };
         let mut spec = inject::profile_to_decoy_tree(prof, level, tok.as_deref(), jitter_ms);
         if level >= 6 {
             inject::apply_decoy_mem_jitter(&mut spec, &mut rng);
@@ -2439,6 +2437,7 @@ fn build_decoy_trees(
     trees
 }
 
+#[inline(never)]
 fn filter_root_pids(pids: &[i32]) -> Vec<i32> {
     let mut roots = Vec::with_capacity(pids.len());
     for &pid in pids {
@@ -2487,6 +2486,7 @@ impl LiveCleanup {
         Self { pids: Vec::new() }
     }
 
+    #[inline(never)]
     fn extend(&mut self, pids: &[i32]) {
         for &p in pids {
             if p > 1 && !self.pids.contains(&p) {
@@ -2497,6 +2497,7 @@ impl LiveCleanup {
 }
 
 impl Drop for LiveCleanup {
+    #[inline(never)]
     fn drop(&mut self) {
         if self.pids.is_empty() {
             return;
@@ -2557,20 +2558,19 @@ fn acquire_pidfile_lock(p: &[u8]) -> Result<inject::PidfileLock, i32> {
     match inject::lock_pidfile(p) {
         Ok(lock) => Ok(lock),
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-            let mut out = Buf::new();
-            out.push_str("psgen: another psgen run holds the pidfile ");
-            out.push_bytes(p);
-            out.push_str("; wait for it to finish or choose another --pidfile\n");
-            sys::err(out.as_bytes());
+            sys::err_parts(&[
+                b"another psgen run holds the pidfile ",
+                p,
+                b"; wait for it to finish or choose another --pidfile",
+            ]);
             Err(2)
         }
         Err(e) => {
             let mut out = Buf::new();
-            out.push_str("psgen: cannot lock the pidfile ");
-            out.push_bytes(p);
-            out.push_str(": ");
-            out.push_str(&e.to_string());
-            out.push(b'\n');
+            bp_kv_b(&mut out, "psgen: cannot lock the pidfile ", p);
+            sys::buf_push_s(&mut out, ": ");
+            sys::push_io_err(&mut out, &e);
+            bp_c(&mut out, b'\n');
             sys::err(out.as_bytes());
             Err(2)
         }
@@ -2578,8 +2578,32 @@ fn acquire_pidfile_lock(p: &[u8]) -> Result<inject::PidfileLock, i32> {
 }
 
 #[inline(never)]
+fn lock_and_check_pidfile(pidfile: Option<&[u8]>) -> Result<Option<inject::PidfileLock>, i32> {
+    let Some(p) = pidfile else {
+        return Ok(None);
+    };
+    let lock = acquire_pidfile_lock(p)?;
+    if !check_pidfile_inactive(p) {
+        return Err(2);
+    }
+    Ok(Some(lock))
+}
+
+#[inline(never)]
+fn wait_and_cleanup(pids: &[i32], duration: u32) {
+    let mut guard = LiveCleanup::new();
+    guard.extend(pids);
+    sys::nanosleep(duration as u64, 0);
+    drop(guard);
+}
+
+#[inline(never)]
 fn run_profile(args: &Args) -> i32 {
-    let forbidden: Vec<&str> = args.redact_tokens.iter().map(String::as_str).collect();
+    let redact_tokens = match resolve_redact_tokens(args) {
+        Ok(v) => v,
+        Err(e) => return err_line(&e),
+    };
+    let forbidden: Vec<&str> = redact_tokens.iter().map(String::as_str).collect();
     if let Some(ref file) = args.validate_file {
         let prof = match load_profile_file(file, &forbidden) {
             Ok(p) => p,
@@ -2603,6 +2627,7 @@ fn run_profile(args: &Args) -> i32 {
     };
     let mut eopts = profile::ExtractOpts::for_pid(pid);
     eopts.tree = args.tree;
+    eopts.ancestors = !args.no_ancestors;
     eopts.label = args.label.clone();
     eopts.masker = args
         .masker
@@ -2615,7 +2640,7 @@ fn run_profile(args: &Args) -> i32 {
             String::from("single")
         }
     });
-    eopts.redact_tokens = args.redact_tokens.clone();
+    eopts.redact_tokens = redact_tokens.clone();
     eopts.redact_envs = args.redact_envs.clone();
     let prof = match profile::extract_live(&eopts) {
         Ok(p) => p,
@@ -2628,6 +2653,24 @@ fn run_profile(args: &Args) -> i32 {
         return err_line(&e);
     }
     0
+}
+
+#[inline(never)]
+fn capture_auto_profile(
+    pid: i32,
+    redact_tokens: &[String],
+    redact_envs: &[String],
+) -> Result<profile::Profile, String> {
+    let mut eopts = profile::ExtractOpts::for_pid(pid);
+    eopts.tree = true;
+    eopts.ancestors = true;
+    eopts.redact_tokens = redact_tokens.to_vec();
+    eopts.redact_envs = redact_envs.to_vec();
+    let mut prof = profile::extract_live(&eopts)?;
+    harness::strip_self_ancestors(&mut prof);
+    let forbidden: Vec<&str> = redact_tokens.iter().map(String::as_str).collect();
+    prof.validate(&forbidden)?;
+    Ok(prof)
 }
 
 fn spawn_masker_tracked(
@@ -2645,7 +2688,8 @@ fn spawn_masker_tracked(
 
 #[inline(never)]
 fn run_harness_inner(args: &Args) -> Result<String, String> {
-    let mut prof = load_profile_file(&args.profile, &[])?;
+    let redact_tokens = resolve_redact_tokens(args)?;
+    let forbidden: Vec<&str> = redact_tokens.iter().map(String::as_str).collect();
     let out_dir = match &args.out_path {
         Some(p) => PathBuf::from(OsStr::from_bytes(p)),
         None => return Err("run requires --out".to_string()),
@@ -2658,7 +2702,7 @@ fn run_harness_inner(args: &Args) -> Result<String, String> {
     let tok_prefix = args.decoy_token.as_deref().unwrap_or("TOK-");
     let hard_negatives = match &args.hard_negatives {
         Some(v) => v.clone(),
-        None if args.run_mode == harness::Mode::Table => Vec::new(),
+        None if args.run_mode == harness::Mode::Table || args.live => Vec::new(),
         None => harness::HardNeg::all().to_vec(),
     };
 
@@ -2668,11 +2712,43 @@ fn run_harness_inner(args: &Args) -> Result<String, String> {
     );
     let uses_decoys = matches!(
         args.run_control,
-        harness::Control::C02Hidden
+        harness::Control::C01Obvious
+            | harness::Control::C02Hidden
             | harness::Control::C04NoTarget
             | harness::Control::C06Main
             | harness::Control::C07HiddenByMask
     );
+
+    if args.live && wants_target && args.target_cmd.is_none() && args.target_pid.is_none() {
+        return Err(
+            "run --live requires --target-cmd or --target-pid for controls with a target"
+                .to_string(),
+        );
+    }
+
+    let mut prof = if args.seen.contains(&"--profile") {
+        load_profile_file(&args.profile, &forbidden)?
+    } else if let Some(tpid) = args.target_pid {
+        capture_auto_profile(tpid, &redact_tokens, &args.redact_envs)?
+    } else if let Some(ref tcmd) = args.target_cmd {
+        // Brief probe launch to capture the live target's profile before the blind interleaved run.
+        let probe_opts = inject::DecoySpawnOpts {
+            duration: 30,
+            seed: seed ^ 0x7072_6f62_6500_0001,
+            ..inject::DecoySpawnOpts::default()
+        };
+        let mut probe_guard = LiveCleanup::new();
+        let (_, probe_pid, _) = inject::spawn_decoy_trees_interleaved(&[], tcmd, &probe_opts)?;
+        probe_guard.extend(&[probe_pid]);
+        sys::nanosleep(0, 150_000_000);
+        let captured = capture_auto_profile(probe_pid, &redact_tokens, &args.redact_envs);
+        drop(probe_guard);
+        captured?
+    } else {
+        return Err(
+            "run requires --profile (or --live with --target-cmd/--target-pid)".to_string(),
+        );
+    };
 
     let mut cleanup = LiveCleanup::new();
     let mut live_target_pids: Vec<i32> = Vec::new();
@@ -2686,6 +2762,12 @@ fn run_harness_inner(args: &Args) -> Result<String, String> {
             args.jitter_ms
         };
 
+    if args.target_cmd.is_none() {
+        if let Some(tpid) = args.target_pid {
+            live_target_pids.push(tpid);
+        }
+    }
+
     if let Some(ref mcmd) = args.masker_cmd {
         let mut spawn_m =
             |cmd: &str, n: usize, s: u64, tok: Option<&str>| -> Result<Vec<i32>, String> {
@@ -2696,7 +2778,14 @@ fn run_harness_inner(args: &Args) -> Result<String, String> {
             };
         let mut all_d = Vec::new();
         if let Some(tcmd) = args.target_cmd.as_deref().filter(|_| wants_target) {
-            let pre_n = decoy_n / 2;
+            let pre_n = if decoy_n <= 1 {
+                0
+            } else {
+                let mut r = Rng::new(seed ^ 0x94d0_49bb_1331_11eb);
+                let lo = (decoy_n / 5).max(1) as u64;
+                let hi = ((decoy_n * 4) / 5).max(lo as usize).min(decoy_n - 1) as u64;
+                r.range(lo, hi) as usize
+            };
             all_d.extend(spawn_m(mcmd, pre_n, seed, Some(tok_prefix))?);
             live_target_pids = spawn_m(tcmd, 1, seed ^ 1, None)?;
             all_d.extend(spawn_m(
@@ -2706,11 +2795,6 @@ fn run_harness_inner(args: &Args) -> Result<String, String> {
                 Some(tok_prefix),
             )?);
         } else {
-            if args.target_cmd.is_none() {
-                if let Some(tpid) = args.target_pid {
-                    live_target_pids.push(tpid);
-                }
-            }
             all_d = spawn_m(mcmd, decoy_n, seed, Some(tok_prefix))?;
         }
         if !all_d.is_empty() || !live_target_pids.is_empty() {
@@ -2720,12 +2804,13 @@ fn run_harness_inner(args: &Args) -> Result<String, String> {
         synthetic_decoys = 0;
     } else {
         let trees = if args.live && decoy_n > 0 {
-            let tp = (args.run_level >= 5).then_some(tok_prefix);
+            let use_tokens = args.run_level >= 5 || args.decoy_token.is_some();
             build_decoy_trees(
                 &prof,
                 decoy_n,
                 args.run_level,
-                tp,
+                args.decoy_token.as_deref(),
+                use_tokens,
                 false,
                 eff_jitter,
                 seed,
@@ -2736,19 +2821,15 @@ fn run_harness_inner(args: &Args) -> Result<String, String> {
         };
         let spawn_opts = inject::DecoySpawnOpts {
             duration: 300,
-            pidfile: None,
-            clean_env: true,
             jitter_ms: eff_jitter,
             churn: args.churn,
             seed,
-            quiet: true,
-            wait: false,
-            bind_exe: false,
+            bind_exe: !args.no_exe && !args.no_root,
+            ..inject::DecoySpawnOpts::default()
         };
         if let Some(tcmd) = args.target_cmd.as_ref().filter(|_| wants_target) {
-            let mid = trees.len() / 2;
             let (mut pre, tgt, suf) =
-                inject::spawn_interleaved_target(&trees[..mid], tcmd, &trees[mid..], &spawn_opts)?;
+                inject::spawn_decoy_trees_interleaved(&trees, tcmd, &spawn_opts)?;
             cleanup.extend(&pre);
             cleanup.extend(&[tgt]);
             cleanup.extend(&suf);
@@ -2756,17 +2837,10 @@ fn run_harness_inner(args: &Args) -> Result<String, String> {
             live_target_pids.push(tgt);
             pre.extend_from_slice(&suf);
             live_decoy_pids = filter_root_pids(&pre);
-        } else {
-            if args.target_cmd.is_none() {
-                if let Some(tpid) = args.target_pid {
-                    live_target_pids.push(tpid);
-                }
-            }
-            if !trees.is_empty() {
-                let decs = inject::spawn_decoy_trees(&trees, &spawn_opts)?;
-                cleanup.extend(&decs);
-                live_decoy_pids = filter_root_pids(&decs);
-            }
+        } else if !trees.is_empty() {
+            let decs = inject::spawn_decoy_trees(&trees, &spawn_opts)?;
+            cleanup.extend(&decs);
+            live_decoy_pids = filter_root_pids(&decs);
         }
         if args.live {
             synthetic_decoys = 0;
@@ -2789,6 +2863,9 @@ fn run_harness_inner(args: &Args) -> Result<String, String> {
         live_target_pids,
         live_decoy_pids,
         decoy_token_prefix: tok_prefix.to_string(),
+        redact_tokens,
+        redact_envs: args.redact_envs.clone(),
+        live_mode: args.live,
     };
 
     let res = harness::build_run(&run_opts);
@@ -2797,17 +2874,26 @@ fn run_harness_inner(args: &Args) -> Result<String, String> {
 
     let mut w = json::Jw::new(false);
     w.obj_open();
-    w.k_str("run_id", &res.run_id);
-    w.k_str("out_dir", &res.out_dir.to_string_lossy());
-    match res.blind_dir {
-        Some(ref b) => w.k_str("blind_dir", &b.to_string_lossy()),
-        None => w.k_null("blind_dir"),
-    }
+    w.k_strs(
+        "run_id,out_dir",
+        &[&res.run_id, &res.out_dir.to_string_lossy()],
+    );
+    w.k_opt_str(
+        "blind_dir",
+        &res.blind_dir
+            .as_ref()
+            .map(|b| b.to_string_lossy().into_owned()),
+    );
     w.k_i32_arr("target_pids", &res.target_pids);
-    w.k_i64("decoy_count", res.decoy_count as i64);
-    w.k_i64("hn_count", res.hn_count as i64);
-    w.k_i64("total_rows", res.total_rows as i64);
-    w.k_i64("manifest_files", res.manifest_files as i64);
+    w.k_i64s(
+        "decoy_count,hn_count,total_rows,manifest_files",
+        &[
+            res.decoy_count as i64,
+            res.hn_count as i64,
+            res.total_rows as i64,
+            res.manifest_files as i64,
+        ],
+    );
     w.obj_close();
     Ok(w.finish())
 }
@@ -2846,9 +2932,22 @@ fn run_verify(args: &Args) -> i32 {
     let Some(ref rd) = args.run_dir else {
         return err_line("verify requires <run-dir>");
     };
+    let redact_tokens = match resolve_redact_tokens(args) {
+        Ok(v) => v,
+        Err(e) => return err_line(&e),
+    };
     let pick_path = args.pick.as_deref().map(Path::new);
-    let forbidden: Vec<&str> = args.redact_tokens.iter().map(String::as_str).collect();
-    let ver = match score::verify_run(Path::new(OsStr::from_bytes(rd)), pick_path, &forbidden) {
+    let blind_dir = args
+        .blind_dir
+        .as_deref()
+        .map(|p| Path::new(OsStr::from_bytes(p)));
+    let forbidden: Vec<&str> = redact_tokens.iter().map(String::as_str).collect();
+    let ver = match score::verify_run_with_blind(
+        Path::new(OsStr::from_bytes(rd)),
+        pick_path,
+        blind_dir,
+        &forbidden,
+    ) {
         Ok(v) => v,
         Err(e) => return err_line(&e),
     };
@@ -2875,15 +2974,86 @@ fn run_selftest(args: &Args) -> i32 {
 }
 
 #[inline(never)]
-fn run_inject_decoy(args: &Args) -> i32 {
-    if args.count > 500 {
-        sys::err(b"psgen: inject count capped at 500\n");
+fn append_pidfile_rows(path: &[u8], pids: &[i32]) -> bool {
+    if pids.is_empty() {
+        return true;
     }
-    let count = if args.count == 0 {
-        1
-    } else {
-        args.count.min(500)
+    let p = Path::new(OsStr::from_bytes(path));
+    if !p.exists() {
+        return inject::write_external_pidfile(path, pids);
+    }
+    let Ok(mut body) = std::fs::read(p) else {
+        return false;
     };
+    if !body.is_empty() && !body.ends_with(b"\n") {
+        body.push(b'\n');
+    }
+    let mut line = Buf::new();
+    for &pid in pids {
+        line.v.clear();
+        sys::buf_push_u(&mut line, pid as u64);
+        if let Some(st) = live::read_starttime(pid) {
+            bp_kv_u(&mut line, "\t", st);
+            if let Some(comm) = live::read_comm(pid) {
+                bp_kv_b(&mut line, "\t", &comm);
+            }
+        }
+        bp_c(&mut line, b'\n');
+        body.extend_from_slice(line.as_bytes());
+    }
+    std::fs::write(p, &body).is_ok()
+}
+
+#[inline(never)]
+fn rng_for(seed: Option<u64>) -> Rng {
+    match seed {
+        Some(s) => Rng::new(s),
+        None => Rng::from_entropy(),
+    }
+}
+
+#[inline(never)]
+fn check_cap(count: usize, cap: usize, def: usize, label: &str) -> usize {
+    if count > cap {
+        let mut out = Buf::new();
+        bp_kv_s(&mut out, "psgen: ", label);
+        bp_cnt(&mut out, " count capped at ", cap as u64, "\n");
+        sys::err(out.as_bytes());
+    }
+    if count == 0 {
+        def
+    } else {
+        count.min(cap)
+    }
+}
+
+#[inline(never)]
+fn check_shortfall(args: &Args, got: usize, want: usize, list: bool, reason: Option<&str>) {
+    shortfall(
+        args.family,
+        got,
+        want,
+        list,
+        reason,
+        gen::distinct_supply(
+            args.family,
+            &corpus::profile_weights(&args.profile),
+            args.seen.contains(&"--profile"),
+        ),
+    );
+}
+
+fn cleanup_pending(pending: bool, pidfile: Option<&[u8]>) {
+    if pending {
+        if let Some(p) = pidfile {
+            rm_bytes(p);
+        }
+    }
+}
+
+#[inline(never)]
+fn run_inject_decoy(args: &Args) -> i32 {
+    let count = check_cap(args.count, 500, 1, "inject");
     let seed = args.seed.unwrap_or(1234);
 
     if let Some(ref p) = args.pidfile {
@@ -2891,18 +3061,10 @@ fn run_inject_decoy(args: &Args) -> i32 {
             return 2;
         }
     }
-    let _pidfile_lock = match &args.pidfile {
-        Some(p) => match acquire_pidfile_lock(p) {
-            Ok(lock) => Some(lock),
-            Err(code) => return code,
-        },
-        None => None,
+    let _pidfile_lock = match lock_and_check_pidfile(args.pidfile.as_deref()) {
+        Ok(lock) => lock,
+        Err(code) => return code,
     };
-    if let Some(ref p) = args.pidfile {
-        if !check_pidfile_inactive(p) {
-            return 2;
-        }
-    }
 
     let pids = if let Some(ref prof_path) = args.from_profile {
         let prof = match load_profile_file(prof_path, &[]) {
@@ -2910,16 +3072,13 @@ fn run_inject_decoy(args: &Args) -> i32 {
             Err(e) => return err_line(&e),
         };
         let level = args.decoy_level.unwrap_or(5);
-        let tok_prefix = if args.decoy_token.is_some() || level >= 5 {
-            Some(args.decoy_token.as_deref().unwrap_or("TOK-"))
-        } else {
-            None
-        };
+        let use_tokens = args.decoy_token.is_some() || level >= 5;
         let trees = build_decoy_trees(
             &prof,
             count,
             level,
-            tok_prefix,
+            args.decoy_token.as_deref(),
+            use_tokens,
             args.decoy_token.is_some(),
             args.jitter_ms,
             seed,
@@ -2928,18 +3087,55 @@ fn run_inject_decoy(args: &Args) -> i32 {
         let opts = inject::DecoySpawnOpts {
             duration: args.duration,
             pidfile: args.pidfile.clone(),
-            clean_env: args.clean_env,
+            clean_env: !args.no_clean_env,
             jitter_ms: args.jitter_ms,
             churn: args.churn,
             seed,
             quiet: args.quiet,
-            wait: args.wait,
-            bind_exe: args.seen.contains(&"--exe") && !args.no_exe && !args.no_root,
+            wait: args.wait && args.label_decoys == 0 && args.interleave_cmd.is_none(),
+            bind_exe: !args.no_exe && !args.no_root,
+            same_session: args.same_session,
+            label_decoys: args.label_decoys,
+            interleave_cmd: args.interleave_cmd.clone(),
         };
-        match inject::spawn_decoy_trees(&trees, &opts) {
-            Ok(v) => v,
-            Err(e) => return err_line(&e),
+        let mut spawned = if let Some(ref icmd) = opts.interleave_cmd {
+            match inject::spawn_decoy_trees_interleaved(&trees, icmd, &opts) {
+                Ok((mut pre, _tgt, suf)) => {
+                    pre.extend_from_slice(&suf);
+                    pre
+                }
+                Err(e) => return err_line(&e),
+            }
+        } else {
+            match inject::spawn_decoy_trees(&trees, &opts) {
+                Ok(v) => v,
+                Err(e) => return err_line(&e),
+            }
+        };
+        if opts.label_decoys > 0 {
+            let lbl_pids = match inject::spawn_label_decoys(
+                &prof.identity.label,
+                &prof.identity.comm,
+                opts.label_decoys,
+                &opts,
+            ) {
+                Ok(v) => v,
+                Err(e) => return err_line(&e),
+            };
+            if let Some(ref pf) = args.pidfile {
+                if !append_pidfile_rows(pf, &lbl_pids) && !args.quiet {
+                    sys::err(b"psgen: cannot append label decoys to pidfile\n");
+                }
+            }
+            spawned.extend_from_slice(&lbl_pids);
         }
+        if args.wait
+            && args.duration > 0
+            && (args.label_decoys > 0 || args.interleave_cmd.is_some())
+        {
+            wait_and_cleanup(&spawned, args.duration);
+        }
+        spawned
     } else if let Some(ref mcmd) = args.masker_cmd {
         let spawned = match inject::spawn_masker_decoys(
             mcmd,
@@ -2960,10 +3156,7 @@ fn run_inject_decoy(args: &Args) -> i32 {
             }
         }
         if args.wait && args.duration > 0 && !spawned.is_empty() {
-            let mut guard = LiveCleanup::new();
-            guard.extend(&spawned);
-            sys::nanosleep(args.duration as u64, 0);
-            drop(guard);
+            wait_and_cleanup(&spawned, args.duration);
         }
         spawned
     } else {
@@ -2976,14 +3169,11 @@ fn run_inject_decoy(args: &Args) -> i32 {
 
     if !args.quiet {
         let mut out = Buf::new();
-        out.push_str("spawned ");
-        out.push_u64(pids.len() as u64);
-        out.push_str(" processes");
+        bp_cnt(&mut out, "spawned ", pids.len() as u64, " processes");
         if let Some(ref path) = args.pidfile {
-            out.push_str(", pids in ");
-            out.push_bytes(path);
+            bp_kv_b(&mut out, ", pids in ", path);
         }
-        out.push(b'\n');
+        bp_c(&mut out, b'\n');
         if args.table {
             sys::err(out.as_bytes());
         } else {
@@ -2997,6 +3187,428 @@ fn run_inject_decoy(args: &Args) -> i32 {
     0
 }
 
+#[inline(never)]
+fn run_corpus() -> i32 {
+    let mut out = Buf::new();
+    for t in corpus::CORPUS.iter() {
+        sys::buf_push_s(&mut out, corpus::family_name(t.fam));
+        bp_kv_s(&mut out, "\t", t.user);
+        bp_kv_u(&mut out, "\t", t.vsz as u64);
+        bp_kv_u(&mut out, "\t", t.rss as u64);
+        bp_kv_s(&mut out, "\t", t.cmd);
+        bp_c(&mut out, b'\n');
+    }
+    sys::out(out.as_bytes());
+    0
+}
+
+#[inline(never)]
+fn run_check(args: &Args) -> i32 {
+    let mut rng = Rng::new(args.seed.unwrap_or(1));
+    let opts = make_gen_opts(
+        args,
+        0,
+        args.seed.unwrap_or(1),
+        b"deploy".to_vec(),
+        None,
+        None,
+    );
+    check::run(&mut rng, &opts, args.binaries, args.require_binaries)
+}
+
+#[inline(never)]
+fn run_unit(args: &Args) -> i32 {
+    let count = check_cap(args.count, 500, 24, "unit");
+    let pidfile = args
+        .pidfile
+        .clone()
+        .unwrap_or_else(|| b"/run/psgen/psgen.pid".to_vec());
+    let out = unit::render(count, args.seed.unwrap_or(7), &pidfile, args);
+    sys::out(out.as_bytes());
+    0
+}
+
+#[inline(never)]
+fn run_stop(args: &Args) -> i32 {
+    let path = match &args.pidfile {
+        Some(p) => p,
+        None => {
+            sys::err(b"psgen: stop needs --pidfile\n");
+            return 2;
+        }
+    };
+    inject::stop(path, args.force, args.plan, args.quiet)
+}
+
+#[inline(never)]
+fn run_list(args: &Args) -> i32 {
+    let _ = check_cap(args.count, 2000, 0, "list");
+    let mut rng = rng_for(args.seed);
+    let opts = make_gen_opts(
+        args,
+        list_target(args),
+        args.seed.unwrap_or(0),
+        util::current_user().name,
+        args.repeat_max,
+        args.host_uptime,
+    );
+    let mut cmds = gen::gen_list(&mut rng, &opts);
+    if lists_count(args) {
+        let want = if args.count == 0 {
+            list_target(args)
+        } else {
+            args.count.min(2000)
+        };
+        check_shortfall(args, cmds.len(), want, true, None);
+    }
+    if args.sort {
+        json::shell_sort_by(&mut cmds, |a, b| a > b);
+    }
+    let mut out = Buf::with_capacity(cmds.len() * 96);
+    for c in &cmds {
+        sys::buf_push_b(&mut out, c);
+        bp_c(&mut out, b'\n');
+    }
+    sys::out(out.as_bytes());
+    0
+}
+
+#[inline(never)]
+fn run_table(args: &Args) -> i32 {
+    let want = check_cap(args.count, 5000, if args.live { 0 } else { 30 }, "table");
+    if args.live {
+        let mut rows = live::read_all();
+        if want > 0 && rows.len() > want {
+            rows.truncate(want);
+        }
+        let out = table::render(
+            &rows,
+            live::mem_total_kb(),
+            &table::Clock::live(sys::now_secs()),
+            sys::page_kb(),
+        );
+        sys::out(out.as_bytes());
+        return 0;
+    }
+    let mut rng = rng_for(args.seed);
+    let opts = make_gen_opts(
+        args,
+        want,
+        args.seed.unwrap_or(0),
+        util::current_user().name,
+        args.repeat_max,
+        args.host_uptime,
+    );
+    let fit = gen::Fit::target(args.host_mem_mb, args.host_pid_max);
+    let rows = gen::gen_table(&mut rng, &opts, &fit);
+    let has_init = rows.iter().any(|r| r.pid == 1);
+    check_shortfall(
+        args,
+        rows.len(),
+        want,
+        false,
+        fit.shortfall_reason_for(rows.len(), want, has_init)
+            .as_deref(),
+    );
+    let mem_kb = match args.host_mem_mb {
+        Some(mb) => mb.saturating_mul(1024),
+        None => table::mem_budget_kb(),
+    };
+    let out = table::render(
+        &rows,
+        mem_kb,
+        &synthetic_clock(args, sys::now_secs()),
+        sys::page_kb(),
+    );
+    sys::out(out.as_bytes());
+    0
+}
+
+#[inline(never)]
+fn run_inject_corpus(args: &Args) -> i32 {
+    if args.from_profile.is_some() || args.masker_cmd.is_some() {
+        return run_inject_decoy(args);
+    }
+    let want = check_cap(args.count, 500, 12, "inject");
+    let me = users::current();
+    let mut rng = rng_for(args.seed);
+    let opts = make_gen_opts(
+        args,
+        want,
+        args.seed.unwrap_or(0),
+        me.name,
+        args.repeat_max,
+        args.host_uptime,
+    );
+    let mut rows = gen::gen_inject(&mut rng, &opts, &gen::Fit::none());
+
+    if args.dry_run {
+        if let Some(p) = &args.pidfile {
+            if inject::pidfile_lock_held(p) {
+                sys::err_parts(&[
+                    b"another psgen run holds the pidfile ",
+                    p,
+                    b"; wait for it to finish or choose another --pidfile",
+                ]);
+                return 2;
+            }
+        }
+    }
+
+    let mut blockers = 0usize;
+    let tmpdir = std::env::temp_dir();
+    let tmpdir_b = tmpdir.as_os_str().as_bytes();
+    let tmpdir_len = tmpdir_b.len();
+    let mut probed_bytes = 0usize;
+    if let Some(p) = &args.pidfile {
+        let init_temps = if args.disk_mb.unwrap_or(0) > 0 {
+            rows.len()
+        } else {
+            0
+        };
+        let need_bytes = inject::estimated_pidfile_bytes(rows.len(), init_temps, tmpdir_len);
+        probed_bytes = need_bytes;
+        if !probe::pidfile_creatable_bytes(p, need_bytes) {
+            let mut out = pidfile_error_bytes(p, need_bytes);
+            for cand in [
+                tmpdir.join("psgen-pids.txt"),
+                PathBuf::from("psgen-pids.txt"),
+            ] {
+                let b = cand.as_os_str().as_bytes();
+                if probe::pidfile_creatable_bytes(b, need_bytes) {
+                    bp_kv_b(&mut out, "; use ", b);
+                    sys::buf_push_s(&mut out, " instead");
+                    break;
+                }
+            }
+            bp_c(&mut out, b'\n');
+            sys::err(out.as_bytes());
+            blockers += 1;
+        }
+    }
+    check_shortfall(
+        args,
+        rows.len(),
+        want,
+        false,
+        gen::Fit::none()
+            .shortfall_reason_for(rows.len(), want, false)
+            .as_deref(),
+    );
+
+    if let Some(mb) = args.disk_mb {
+        if mb > 0 {
+            if let Some(limit) = sys::rlimit_fsize() {
+                if mb.saturating_mul(1024 * 1024) > limit {
+                    let mut out = Buf::new();
+                    bp_cnt(
+                        &mut out,
+                        "psgen: --disk ",
+                        mb,
+                        " MiB exceeds RLIMIT_FSIZE (",
+                    );
+                    bp_cnt(&mut out, "", limit / 1024 / 1024, " MiB)\n");
+                    sys::err(out.as_bytes());
+                    blockers += 1;
+                }
+            }
+            let total_mb = mb.saturating_mul(rows.len() as u64);
+            if let Some((free, _)) = probe::space(tmpdir_b) {
+                if total_mb.saturating_mul(1024 * 1024) > free.saturating_sub(free / 10) {
+                    let mut out = Buf::new();
+                    bp_cnt(&mut out, "psgen: --disk ", mb, " MiB x ");
+                    bp_cnt(&mut out, "", rows.len() as u64, " rows needs ");
+                    bp_cnt(&mut out, "", total_mb, " MiB, more than the free space in ");
+                    sys::buf_push_b(&mut out, tmpdir_b);
+                    bp_cnt(&mut out, " (", free / 1024 / 1024, " MiB)\n");
+                    sys::err(out.as_bytes());
+                    blockers += 1;
+                }
+            }
+        }
+    }
+    if blockers > 0 {
+        return 2;
+    }
+
+    if let Some(p) = &args.pidfile {
+        if !check_pidfile_inactive(p) {
+            return 2;
+        }
+    }
+
+    let prep = inject::prepare(&mut rows, args, args.create_users && !args.dry_run);
+
+    if let Some(p) = &args.pidfile {
+        let temps_est = staging_patterns(&rows, &prep, args).len();
+        let dir_len = prep
+            .shadow_root
+            .as_deref()
+            .map_or(tmpdir_len, |s| tmpdir_len.max(s.len()));
+        let need_bytes = inject::estimated_pidfile_bytes(rows.len(), temps_est, dir_len);
+        if need_bytes > probed_bytes && !probe::pidfile_creatable_bytes(p, need_bytes) {
+            let mut out = pidfile_error_bytes(p, need_bytes);
+            bp_c(&mut out, b'\n');
+            sys::err(out.as_bytes());
+            return 2;
+        }
+    }
+
+    if args.dry_run {
+        let create = would_create(&mut rows, args);
+        for name in &create {
+            sys::err_parts(&[b"would create ", name]);
+        }
+        if args.json {
+            print_json_plan(&rows, &prep, &create, args);
+        } else if args.plan {
+            print_plan(&rows, &prep, &create, args);
+        } else {
+            let mut out = Buf::new();
+            for p in &rows {
+                sys::buf_push_b(&mut out, &p.user);
+                bp_kv_b(&mut out, "\t", &p.cmd);
+                bp_c(&mut out, b'\n');
+            }
+            sys::out(out.as_bytes());
+        }
+        print_notes(&prep, args);
+        return 0;
+    }
+
+    let _pidfile_lock = match lock_and_check_pidfile(args.pidfile.as_deref()) {
+        Ok(lock) => lock,
+        Err(code) => return code,
+    };
+
+    let pruned = inject::prune_staging(&prep);
+    if pruned > 0 {
+        let mut out = Buf::new();
+        bp_cnt(
+            &mut out,
+            "psgen: pruned ",
+            pruned as u64,
+            " staging directories from earlier runs\n",
+        );
+        sys::err(out.as_bytes());
+    }
+
+    let mut pending_written = false;
+    if let Some(p) = &args.pidfile {
+        pending_written = inject::write_pending_pidfile(p);
+        if !pending_written {
+            let mut out = pidfile_error(p);
+            sys::buf_push_s(
+                &mut out,
+                " (the pidfile could not be written before spawning)\n",
+            );
+            sys::err(out.as_bytes());
+            return 2;
+        }
+    }
+
+    print_notes(&prep, args);
+    let result = match inject::spawn(&rows, args, &prep) {
+        Ok(r) => r,
+        Err(e) => {
+            cleanup_pending(pending_written, args.pidfile.as_deref());
+            return err_line(&e);
+        }
+    };
+    print_summary(&prep, &result, args);
+
+    if result.pids.is_empty() {
+        cleanup_pending(pending_written, args.pidfile.as_deref());
+        return err_line("no processes were spawned");
+    }
+    let pidfile_failed = !result.pidfile_ok;
+    if pidfile_failed {
+        let mut out = Buf::new();
+        sys::buf_push_s(
+            &mut out,
+            "psgen: the pidfile was not written; spawned PIDs:",
+        );
+        for pid in &result.pids {
+            bp_kv_u(&mut out, " ", *pid as u64);
+        }
+        bp_c(&mut out, b'\n');
+        for t in &result.temps {
+            bp_kv_b(&mut out, "psgen: temp dir ", t.as_os_str().as_bytes());
+            bp_c(&mut out, b'\n');
+        }
+        if let Some(p) = &args.pidfile {
+            rm_bytes(p);
+            if !result.pids.is_empty() {
+                if let Some(sidecar) =
+                    inject::write_pid_sidecar(p, &result.pids, &result.temps, &result.nonce)
+                {
+                    bp_kv_b(&mut out, "psgen: the spawned rows are in ", &sidecar);
+                    bp_kv_b(
+                        &mut out,
+                        "; stop them with: psgen stop --pidfile ",
+                        &sidecar,
+                    );
+                    bp_c(&mut out, b'\n');
+                }
+            }
+        }
+        sys::err(out.as_bytes());
+    }
+    let mut code = 0;
+    if result.failed > 0 || result.missing > 0 || !result.mismatches.is_empty() || pidfile_failed {
+        code = 1;
+    }
+
+    if args.table {
+        render_live_table(&result.pids);
+    }
+
+    if args.wait && args.duration > 0 {
+        sys::nanosleep(args.duration as u64, 0);
+        let same = |pid: i32, start: u64, comm: &[u8]| {
+            live::read_starttime(pid) == Some(start)
+                && (comm.is_empty() || live::read_comm(pid).as_deref() == Some(comm))
+        };
+        for (pid, start) in &result.roots {
+            if live::read_starttime(*pid) == Some(*start) {
+                sys::kill(-*pid, sys::SIGKILL);
+            }
+        }
+        for (pid, start, comm) in &result.ident {
+            let pfd = sys::pidfd_open(*pid);
+            if pfd >= 0 {
+                if same(*pid, *start, comm)
+                    && !sys::pidfd_send_signal(pfd, sys::SIGKILL)
+                    && same(*pid, *start, comm)
+                {
+                    sys::kill(*pid, sys::SIGKILL);
+                }
+                sys::close(pfd);
+            } else if same(*pid, *start, comm) {
+                sys::kill(*pid, sys::SIGKILL);
+            }
+        }
+        for _ in 0..200 {
+            let mut status = 0;
+            while sys::waitpid_nohang(-1, &mut status) > 0 {}
+            if !result.pids.iter().any(|pid| live::alive(*pid)) {
+                break;
+            }
+            sys::nanosleep(0, 10_000_000);
+        }
+        for t in &result.temps {
+            if !inject::staging_busy(t) {
+                let _ = std::fs::remove_dir_all(t);
+            }
+        }
+    }
+    if pidfile_failed {
+        1
+    } else {
+        code
+    }
+}
+
 pub fn run() -> i32 {
     let argv: Vec<Vec<u8>> = std::env::args_os().map(|s| s.as_bytes().to_vec()).collect();
     if argv.is_empty() {
@@ -3006,11 +3618,10 @@ pub fn run() -> i32 {
     let args = match parse(&argv) {
         Ok(a) => a,
         Err(msg) => {
-            let mut out = Buf::new();
-            out.push_str("psgen: ");
-            out.push_str(msg.as_str());
-            out.push_str("\n(psgen --help for the full option list)\n");
-            sys::err(out.as_bytes());
+            sys::err_parts(&[
+                msg.as_str().as_bytes(),
+                b"\n(psgen --help for the full option list)",
+            ]);
             return 2;
         }
     };
@@ -3048,581 +3659,13 @@ pub fn run() -> i32 {
         Sub::Replay => run_score_or_replay(&args, true),
         Sub::Verify => run_verify(&args),
         Sub::Selftest => run_selftest(&args),
-        Sub::Corpus => {
-            let mut out = Buf::new();
-            for t in corpus::CORPUS.iter() {
-                out.push_bytes(corpus::family_name(t.fam).as_bytes());
-                out.push(b'\t');
-                out.push_bytes(t.user.as_bytes());
-                out.push(b'\t');
-                out.push_u64(t.vsz as u64);
-                out.push(b'\t');
-                out.push_u64(t.rss as u64);
-                out.push(b'\t');
-                out.push_bytes(t.cmd.as_bytes());
-                out.push(b'\n');
-            }
-            sys::out(out.as_bytes());
-            0
-        }
-        Sub::Check => {
-            let mut rng = Rng::new(args.seed.unwrap_or(1));
-            let opts = make_gen_opts(
-                &args,
-                0,
-                args.seed.unwrap_or(1),
-                b"deploy".to_vec(),
-                None,
-                None,
-            );
-            check::run(&mut rng, &opts, args.binaries, args.require_binaries)
-        }
-        Sub::Unit => {
-            let count = if args.count == 0 {
-                24
-            } else {
-                args.count.min(500)
-            };
-            if args.count > 500 {
-                sys::err(b"psgen: unit count capped at 500\n");
-            }
-            let pidfile = args
-                .pidfile
-                .clone()
-                .unwrap_or_else(|| b"/run/psgen/psgen.pid".to_vec());
-            let out = unit::render(count, args.seed.unwrap_or(7), &pidfile, &args);
-            sys::out(out.as_bytes());
-            0
-        }
-        Sub::Stop => {
-            let path = match &args.pidfile {
-                Some(p) => p,
-                None => {
-                    sys::err(b"psgen: stop needs --pidfile\n");
-                    return 2;
-                }
-            };
-            inject::stop(path, args.force, args.plan, args.quiet)
-        }
-        Sub::List => {
-            if args.count > 2000 {
-                sys::err(b"psgen: list count capped at 2000\n");
-            }
-            let mut rng = match args.seed {
-                Some(s) => Rng::new(s),
-                None => Rng::from_entropy(),
-            };
-            let opts = make_gen_opts(
-                &args,
-                list_target(&args),
-                args.seed.unwrap_or(0),
-                util::current_user().name,
-                args.repeat_max,
-                args.host_uptime,
-            );
-            let mut cmds = gen::gen_list(&mut rng, &opts);
-            if lists_count(&args) {
-                let want = if args.count == 0 {
-                    list_target(&args)
-                } else {
-                    args.count.min(2000)
-                };
-                shortfall(
-                    args.family,
-                    cmds.len(),
-                    want,
-                    true,
-                    None,
-                    gen::distinct_supply(
-                        args.family,
-                        &corpus::profile_weights(&args.profile),
-                        args.seen.contains(&"--profile"),
-                    ),
-                );
-            }
-            if args.sort {
-                json::shell_sort_by(&mut cmds, |a, b| a > b);
-            }
-            let mut out = Buf::with_capacity(cmds.len() * 96);
-            for c in &cmds {
-                out.push_bytes(c);
-                out.push(b'\n');
-            }
-            sys::out(out.as_bytes());
-            0
-        }
-        Sub::Table => {
-            if args.count > 5000 {
-                sys::err(b"psgen: table count capped at 5000\n");
-            }
-            if args.live {
-                let mut rows = live::read_all();
-                let limit = args.count.min(5000);
-                if limit > 0 && rows.len() > limit {
-                    rows.truncate(limit);
-                }
-                // The live table is `ps aux` for this host, so it uses the
-                // host's own zone and `ps`'s own denominator. Both are supplied
-                // by one function each, so no caller can pick a different one.
-                let out = table::render(
-                    &rows,
-                    live::mem_total_kb(),
-                    &table::Clock::live(sys::now_secs()),
-                    sys::page_kb(),
-                );
-                sys::out(out.as_bytes());
-                return 0;
-            }
-            let mut rng = match args.seed {
-                Some(s) => Rng::new(s),
-                None => Rng::from_entropy(),
-            };
-            let want = if args.count == 0 {
-                30
-            } else {
-                args.count.min(5000)
-            };
-            let opts = make_gen_opts(
-                &args,
-                want,
-                args.seed.unwrap_or(0),
-                util::current_user().name,
-                args.repeat_max,
-                args.host_uptime,
-            );
-            let fit = gen::Fit::target(args.host_mem_mb, args.host_pid_max);
-            let rows = gen::gen_table(&mut rng, &opts, &fit);
-            let has_init = rows.iter().any(|r| r.pid == 1);
-            shortfall(
-                args.family,
-                rows.len(),
-                want,
-                false,
-                fit.shortfall_reason_for(rows.len(), want, has_init)
-                    .as_deref(),
-                gen::distinct_supply(
-                    args.family,
-                    &corpus::profile_weights(&args.profile),
-                    args.seen.contains(&"--profile"),
-                ),
-            );
-            // `%MEM` divides by the memory of the host the table describes.
-            // `table::mem_budget_kb()` is this host's budget; an explicit
-            // `--host-mem` names a different host, and the table it produces
-            // has to be a percentage of *that* machine or the column is not a
-            // property of the table at all.
-            let mem_kb = match args.host_mem_mb {
-                Some(mb) => mb.saturating_mul(1024),
-                None => table::mem_budget_kb(),
-            };
-            let out = table::render(
-                &rows,
-                mem_kb,
-                &synthetic_clock(&args, sys::now_secs()),
-                sys::page_kb(),
-            );
-            sys::out(out.as_bytes());
-            0
-        }
-        Sub::Inject => {
-            if args.from_profile.is_some() || args.masker_cmd.is_some() {
-                return run_inject_decoy(&args);
-            }
-            if args.count > 500 {
-                sys::err(b"psgen: inject count capped at 500\n");
-            }
-            let me = users::current();
-            let mut rng = match args.seed {
-                Some(s) => Rng::new(s),
-                None => Rng::from_entropy(),
-            };
-            let want = if args.count == 0 {
-                12
-            } else {
-                args.count.min(500)
-            };
-            let opts = make_gen_opts(
-                &args,
-                want,
-                args.seed.unwrap_or(0),
-                me.name,
-                args.repeat_max,
-                args.host_uptime,
-            );
-            let mut rows = gen::gen_inject(&mut rng, &opts, &gen::Fit::none());
-
-            // A preview never creates `<pidfile>.lock`, but if another run
-            // already holds it, refuse with exit 2 just like a real run would.
-            if args.dry_run {
-                if let Some(p) = &args.pidfile {
-                    if inject::pidfile_lock_held(p) {
-                        let mut out = Buf::new();
-                        out.push_str("psgen: another psgen run holds the pidfile ");
-                        out.push_bytes(p);
-                        out.push_str("; wait for it to finish or choose another --pidfile\n");
-                        sys::err(out.as_bytes());
-                        return 2;
-                    }
-                }
-            }
-
-            // Preflight the pidfile before spawning, proving space and
-            // RLIMIT_FSIZE for the estimated real body rather than only the
-            // pending header. The same check runs under --dry-run so a plan
-            // fails for a command line the real run would refuse.
-            let mut blockers = 0usize;
-            let tmpdir_len = std::env::temp_dir().as_os_str().as_bytes().len();
-            let mut probed_bytes = 0usize;
-            if let Some(p) = &args.pidfile {
-                let init_temps = if args.disk_mb.unwrap_or(0) > 0 {
-                    rows.len()
-                } else {
-                    0
-                };
-                let need_bytes =
-                    inject::estimated_pidfile_bytes(rows.len(), init_temps, tmpdir_len);
-                probed_bytes = need_bytes;
-                if !probe::pidfile_creatable_bytes(p, need_bytes) {
-                    let mut out = pidfile_error_bytes(p, need_bytes);
-                    // Suggest a writable path without writing to the
-                    // candidate path.
-                    for cand in [
-                        std::env::temp_dir().join("psgen-pids.txt"),
-                        std::path::PathBuf::from("psgen-pids.txt"),
-                    ] {
-                        let b = cand.as_os_str().as_bytes();
-                        if probe::pidfile_creatable_bytes(b, need_bytes) {
-                            out.push_str("; use ");
-                            out.push_bytes(b);
-                            out.push_str(" instead");
-                            break;
-                        }
-                    }
-                    out.push(b'\n');
-                    sys::err(out.as_bytes());
-                    blockers += 1;
-                }
-            }
-            shortfall(
-                args.family,
-                rows.len(),
-                want,
-                false,
-                gen::Fit::none()
-                    .shortfall_reason_for(rows.len(), want, false)
-                    .as_deref(),
-                gen::distinct_supply(
-                    args.family,
-                    &corpus::profile_weights(&args.profile),
-                    args.seen.contains(&"--profile"),
-                ),
-            );
-
-            // A disk target that would fill the filesystem is refused here,
-            // before anything is spawned. Every check in this block reads the
-            // host, so a preview runs it too: a plan that says "fine" for a
-            // command line the run refuses cannot gate a CI step.
-            if let Some(mb) = args.disk_mb {
-                if mb > 0 {
-                    if let Some(limit) = sys::rlimit_fsize() {
-                        if mb.saturating_mul(1024 * 1024) > limit {
-                            let mut out = Buf::new();
-                            out.push_str("psgen: --disk ");
-                            out.push_u64(mb);
-                            out.push_str(" MiB exceeds RLIMIT_FSIZE (");
-                            out.push_u64(limit / 1024 / 1024);
-                            out.push_str(" MiB)\n");
-                            sys::err(out.as_bytes());
-                            blockers += 1;
-                        }
-                    }
-                    let total_mb = mb.saturating_mul(rows.len() as u64);
-                    let dir = std::env::temp_dir();
-                    let dirb = dir.as_os_str().as_bytes().to_vec();
-                    if let Some((free, _)) = probe::space(&dirb) {
-                        if total_mb.saturating_mul(1024 * 1024) > free.saturating_sub(free / 10) {
-                            let mut out = Buf::new();
-                            out.push_str("psgen: --disk ");
-                            out.push_u64(mb);
-                            out.push_str(" MiB x ");
-                            out.push_u64(rows.len() as u64);
-                            out.push_str(" rows needs ");
-                            out.push_u64(total_mb);
-                            out.push_str(" MiB, more than the free space in ");
-                            out.push_bytes(&dirb);
-                            out.push_str(" (");
-                            out.push_u64(free / 1024 / 1024);
-                            out.push_str(" MiB)\n");
-                            sys::err(out.as_bytes());
-                            blockers += 1;
-                        }
-                    }
-                }
-            }
-            if blockers > 0 {
-                return 2;
-            }
-
-            // A pidfile that still records live stubs cannot be reused: the
-            // pending rewrite would erase the only record of the old run, and
-            // the old stubs would outlive `stop`. A preview runs the same
-            // check, because it describes what a real run would do, and a run
-            // against this pidfile would be refused.
-            if let Some(p) = &args.pidfile {
-                if !check_pidfile_inactive(p) {
-                    return 2;
-                }
-            }
-
-            let prep = inject::prepare(&mut rows, &args, args.create_users && !args.dry_run);
-
-            // Re-check the pidfile size once `prepare()` has resolved the exe
-            // tier and staging directory count, in case bind/shadow staging
-            // adds `# temp` lines beyond the initial estimate.
-            if let Some(p) = &args.pidfile {
-                let temps_est = staging_patterns(&rows, &prep, &args).len();
-                let dir_len = prep
-                    .shadow_root
-                    .as_deref()
-                    .map_or(tmpdir_len, |s| tmpdir_len.max(s.len()));
-                let need_bytes = inject::estimated_pidfile_bytes(rows.len(), temps_est, dir_len);
-                if need_bytes > probed_bytes && !probe::pidfile_creatable_bytes(p, need_bytes) {
-                    let mut out = pidfile_error_bytes(p, need_bytes);
-                    out.push(b'\n');
-                    sys::err(out.as_bytes());
-                    return 2;
-                }
-            }
-
-            if args.dry_run {
-                // A preview cannot create an account, but it must not fall
-                // back to the caller's identity either: the run it describes
-                // would inject as the template's user.
-                let create = would_create(&mut rows, &args);
-                for name in &create {
-                    let mut out = Buf::new();
-                    out.push_str("psgen: would create ");
-                    out.push_bytes(name);
-                    out.push(b'\n');
-                    sys::err(out.as_bytes());
-                }
-                if args.json {
-                    print_json_plan(&rows, &prep, &create, &args);
-                } else if args.plan {
-                    print_plan(&rows, &prep, &create, &args);
-                } else {
-                    let mut out = Buf::new();
-                    for p in &rows {
-                        out.push_bytes(&p.user);
-                        out.push(b'\t');
-                        out.push_bytes(&p.cmd);
-                        out.push(b'\n');
-                    }
-                    sys::out(out.as_bytes());
-                }
-                print_notes(&prep, &args);
-                return 0;
-            }
-
-            // Serialize the pending write and the final rewrite. The live
-            // check above is a read, and two runs that pass it together both
-            // rename a file into place; the second erases the first's rows.
-            let _pidfile_lock = match &args.pidfile {
-                Some(p) => match acquire_pidfile_lock(p) {
-                    Ok(lock) => Some(lock),
-                    Err(code) => return code,
-                },
-                None => None,
-            };
-
-            // Re-check liveness while holding the lock: another injector could
-            // have finished and released the lock between the unlocked preflight
-            // check above and `lock_pidfile` here.
-            if let Some(p) = &args.pidfile {
-                if !check_pidfile_inactive(p) {
-                    return 2;
-                }
-            }
-
-            // Forget the staging directories of runs whose injector is gone.
-            // A `--duration` run that nobody stops leaves its shadow copy and
-            // --disk data behind; the next run reclaims them.
-            let pruned = inject::prune_staging(&prep);
-            if pruned > 0 {
-                let mut out = Buf::new();
-                out.push_str("psgen: pruned ");
-                out.push_u64(pruned as u64);
-                out.push_str(" staging directories from earlier runs\n");
-                sys::err(out.as_bytes());
-            }
-
-            // Prove the pidfile can be written before the first stub exists,
-            // and leave a valid header-only pidfile behind. A failure after
-            // the fork would otherwise leave live stubs with no record.
-            let mut pending_written = false;
-            if let Some(p) = &args.pidfile {
-                pending_written = inject::write_pending_pidfile(p);
-                if !pending_written {
-                    // The preflight proved a write works, so a failure here is
-                    // a race (the directory went away); refuse rather than
-                    // spawn what cannot be stopped.
-                    let mut out = pidfile_error(p);
-                    out.push_str(" (the pidfile could not be written before spawning)");
-                    out.push(b'\n');
-                    sys::err(out.as_bytes());
-                    return 2;
-                }
-            }
-
-            print_notes(&prep, &args);
-            let result = match inject::spawn(&rows, &args, &prep) {
-                Ok(r) => r,
-                Err(e) => {
-                    // Every `spawn` error is raised before the first fork, so
-                    // no stub exists to record. Remove the header-only file
-                    // rather than leave a pidfile that claims a run happened.
-                    if pending_written {
-                        if let Some(p) = &args.pidfile {
-                            let _ = std::fs::remove_file(Path::new(std::ffi::OsStr::from_bytes(p)));
-                        }
-                    }
-                    let mut out = Buf::new();
-                    out.push_str("psgen: ");
-                    out.push_str(&e);
-                    out.push(b'\n');
-                    sys::err(out.as_bytes());
-                    return 1;
-                }
-            };
-            print_summary(&prep, &result, &args);
-
-            if result.pids.is_empty() {
-                if pending_written {
-                    if let Some(p) = &args.pidfile {
-                        let _ = std::fs::remove_file(Path::new(std::ffi::OsStr::from_bytes(p)));
-                    }
-                }
-                sys::err(b"psgen: no processes were spawned\n");
-                return 1;
-            }
-            let pidfile_failed = !result.pidfile_ok;
-            if pidfile_failed {
-                // The list goes to stderr even under --quiet: without it the
-                // caller cannot stop the stubs, which stay alive. The temp
-                // dirs are printed too, because the pidfile that would have
-                // listed them was not written.
-                let mut out = Buf::new();
-                out.push_str("psgen: the pidfile was not written; spawned PIDs:");
-                for pid in &result.pids {
-                    out.push(b' ');
-                    out.push_u64(*pid as u64);
-                }
-                out.push(b'\n');
-                for t in &result.temps {
-                    out.push_str("psgen: temp dir ");
-                    out.push_bytes(t.as_os_str().as_bytes());
-                    out.push(b'\n');
-                }
-                // The file still on disk is the pending header, not a record
-                // of this run. Remove it if possible, and always write a
-                // recovery sidecar (beside the pidfile, or in TMPDIR if the
-                // parent directory is unwritable) carrying the real nonce and
-                // `# temp` paths so `psgen stop --pidfile <sidecar>` can stop
-                // the run cleanly.
-                if let Some(p) = &args.pidfile {
-                    let _ = std::fs::remove_file(Path::new(std::ffi::OsStr::from_bytes(p)));
-                    if !result.pids.is_empty() {
-                        if let Some(sidecar) =
-                            inject::write_pid_sidecar(p, &result.pids, &result.temps, &result.nonce)
-                        {
-                            out.push_str("psgen: the spawned rows are in ");
-                            out.push_bytes(&sidecar);
-                            out.push_str("; stop them with: psgen stop --pidfile ");
-                            out.push_bytes(&sidecar);
-                            out.push(b'\n');
-                        }
-                    }
-                }
-                sys::err(out.as_bytes());
-            }
-            let mut code = 0;
-            if result.failed > 0
-                || result.missing > 0
-                || !result.mismatches.is_empty()
-                || pidfile_failed
-            {
-                // A run whose pidfile was not written is not a success even
-                // when every stub started: the caller cannot stop them.
-                code = 1;
-            }
-
-            if args.table {
-                render_live_table(&result.pids);
-            }
-
-            if args.wait && args.duration > 0 {
-                sys::nanosleep(args.duration as u64, 0);
-                let same = |pid: i32, start: u64, comm: &[u8]| {
-                    live::read_starttime(pid) == Some(start)
-                        && (comm.is_empty() || live::read_comm(pid).as_deref() == Some(comm))
-                };
-                // Kill the root's process group first. The starttime check
-                // proves the root is alive, so its PGID cannot be a reused
-                // PID. This also reaches rows that stayed in the root's
-                // process group and therefore have no entry in `ident`.
-                for (pid, start) in &result.roots {
-                    if live::read_starttime(*pid) == Some(*start) {
-                        sys::kill(-*pid, sys::SIGKILL);
-                    }
-                }
-                for (pid, start, comm) in &result.ident {
-                    let pfd = sys::pidfd_open(*pid);
-                    if pfd >= 0 {
-                        if same(*pid, *start, comm)
-                            && !sys::pidfd_send_signal(pfd, sys::SIGKILL)
-                            && same(*pid, *start, comm)
-                        {
-                            sys::kill(*pid, sys::SIGKILL);
-                        }
-                        sys::close(pfd);
-                    } else if same(*pid, *start, comm) {
-                        sys::kill(*pid, sys::SIGKILL);
-                    }
-                }
-                // The injector is a child subreaper, so orphaned stub
-                // children reparent here and can be reaped.
-                for _ in 0..200 {
-                    loop {
-                        let mut status = 0;
-                        let r = sys::waitpid_nohang(-1, &mut status);
-                        if r <= 0 {
-                            break;
-                        }
-                    }
-                    let alive = result.pids.iter().any(|pid| live::alive(*pid));
-                    if !alive {
-                        break;
-                    }
-                    sys::nanosleep(0, 10_000_000);
-                }
-                // `result.pids` only holds the rows that reported. A stub that
-                // never reported (a `setsid` child, a row killed before its
-                // status record) is not in it, so "no pid is alive" is not the
-                // same as "nothing is using the directory". The live marker is
-                // the same test `stop` uses.
-                for t in &result.temps {
-                    let busy = inject::staging_busy(t);
-                    if !busy {
-                        let _ = std::fs::remove_dir_all(t);
-                    }
-                }
-            }
-            if pidfile_failed {
-                1
-            } else {
-                code
-            }
-        }
+        Sub::Corpus => run_corpus(),
+        Sub::Check => run_check(&args),
+        Sub::Unit => run_unit(&args),
+        Sub::Stop => run_stop(&args),
+        Sub::List => run_list(&args),
+        Sub::Table => run_table(&args),
+        Sub::Inject => run_inject_corpus(&args),
     }
 }
 
@@ -4162,5 +4205,90 @@ mod tests {
         // Legacy profile validation still rejects non-corpus names on table/inject
         assert!(!ok(&["table", "--profile", "/tmp/p.json"]));
         assert!(!ok(&["inject", "--profile", "/tmp/p.json"]));
+    }
+
+    #[test]
+    fn track_d_new_cli_flags_and_optional_live_profile() {
+        let p = parse_strs(&[
+            "profile",
+            "--pid",
+            "99",
+            "--tree",
+            "--no-ancestors",
+            "--redact-token-file",
+            "/tmp/toks.txt",
+        ])
+        .unwrap();
+        assert!(p.no_ancestors);
+        assert_eq!(p.redact_token_files, vec!["/tmp/toks.txt"]);
+        assert!(!ok(&[
+            "profile",
+            "--validate",
+            "/tmp/p.json",
+            "--no-ancestors"
+        ]));
+
+        let inj = parse_strs(&[
+            "inject",
+            "--from-profile",
+            "/tmp/p.json",
+            "--no-clean-env",
+            "--same-session",
+            "--label-decoys",
+            "5",
+            "--interleave-cmd",
+            "exec /bin/sleep 5",
+        ])
+        .unwrap();
+        assert!(inj.no_clean_env);
+        assert!(inj.same_session);
+        assert_eq!(inj.label_decoys, 5);
+        assert_eq!(inj.interleave_cmd.as_deref(), Some("exec /bin/sleep 5"));
+        assert!(!ok(&["inject", "--no-clean-env"]));
+        assert!(!ok(&["inject", "--same-session"]));
+        assert!(!ok(&["inject", "--label-decoys", "5"]));
+        assert!(!ok(&["inject", "--interleave-cmd", "sleep 1"]));
+
+        // `run --live` with `--target-cmd` or `--target-pid` no longer requires `--profile`.
+        let r1 = parse_strs(&[
+            "run",
+            "--live",
+            "--target-cmd",
+            "exec /bin/sleep 5",
+            "--out",
+            "/tmp/run",
+            "--redact-token",
+            "SEC",
+            "--redact-token-file",
+            "/tmp/t.txt",
+            "--redact-env",
+            "API_KEY",
+        ])
+        .unwrap();
+        assert!(r1.live);
+        assert_eq!(r1.redact_tokens, vec!["SEC"]);
+        assert_eq!(r1.redact_token_files, vec!["/tmp/t.txt"]);
+        assert_eq!(r1.redact_envs, vec!["API_KEY"]);
+        assert!(ok(&[
+            "run",
+            "--live",
+            "--target-pid",
+            "42",
+            "--out",
+            "/tmp/run"
+        ]));
+        assert!(!ok(&["run", "--live", "--out", "/tmp/run"]));
+
+        let v = parse_strs(&[
+            "verify",
+            "/tmp/r1",
+            "--blind-dir",
+            "/tmp/b1",
+            "--redact-token-file",
+            "/tmp/t.txt",
+        ])
+        .unwrap();
+        assert_eq!(v.blind_dir.as_deref(), Some(&b"/tmp/b1"[..]));
+        assert_eq!(v.redact_token_files, vec!["/tmp/t.txt"]);
     }
 }

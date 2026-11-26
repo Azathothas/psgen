@@ -1,11 +1,11 @@
-//! Built-in reference blind observer, 6 planted-defect guards (`PD-01`..`PD-06`
+//! Built-in reference blind observer, 8 planted-defect guards (`PD-01`..`PD-08`
 //! with both passing and refusal verification), and the 9/10 vs 7/10
 //! discrimination acceptance suite (`psgen selftest`).
 
-use crate::harness::{self, Control, HardNeg, Mode, RunOpts, TableRow, DEFAULT_RESIDUAL};
+use crate::harness::{self, Control, HardNeg, Mode, RunOpts, DEFAULT_RESIDUAL};
 use crate::json::{
-    self, cat2, cat3, i64_str, mkdir_all, read_str, read_str_in, sort_strings, u64_str, write_file,
-    Json, Jw,
+    self, cat2, cat3, csv_idx, i64_str, join_strs, mkdir_all, next_csv, own, read_opt_in, read_str,
+    read_str_in, sort_strings, u64_str, write_file, Json, Jw,
 };
 use crate::profile::{self, Profile};
 use crate::score::{self, Pick, PickChoice, PICK_SCHEMA};
@@ -14,12 +14,9 @@ use std::path::{Path, PathBuf};
 
 pub const SELFTEST_SCHEMA: u32 = 1;
 
+const OBS_SURFACE_COUNT: usize = 14;
 const OBS_SURFACES_CSV: &str =
-    "comm,cmdline,ppid,exe,memory,maps,environ,fd,status,syscall,threads";
-
-fn obs_surface_name(idx: usize) -> &'static str {
-    OBS_SURFACES_CSV.split(',').nth(idx).unwrap_or("")
-}
+    "comm,cmdline,ppid,exe,memory,maps,environ,fd,status,syscall,threads,cwd,auxv,stat";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ObserverDefect {
@@ -31,127 +28,206 @@ enum ObserverDefect {
 }
 
 struct ObservedProc {
-    row: TableRow,
+    pid: i32,
+    ppid: i32,
+    user: String,
     is_child: bool,
-    surfaces: [String; 11],
-    surf_mask: u16,
+    surfaces: Vec<(u8, String)>,
     starttime: Option<u64>,
     leaked_secret_env: bool,
 }
 
 impl ObservedProc {
+    #[inline(never)]
     fn set_surf(&mut self, i: usize, val: String) {
-        self.surfaces[i] = val;
-        self.surf_mask |= 1 << i;
-    }
-
-    fn surf(&self, i: usize) -> Option<&str> {
-        if (self.surf_mask & (1 << i)) != 0 {
-            Some(self.surfaces[i].as_str())
+        let k = i as u8;
+        if let Some((_, slot)) = self.surfaces.iter_mut().find(|(idx, _)| *idx == k) {
+            *slot = val;
         } else {
-            None
+            self.surfaces.push((k, val));
         }
     }
+
+    #[inline(never)]
+    fn surf(&self, i: usize) -> Option<&str> {
+        let k = i as u8;
+        self.surfaces
+            .iter()
+            .find(|(idx, _)| *idx == k)
+            .map(|(_, s)| s.as_str())
+    }
 }
 
-fn parse_stat_starttime(stat_text: &str) -> Option<u64> {
-    let close = stat_text.rfind(')')?;
-    stat_text[close + 1..]
+#[inline(never)]
+fn parse_stat_fields(stat_text: &str) -> (Option<u64>, Option<String>) {
+    let Some(close) = stat_text.rfind(')') else {
+        return (None, None);
+    };
+    let mut st = None;
+    let mut f = [0u64; 6]; // flags, startstack, arg_s, arg_e, env_s, env_e
+    for (idx, tok) in stat_text
+        .get(close + 1..)
+        .unwrap_or("")
         .split_ascii_whitespace()
-        .nth(19)
-        .and_then(json::parse_u64_s)
-}
-
-fn parse_status_sig(status_text: &str) -> String {
-    let mut nnp = "0";
-    let mut sec = "0";
-    let mut sf = "0";
-    let mut traced = false;
-    let mut cap_eff = "";
-    let mut cap_prm = "";
-    let mut cap_bnd = "";
-    for line in status_text.lines() {
-        let Some((k, v)) = line.split_once(':') else {
+        .enumerate()
+    {
+        let Some(v) = json::parse_u64_s(tok) else {
             continue;
         };
-        let v = v.trim();
-        match k {
-            "NoNewPrivs" => nnp = v,
-            "Seccomp" => sec = v,
-            "Seccomp_filters" => sf = v,
-            "TracerPid" => traced = v != "0" && !v.is_empty(),
-            "CapEff" => cap_eff = v,
-            "CapPrm" => cap_prm = v,
-            "CapBnd" => cap_bnd = v,
+        match idx {
+            6 => f[0] = v,
+            19 => st = Some(v),
+            25 => f[1] = v,
+            45 => f[2] = v,
+            46 => f[3] = v,
+            47 => f[4] = v,
+            48 => f[5] = v,
             _ => {}
         }
     }
-    harness::format_status_sig(nnp, sec, sf, traced, cap_eff, cap_prm, cap_bnd)
+    let mut sig = String::with_capacity(48);
+    sig.push_str("arg=");
+    json::push_u64(&mut sig, f[3].saturating_sub(f[2]));
+    sig.push_str("|env=");
+    json::push_u64(&mut sig, f[5].saturating_sub(f[4]));
+    sig.push_str(if f[1] != 0 { "|st=1|fl=" } else { "|st=0|fl=" });
+    json::push_u64(&mut sig, f[0]);
+    (st, Some(sig))
 }
 
+#[inline(never)]
+fn parse_status_sig(status_text: &str) -> String {
+    const KEYS: &str =
+        "NoNewPrivs,Seccomp,Seccomp_filters,TracerPid,CapEff,CapPrm,CapBnd,VmLck,RssShmem";
+    let mut v = ["0", "0", "0", "0", "", "", "", "0", "0"];
+    for line in status_text.lines() {
+        let Some((k, raw)) = line.split_once(':') else {
+            continue;
+        };
+        if let Some(i) = csv_idx(KEYS, k, false) {
+            let t = raw.trim();
+            if let Some(slot) = v.get_mut(i) {
+                *slot = if i >= 7 {
+                    t.strip_suffix("kB").unwrap_or(t).trim()
+                } else {
+                    t
+                };
+            }
+        }
+    }
+    harness::format_status_sig(
+        v[0],
+        v[1],
+        v[2],
+        v[3] != "0" && !v[3].is_empty(),
+        v[4],
+        v[5],
+        v[6],
+        v[7],
+        v[8],
+    )
+}
+
+#[inline(never)]
 fn parse_mem_scan_sig(mem_text: &str) -> String {
     let Ok(doc) = json::parse(mem_text) else {
-        return mem_text.trim().to_string();
+        return own(mem_text.trim());
     };
-    if !doc.get("readable").and_then(Json::as_bool).unwrap_or(false) {
-        let err = doc.get("error").and_then(Json::as_str).unwrap_or("EACCES");
-        return cat2("readable=false|err=", err);
+    if !doc.get_bool("readable").unwrap_or(false) {
+        return cat2(
+            "readable=false|err=",
+            doc.get_str("error").unwrap_or("EACCES"),
+        );
     }
-    let tp = doc
-        .get("token_present")
-        .and_then(Json::as_bool)
-        .unwrap_or(false);
-    cat2("readable=true|token=", if tp { "true" } else { "false" })
+    let tp = doc.get_bool("token_present").unwrap_or(false);
+    let mut sig = cat2("readable=true|token=", bstr(tp));
+    if tp {
+        if let Some(len) = doc.get_u64("token_len") {
+            sig.push_str("|len=");
+            json::push_u64(&mut sig, len);
+        }
+        if let Some(arr) = doc.get_arr("token_placements") {
+            let mut pl = Vec::new();
+            for v in arr {
+                if let Some(s) = v.as_str() {
+                    pl.push(own(s));
+                }
+            }
+            if !pl.is_empty() {
+                sort_strings(&mut pl);
+                sig.push_str("|pl=");
+                sig.push_str(&join_strs(&pl, ","));
+            }
+        }
+    }
+    sig
 }
 
+#[inline(never)]
+fn parse_auxv_sig(auxv_text: &str) -> String {
+    let trimmed = auxv_text.trim();
+    if trimmed.starts_with("EACCES") {
+        return own("EACCES");
+    }
+    let mut execfn = "";
+    let mut plat = "";
+    for line in trimmed.lines() {
+        if let Some(v) = line.strip_prefix("AT_EXECFN=") {
+            execfn = v;
+        } else if let Some(v) = line.strip_prefix("AT_PLATFORM=") {
+            plat = v;
+        }
+    }
+    json::cat4("execfn=", execfn, "|plat=", plat)
+}
+
+#[inline(never)]
 fn parse_fd_sig(fd_text: &str) -> String {
     let Ok(doc) = json::parse(fd_text) else {
-        return fd_text.trim().to_string();
+        return own(fd_text.trim());
     };
-    if let Some(err) = doc.get("error").and_then(Json::as_str) {
+    if let Some(err) = doc.get_str("error") {
         return cat2("err=", err);
     }
     let Some(arr) = doc.as_arr() else {
-        return fd_text.trim().to_string();
+        return own(fd_text.trim());
     };
     let mut items = Vec::with_capacity(arr.len());
     for item in arr {
-        if let (Some(fd), Some(t)) = (
-            item.get("fd").and_then(Json::as_i64),
-            item.get("target").and_then(Json::as_str),
-        ) {
+        if let (Some(fd), Some(t)) = (item.get_i64("fd"), item.get_str("target")) {
             items.push(cat3(&i64_str(fd), ":", &harness::normalize_fd_target(t)));
         }
     }
     sort_strings(&mut items);
-    items.join("|")
+    join_strs(&items, "|")
 }
 
+#[inline(never)]
 fn parse_task_sig(task_text: &str) -> String {
     let Ok(doc) = json::parse(task_text) else {
-        return task_text.trim().to_string();
+        return own(task_text.trim());
     };
     let Some(arr) = doc.as_arr() else {
-        return task_text.trim().to_string();
+        return own(task_text.trim());
     };
     let mut comms = Vec::with_capacity(arr.len());
     for item in arr {
-        if let Some(c) = item.get("comm").and_then(Json::as_str) {
-            comms.push(c.to_string());
+        if let Some(c) = item.get_str("comm") {
+            comms.push(own(c));
         }
     }
     sort_strings(&mut comms);
-    cat3(&u64_str(arr.len() as u64), "|", &comms.join(","))
+    cat3(&u64_str(arr.len() as u64), "|", &join_strs(&comms, ","))
 }
 
+#[inline(never)]
 fn full_fingerprint(p: &ObservedProc, all: &[ObservedProc]) -> String {
-    let mut out = String::new();
-    out.push_str("user=");
-    out.push_str(&p.row.user);
-    out.push('\n');
-    for i in 0..11 {
+    let mut out = cat3("user=", &p.user, "\n");
+    let mut csv = OBS_SURFACES_CSV;
+    for i in 0..OBS_SURFACE_COUNT {
+        let name = next_csv(&mut csv);
         if let Some(v) = p.surf(i) {
-            out.push_str(obs_surface_name(i));
+            out.push_str(name);
             out.push('=');
             out.push_str(v);
             out.push('\n');
@@ -164,7 +240,7 @@ fn full_fingerprint(p: &ObservedProc, all: &[ObservedProc]) -> String {
     }
     let mut child_fps = Vec::new();
     for c in all {
-        if c.is_child && c.row.ppid == p.row.pid {
+        if c.is_child && c.ppid == p.pid {
             child_fps.push(full_fingerprint(c, all));
         }
     }
@@ -178,16 +254,11 @@ fn full_fingerprint(p: &ObservedProc, all: &[ObservedProc]) -> String {
 }
 
 fn median_u64(vals: &mut [u64]) -> u64 {
-    for i in 1..vals.len() {
-        let mut j = i;
-        while j > 0 && vals[j - 1] > vals[j] {
-            vals.swap(j - 1, j);
-            j -= 1;
-        }
-    }
-    vals[vals.len() / 2]
+    json::shell_sort_by(vals, |a, b| a > b);
+    vals.get(vals.len() / 2).copied().unwrap_or(0)
 }
 
+#[inline(never)]
 fn find_cohort_anomaly(
     cohort: &[&ObservedProc],
     deep_enabled: bool,
@@ -196,8 +267,10 @@ fn find_cohort_anomaly(
     if cohort.len() < 3 {
         return None;
     }
-    let limit = if deep_enabled { 11 } else { 3 };
-    for (si, surf) in OBS_SURFACES_CSV.split(',').enumerate().take(limit) {
+    let limit = if deep_enabled { OBS_SURFACE_COUNT } else { 3 };
+    let mut csv = OBS_SURFACES_CSV;
+    for si in 0..limit {
+        let surf = next_csv(&mut csv);
         if (defect == ObserverDefect::IgnoreExe && si == 3)
             || (defect == ObserverDefect::IgnoreMaps && si == 5)
         {
@@ -219,7 +292,7 @@ fn find_cohort_anomaly(
         for p in cohort {
             if let Some(val) = p.surf(si) {
                 if counts.iter().any(|(k, c)| *k == val && *c == 1) {
-                    return Some((p.row.pid, surf, cat3("unique '", surf, "' signature")));
+                    return Some((p.pid, surf, cat3("unique '", surf, "' signature")));
                 }
             }
         }
@@ -234,27 +307,20 @@ fn find_cohort_anomaly(
         }
         if sts.len() >= 3 {
             let med = median_u64(&mut sts);
-            let mut devs = Vec::with_capacity(sts.len());
-            for &s in &sts {
-                devs.push(s.abs_diff(med));
-            }
+            let mut devs: Vec<u64> = sts.iter().map(|&s| s.abs_diff(med)).collect();
             let mad = median_u64(&mut devs);
             let thresh = 50_000u64.max(mad.saturating_mul(10));
             let mut best: Option<(i32, u64)> = None;
             for p in cohort {
                 if let Some(st) = p.starttime {
                     let d = st.abs_diff(med);
-                    if d > thresh && best.map(|(_, bd)| d > bd).unwrap_or(true) {
-                        best = Some((p.row.pid, d));
+                    if d > thresh && !best.is_some_and(|(_, bd)| d <= bd) {
+                        best = Some((p.pid, d));
                     }
                 }
             }
             if let Some((pid, delta)) = best {
-                return Some((
-                    pid,
-                    "starttime",
-                    cat3("starttime outlier (delta=", &u64_str(delta), ")"),
-                ));
+                return Some((pid, "starttime", cat2("starttime delta=", &u64_str(delta))));
             }
         }
     }
@@ -271,67 +337,89 @@ fn make_pick(
 ) -> Pick {
     Pick {
         schema: PICK_SCHEMA,
-        phase: phase_norm.to_string(),
+        phase: own(phase_norm),
         pick: choice,
-        reason_surface: surface.to_string(),
-        reason: reason.to_string(),
+        reason_surface: own(surface),
+        reason: own(reason),
         elapsed_sec: Some(0.05),
-        evaluator: Some(
-            match defect {
-                ObserverDefect::None => "reference-blind-v1",
-                ObserverDefect::AlwaysAbsent => "defect-always-absent",
-                ObserverDefect::AlwaysPickFirst => "defect-always-pick-first",
-                ObserverDefect::IgnoreExe => "defect-ignore-exe",
-                ObserverDefect::IgnoreMaps => "defect-ignore-maps",
-            }
-            .to_string(),
-        ),
+        evaluator: Some(own(match defect {
+            ObserverDefect::None => "reference-blind-v1",
+            ObserverDefect::AlwaysAbsent => "defect-always-absent",
+            ObserverDefect::AlwaysPickFirst => "defect-always-pick-first",
+            ObserverDefect::IgnoreExe => "defect-ignore-exe",
+            ObserverDefect::IgnoreMaps => "defect-ignore-maps",
+        })),
     }
 }
 
-fn read_deep_surfaces(pdir: &Path, defect: ObserverDefect, op: &mut ObservedProc) {
-    let ro = |name: &str| read_str_in(pdir, name).ok();
-    if defect != ObserverDefect::IgnoreExe {
-        if let Some(s) = ro("exe") {
-            op.set_surf(3, s.trim().to_string());
+#[inline(never)]
+fn parse_environ_sig(env_text: &str) -> String {
+    if !env_text.is_empty() && env_text.bytes().all(|b| b == 0) {
+        return cat2("all_nul:", &u64_str(env_text.len() as u64));
+    }
+    let mut lines = Vec::new();
+    for part in env_text.split(['\n', '\0']) {
+        let t = part.trim();
+        if !t.is_empty() {
+            lines.push(own(t));
         }
     }
-    if let Some(s) = ro("mem_scan.json") {
-        op.set_surf(4, parse_mem_scan_sig(&s));
+    sort_strings(&mut lines);
+    join_strs(&lines, "\n")
+}
+
+#[inline(never)]
+fn read_deep_surfaces(pdir: &Path, defect: ObserverDefect, op: &mut ObservedProc) {
+    if let Some(s) = read_opt_in(pdir, "comm") {
+        let exact = s.strip_suffix('\n').unwrap_or(&s);
+        if !exact.is_empty() {
+            op.set_surf(0, own(exact));
+        }
+    }
+    for (fname, idx, skip) in [
+        ("exe", 3, defect == ObserverDefect::IgnoreExe),
+        ("cwd", 11, false),
+    ] {
+        if !skip {
+            if let Some(s) = read_opt_in(pdir, fname) {
+                op.set_surf(idx, own(s.trim()));
+            }
+        }
+    }
+    for &(fname, idx, parse_fn) in &[
+        ("mem_scan.json", 4, parse_mem_scan_sig as fn(&str) -> String),
+        ("fd.json", 7, parse_fd_sig as fn(&str) -> String),
+        ("status", 8, parse_status_sig as fn(&str) -> String),
+        ("task.json", 10, parse_task_sig as fn(&str) -> String),
+        ("auxv", 12, parse_auxv_sig as fn(&str) -> String),
+    ] {
+        if let Some(s) = read_opt_in(pdir, fname) {
+            op.set_surf(idx, parse_fn(&s));
+        }
     }
     if defect != ObserverDefect::IgnoreMaps {
-        if let Some(s) = ro("maps") {
-            op.set_surf(5, s.trim().to_string());
+        if let Some(m) = read_opt_in(pdir, "maps") {
+            let sm = read_opt_in(pdir, "smaps")
+                .map(|t| harness::normalize_smaps_for_sig(&t))
+                .unwrap_or_default();
+            op.set_surf(5, cat3(m.trim(), "||", &sm));
         }
     }
-    if let Some(env_text) = ro("environ") {
+    if let Some(env_text) = read_opt_in(pdir, "environ") {
         if profile::has_unredacted_secret_in_environ(&env_text) {
             op.leaked_secret_env = true;
         }
-        let mut lines = Vec::new();
-        for part in env_text.split(['\n', '\0']) {
-            let t = part.trim();
-            if !t.is_empty() {
-                lines.push(t.to_string());
-            }
-        }
-        sort_strings(&mut lines);
-        op.set_surf(6, lines.join("\n"));
+        op.set_surf(6, parse_environ_sig(&env_text));
     }
-    if let Some(s) = ro("fd.json") {
-        op.set_surf(7, parse_fd_sig(&s));
-    }
-    if let Some(s) = ro("status") {
-        op.set_surf(8, parse_status_sig(&s));
-    }
-    if let (Some(sc), Some(wc)) = (ro("syscall"), ro("wchan")) {
+    if let (Some(sc), Some(wc)) = (read_opt_in(pdir, "syscall"), read_opt_in(pdir, "wchan")) {
         op.set_surf(9, cat3(sc.trim(), "|", wc.trim()));
     }
-    if let Some(s) = ro("task.json") {
-        op.set_surf(10, parse_task_sig(&s));
-    }
-    if let Some(s) = ro("stat") {
-        op.starttime = parse_stat_starttime(&s);
+    if let Some(s) = read_opt_in(pdir, "stat") {
+        let (st, stat_sig) = parse_stat_fields(&s);
+        op.starttime = st;
+        if let Some(ss) = stat_sig {
+            op.set_surf(13, ss);
+        }
     }
 }
 
@@ -347,32 +435,27 @@ fn observe_with_defect(
     } else if pt.eq_ignore_ascii_case("deep") {
         "deep"
     } else {
-        return Err(cat3("invalid phase '", pt, "'"));
+        return Err(cat2("invalid phase ", pt));
     };
 
-    let table_text = read_str_in(blind_dir, "blind-table.txt")?;
-    let rows = harness::parse_blind_table(&table_text)?;
-
+    let rows = harness::parse_blind_table(&read_str_in(blind_dir, "blind-table.txt")?)?;
     if defect == ObserverDefect::AlwaysAbsent || rows.is_empty() {
         return Ok(make_pick(
             phase_norm,
             defect,
             PickChoice::Absent,
             "absent",
-            if rows.is_empty() {
-                "empty table"
-            } else {
-                "planted defect: always absent"
-            },
+            "absent",
         ));
     }
     if defect == ObserverDefect::AlwaysPickFirst {
+        let pid = rows.first().map_or(0, |r| r.pid);
         return Ok(make_pick(
             phase_norm,
             defect,
-            PickChoice::Pid(rows[0].pid),
+            PickChoice::Pid(pid),
             "comm",
-            "planted defect: pick first",
+            "pick first",
         ));
     }
 
@@ -394,44 +477,29 @@ fn observe_with_defect(
     for row in rows {
         let is_child = pid_list.contains(&row.ppid);
         let hc = bstr(parent_list.contains(&row.pid));
-        let pid = row.pid;
-        let ppid = row.ppid;
-        let comm = row.comm.clone();
-        let args = row.args.clone();
         let mut op = ObservedProc {
-            row,
+            pid: row.pid,
+            ppid: row.ppid,
+            user: row.user,
             is_child,
-            surfaces: Default::default(),
-            surf_mask: 0,
+            surfaces: Vec::new(),
             starttime: None,
             leaked_secret_env: false,
         };
-        op.set_surf(0, comm);
-        op.set_surf(1, args);
+        op.set_surf(0, row.comm);
+        op.set_surf(1, row.args);
         op.set_surf(
             2,
             if is_child {
                 cat2("cluster-parent|has_child=", hc)
             } else {
-                cat3(&i64_str(ppid as i64), "|has_child=", hc)
+                cat3(&i64_str(op.ppid as i64), "|has_child=", hc)
             },
         );
-
         if deep_enabled {
-            let pdir = deep_root.join(i64_str(pid as i64));
-            read_deep_surfaces(&pdir, defect, &mut op);
+            read_deep_surfaces(&deep_root.join(i64_str(op.pid as i64)), defect, &mut op);
         }
         observed.push(op);
-    }
-
-    if let Some(leaker) = observed.iter().find(|p| p.leaked_secret_env) {
-        return Ok(make_pick(
-            phase_norm,
-            defect,
-            PickChoice::Pid(leaker.row.pid),
-            "environ",
-            "unredacted secret detected in environ",
-        ));
     }
 
     let mut roots = Vec::new();
@@ -444,50 +512,27 @@ fn observe_with_defect(
         }
     }
 
-    if roots.len() == 1 {
-        return Ok(make_pick(
-            phase_norm,
-            defect,
-            PickChoice::Pid(roots[0].row.pid),
-            "comm",
-            "sole root process in table",
-        ));
-    }
-    if roots.len() == 2 {
-        let msg = if full_fingerprint(roots[0], &observed) == full_fingerprint(roots[1], &observed)
-        {
-            "exact clone tie across all surfaces"
+    let (choice, surf, reason) = if let Some(leaker) = observed.iter().find(|p| p.leaked_secret_env)
+    {
+        (PickChoice::Pid(leaker.pid), "environ", own("leaked secret"))
+    } else if let [only] = roots.as_slice() {
+        (PickChoice::Pid(only.pid), "comm", own("sole root"))
+    } else if let [a, b] = roots.as_slice() {
+        let msg = if full_fingerprint(a, &observed) == full_fingerprint(b, &observed) {
+            "exact clone tie"
         } else {
-            "two candidates without majority baseline"
+            "two candidates"
         };
-        return Ok(make_pick(
-            phase_norm,
-            defect,
-            PickChoice::Ambiguous,
-            "ambiguous",
-            msg,
-        ));
-    }
-
-    for cohort in [roots.as_slice(), children.as_slice()] {
-        if let Some((pid, surf, reason)) = find_cohort_anomaly(cohort, deep_enabled, defect) {
-            return Ok(make_pick(
-                phase_norm,
-                defect,
-                PickChoice::Pid(pid),
-                surf,
-                &reason,
-            ));
-        }
-    }
-
-    Ok(make_pick(
-        phase_norm,
-        defect,
-        PickChoice::Absent,
-        "absent",
-        "no anomalous surface detected",
-    ))
+        (PickChoice::Ambiguous, "ambiguous", own(msg))
+    } else if let Some((pid, surf, reason)) = [roots.as_slice(), children.as_slice()]
+        .into_iter()
+        .find_map(|c| find_cohort_anomaly(c, deep_enabled, defect))
+    {
+        (PickChoice::Pid(pid), surf, reason)
+    } else {
+        (PickChoice::Absent, "absent", own("no anomaly"))
+    };
+    Ok(make_pick(phase_norm, defect, choice, surf, &reason))
 }
 
 /// Strictly blind built-in reference observer. Reads ONLY `blind-table.txt`
@@ -500,9 +545,9 @@ fn clean_profile(label: &str, tree: bool) -> Profile {
     let mut prof = profile::synthetic_default_profile(label, tree);
     prof.memory.token_present = true;
     prof.environ = vec![
-        "PATH=/usr/local/bin:/usr/bin:/bin".to_string(),
-        "HOME=/srv/ci".to_string(),
-        "LANG=C.UTF-8".to_string(),
+        own("PATH=/usr/local/bin:/usr/bin:/bin"),
+        own("HOME=/srv/ci"),
+        own("LANG=C.UTF-8"),
     ];
     for child in &mut prof.children {
         child.memory.token_present = true;
@@ -516,8 +561,8 @@ fn make_7of10_leaking_target(base: &Profile, variant: usize) -> Profile {
     match variant % 4 {
         0 => {
             let leak_exe = "/opt/weak-masker/real-target-bin";
-            weak.identity.exe = leak_exe.to_string();
-            weak.auxv.at_execfn = Some(leak_exe.to_string());
+            json::assign_str(&mut weak.identity.exe, leak_exe);
+            weak.auxv.at_execfn = Some(own(leak_exe));
             if let Some(m0) = weak.memory.maps.first_mut() {
                 *m0 = cat2("<addr> r-xp 00001000 08:01 1001 ", leak_exe);
             }
@@ -530,20 +575,19 @@ fn make_7of10_leaking_target(base: &Profile, variant: usize) -> Profile {
             }
         }
         1 => {
-            weak.memory
-                .maps
-                .push("<addr> r-xp 00000000 08:01 4242 /usr/lib/libweakmask.so".to_string());
-            weak.memory.smaps.push(
-                "r-xp /usr/lib/libweakmask.so Rss:128kB Private_Dirty:0kB Anonymous:0kB"
-                    .to_string(),
-            );
+            weak.memory.maps.push(own(
+                "<addr> r-xp 00000000 08:01 4242 /usr/lib/libweakmask.so",
+            ));
+            weak.memory.smaps.push(own(
+                "r-xp /usr/lib/libweakmask.so Rss:128kB Private_Dirty:0kB Anonymous:0kB",
+            ));
         }
-        2 => weak.environ.push("WEAK_MASKER_ACTIVE=1".to_string()),
+        2 => weak.environ.push(own("WEAK_MASKER_ACTIVE=1")),
         _ => {
-            weak.identity.comm = "python3".to_string();
-            weak.status.name = "python3".to_string();
+            json::assign_str(&mut weak.identity.comm, "python3");
+            json::assign_str(&mut weak.status.name, "python3");
             if let Some(t) = weak.task.first_mut() {
-                t.comm = "python3".to_string();
+                json::assign_str(&mut t.comm, "python3");
             }
         }
     }
@@ -577,9 +621,41 @@ fn build_case(
         run_id: None,
         live_target_pids: Vec::new(),
         live_decoy_pids: Vec::new(),
-        decoy_token_prefix: "dtok_".to_string(),
+        decoy_token_prefix: own("dtok_"),
+        redact_tokens: Vec::new(),
+        redact_envs: Vec::new(),
+        live_mode: false,
     };
     harness::build_run_with_target_override(&opts, target_ov)
+}
+
+struct PdRun {
+    run: PathBuf,
+    blind: PathBuf,
+    tpid: i32,
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn run_pd(
+    work_root: &Path,
+    tag: &str,
+    prof: &Profile,
+    ctrl: Control,
+    level: u8,
+    decoys: usize,
+    seed: u64,
+    hns: &[HardNeg],
+    ov: Option<&Profile>,
+) -> Result<PdRun, String> {
+    let run = work_root.join(cat2(tag, "-run"));
+    let blind = work_root.join(cat2(tag, "-blind"));
+    let rr = build_case(prof, ctrl, level, decoys, seed, hns, &run, Some(&blind), ov)?;
+    Ok(PdRun {
+        run,
+        blind,
+        tpid: rr.target_pids.first().copied().unwrap_or(0),
+    })
 }
 
 struct PdResult {
@@ -596,28 +672,27 @@ impl PdResult {
         self.passing_ok && self.refusal_ok
     }
 
-    fn write_full(&self, w: &mut Jw) {
+    fn write_entry(&self, w: &mut Jw, mode: u8) {
         w.elem_obj();
-        w.k_str("id", self.id);
-        w.k_str("name", self.name);
-        w.k_bool("ok", self.ok());
-        w.k_bool("passing_ok", self.passing_ok);
-        w.k_bool("refusal_ok", self.refusal_ok);
-        w.k_str("passing_detail", &self.passing_detail);
-        w.k_str("refusal_detail", &self.refusal_detail);
-        w.obj_close();
-    }
-
-    fn write_guard(&self, w: &mut Jw, passing: bool) {
-        w.elem_obj();
-        w.k_str("id", self.id);
-        w.k_str("name", self.name);
-        if passing {
-            w.k_bool("passing_ok", self.passing_ok);
-            w.k_str("detail", &self.passing_detail);
-        } else {
-            w.k_bool("refusal_ok", self.refusal_ok);
-            w.k_str("detail", &self.refusal_detail);
+        w.k_strs("id,name", &[self.id, self.name]);
+        match mode {
+            0 => {
+                w.k_bool("passing_ok", self.passing_ok);
+                w.k_str("detail", &self.passing_detail);
+            }
+            1 => {
+                w.k_bool("refusal_ok", self.refusal_ok);
+                w.k_str("detail", &self.refusal_detail);
+            }
+            _ => {
+                w.k_bool("ok", self.ok());
+                w.k_bool("passing_ok", self.passing_ok);
+                w.k_bool("refusal_ok", self.refusal_ok);
+                w.k_strs(
+                    "passing_detail,refusal_detail",
+                    &[&self.passing_detail, &self.refusal_detail],
+                );
+            }
         }
         w.obj_close();
     }
@@ -631,17 +706,64 @@ fn bstr(b: bool) -> &'static str {
     }
 }
 
-fn score_ctrl_ok(run_dir: &Path, pick: &Pick, ctrl: &str, name: &str) -> Result<bool, String> {
+#[inline(never)]
+fn verify_flags(run: &Path, blind: Option<&Path>, sec: &[&str]) -> Result<u8, String> {
+    let v = match blind {
+        Some(b) => score::verify_run_with_blind(run, None, Some(b), sec)?,
+        None => score::verify_run(run, None, sec)?,
+    };
+    Ok(u8::from(v.ok)
+        | (u8::from(v.target_presence_ok) << 1)
+        | (u8::from(v.has_secret_leaks) << 2)
+        | (u8::from(v.blind_dir_ok) << 3)
+        | (u8::from(v.failures.is_empty()) << 4))
+}
+
+#[inline(never)]
+fn score_pick_doc(run_dir: &Path, pick: &Pick, name: &str) -> Result<Json, String> {
     let pp = run_dir.join(name);
     write_file(&pp, pick.to_json_str().as_bytes())?;
-    let sc_s = score::score_runs(&[(run_dir.to_path_buf(), pp)])?;
-    let sc = json::parse(&sc_s)?;
-    Ok(sc
+    json::parse(&score::score_runs(&[(run_dir.to_path_buf(), pp)])?)
+}
+
+#[inline(never)]
+fn obs_ctrl_ok(
+    r: &PdRun,
+    phase: &str,
+    defect: ObserverDefect,
+    ctrl: &str,
+    name: &str,
+) -> Result<(PickChoice, bool), String> {
+    let pick = observe_with_defect(&r.blind, phase, defect)?;
+    let sc = score_pick_doc(&r.run, &pick, name)?;
+    let ok = sc
         .get("controls")
         .and_then(|c| c.get(ctrl))
-        .and_then(|c| c.get("ok"))
-        .and_then(Json::as_bool)
-        .unwrap_or(false))
+        .and_then(|c| c.get_bool("ok"))
+        .unwrap_or(false);
+    Ok((pick.pick, ok))
+}
+
+#[inline(never)]
+fn score_pop(run_dir: &Path, pick: &Pick, name: &str, default: i64) -> Result<i64, String> {
+    let sc = score_pick_doc(run_dir, pick, name)?;
+    Ok(sc.get_i64("psgen_population_score").unwrap_or(default))
+}
+
+#[inline(never)]
+fn obs_pop(r: &PdRun, name: &str, default: i64) -> Result<(PickChoice, i64), String> {
+    let pick = reference_observe(&r.blind, "deep")?;
+    let sc = score_pop(&r.run, &pick, name, default)?;
+    Ok((pick.pick, sc))
+}
+
+#[inline(never)]
+fn answer_diff_len(run_dir: &Path) -> Result<Option<usize>, String> {
+    let ans = json::parse(&read_str_in(run_dir, "answer.json")?)?;
+    Ok(ans
+        .get("differing_surfaces")
+        .and_then(|d| d.get_arr("target_vs_decoys"))
+        .map(<[Json]>::len))
 }
 
 fn pd_item(
@@ -662,14 +784,6 @@ fn pd_item(
     }
 }
 
-#[inline(never)]
-fn pd_dirs(work_root: &Path, tag: &str) -> (PathBuf, PathBuf) {
-    (
-        work_root.join(cat2(tag, "-run")),
-        work_root.join(cat2(tag, "-blind")),
-    )
-}
-
 struct PdCtrlSpec {
     tag: &'static str,
     id: &'static str,
@@ -683,46 +797,58 @@ struct PdCtrlSpec {
     check_isolated: bool,
 }
 
+#[inline(never)]
 fn pd_ctrl_case(
     work_root: &Path,
     base_prof: &Profile,
     spec: &PdCtrlSpec,
 ) -> Result<PdResult, String> {
-    let (run_dir, blind_dir) = pd_dirs(work_root, spec.tag);
-    let rr = build_case(
+    let r = run_pd(
+        work_root,
+        spec.tag,
         base_prof,
         spec.ctrl,
         spec.level,
         spec.decoys,
         spec.seed,
         &[],
-        &run_dir,
-        Some(&blind_dir),
         None,
     )?;
     let isolated = !spec.check_isolated
-        || (!blind_dir.join("answer.json").exists()
-            && !blind_dir.join("population.json").exists()
-            && !blind_dir.join("profile.json").exists());
-    let good = reference_observe(&blind_dir, spec.phase)?;
-    let good_ok = score_ctrl_ok(&run_dir, &good, spec.ctrl.id(), "pick-good.json")?;
-    let bad = observe_with_defect(&blind_dir, spec.phase, spec.bad_defect)?;
-    let bad_ok = score_ctrl_ok(&run_dir, &bad, spec.ctrl.id(), "pick-bad.json")?;
-    let pick_ok = match rr.target_pids.first() {
-        Some(&tpid) => good.pick == PickChoice::Pid(tpid),
-        None => good.pick == PickChoice::Absent,
+        || !["answer.json", "population.json", "profile.json"]
+            .iter()
+            .any(|f| r.blind.join(f).exists());
+    let (good_pick, good_ok) = obs_ctrl_ok(
+        &r,
+        spec.phase,
+        ObserverDefect::None,
+        spec.ctrl.id(),
+        "pick-good.json",
+    )?;
+    let (_, bad_ok) = obs_ctrl_ok(
+        &r,
+        spec.phase,
+        spec.bad_defect,
+        spec.ctrl.id(),
+        "pick-bad.json",
+    )?;
+    let pick_ok = if r.tpid > 0 {
+        good_pick == PickChoice::Pid(r.tpid)
+    } else {
+        good_pick == PickChoice::Absent
     };
     Ok(pd_item(
         spec.id,
         spec.name,
         isolated && good_ok && pick_ok,
         !bad_ok,
-        bstr(isolated && good_ok).to_string(),
-        bstr(bad_ok).to_string(),
+        own(bstr(isolated && good_ok)),
+        own(bstr(bad_ok)),
     ))
 }
 
 #[allow(clippy::too_many_arguments)]
+#[inline(never)]
 fn pd_deep_surface_case(
     work_root: &Path,
     base_prof: &Profile,
@@ -735,203 +861,311 @@ fn pd_deep_surface_case(
     hns: &[HardNeg],
     target_ov: Option<&Profile>,
 ) -> Result<PdResult, String> {
-    let (run_dir, blind_dir) = pd_dirs(work_root, tag);
-    let rr = build_case(
+    let r = run_pd(
+        work_root,
+        tag,
         base_prof,
         Control::C06Main,
         5,
         12,
         seed,
         hns,
-        &run_dir,
-        Some(&blind_dir),
         target_ov,
     )?;
     let expected_pid = if hns.is_empty() {
-        rr.target_pids[0]
+        r.tpid
     } else {
-        let ans = json::parse(&read_str_in(&run_dir, "answer.json")?)?;
-        ans.req_arr("hard_negatives")?[0]
-            .get("pid")
-            .and_then(Json::as_i64)
+        let ans = json::parse(&read_str_in(&r.run, "answer.json")?)?;
+        ans.req_arr("hard_negatives")?
+            .first()
+            .and_then(|v| v.get_i64("pid"))
             .ok_or("missing hn pid")? as i32
     };
-    let good = reference_observe(&blind_dir, "deep")?;
-    let bad = observe_with_defect(&blind_dir, "deep", bad_defect)?;
+    let good = reference_observe(&r.blind, "deep")?;
+    let bad_pick = observe_with_defect(&r.blind, "deep", bad_defect)?.pick;
     Ok(pd_item(
         id,
         name,
         good.pick == PickChoice::Pid(expected_pid) && good.reason_surface == surface,
-        bad.pick != PickChoice::Pid(expected_pid),
+        bad_pick != PickChoice::Pid(expected_pid),
         good.reason_surface,
-        bstr(bad.pick != PickChoice::Pid(expected_pid)).to_string(),
+        own(bstr(bad_pick != PickChoice::Pid(expected_pid))),
     ))
 }
 
+#[inline(never)]
 fn pd05_case(work_root: &Path, base_prof: &Profile) -> Result<PdResult, String> {
-    let (run_c07, blind_c07) = pd_dirs(work_root, "pd05-c07");
-    build_case(
-        base_prof,
-        Control::C07HiddenByMask,
-        5,
-        10,
-        1005,
-        &[],
-        &run_c07,
-        Some(&blind_c07),
-        None,
-    )?;
-    let c07_pick = reference_observe(&blind_c07, "deep")?;
-    let c07_ok = score::verify_run(&run_c07, None, &[])?.ok;
-
-    let run_bad = work_root.join("pd05-tampered");
-    let rr_bad = build_case(
-        base_prof,
-        Control::C06Main,
-        5,
-        10,
-        1005,
-        &[],
-        &run_bad,
-        None,
-        None,
-    )?;
-    let tpid_s = i64_str(rr_bad.target_pids[0] as i64);
-    let tbl_path = run_bad.join("blind-table.txt");
-    let orig = read_str(&tbl_path)?;
-    let mut stripped = String::with_capacity(orig.len());
-    for l in orig.lines() {
-        if l.split_ascii_whitespace().next() != Some(tpid_s.as_str()) {
-            stripped.push_str(l);
-            stripped.push('\n');
+    let (c07_pick, c07_ok) = {
+        let c07 = run_pd(
+            work_root,
+            "pd05-c07",
+            base_prof,
+            Control::C07HiddenByMask,
+            5,
+            10,
+            1005,
+            &[],
+            None,
+        )?;
+        let pick = reference_observe(&c07.blind, "deep")?;
+        let ok = (verify_flags(&c07.run, None, &[])? & 1) != 0;
+        (pick, ok)
+    };
+    let ref_ok = {
+        let bad = run_pd(
+            work_root,
+            "pd05-tampered",
+            base_prof,
+            Control::C06Main,
+            5,
+            10,
+            1005,
+            &[],
+            None,
+        )?;
+        let tpid_s = i64_str(bad.tpid as i64);
+        let tbl_path = bad.run.join("blind-table.txt");
+        let orig = read_str(&tbl_path)?;
+        let mut stripped = String::with_capacity(orig.len());
+        for l in orig.lines() {
+            if l.split_ascii_whitespace().next() != Some(tpid_s.as_str()) {
+                stripped.push_str(l);
+                stripped.push('\n');
+            }
         }
-    }
-    write_file(&tbl_path, stripped.as_bytes())?;
-
-    let ver_bad = score::verify_run(&run_bad, None, &[])?;
-    let ver_flagged = !ver_bad.ok && !ver_bad.target_presence_ok;
-    let p_abs = run_bad.join("pick.json");
-    write_file(&p_abs, c07_pick.to_json_str().as_bytes())?;
-    let scorer_refused = score::score_runs(&[(run_bad, p_abs)]).is_err();
-
+        write_file(&tbl_path, stripped.as_bytes())?;
+        (verify_flags(&bad.run, None, &[])? & 3) == 0
+            && score_pick_doc(&bad.run, &c07_pick, "pick.json").is_err()
+    };
     Ok(pd_item(
         "PD-05",
         "Missing target PID guard (LDKit regression)",
         c07_pick.pick == PickChoice::Absent && c07_ok,
-        ver_flagged && scorer_refused,
-        bstr(c07_ok).to_string(),
-        bstr(ver_flagged && scorer_refused).to_string(),
+        ref_ok,
+        own(bstr(c07_ok)),
+        own(bstr(ref_ok)),
     ))
 }
 
+#[inline(never)]
 fn pd06_case(work_root: &Path, base_prof: &Profile) -> Result<PdResult, String> {
     const PLANTED_SECRET: &str = "ghp_PlantedTestSecretToken0123456789abcd";
-    let mut leaky = base_prof.clone();
-    leaky.environ.push(cat2("APP_TOKEN=", PLANTED_SECRET));
-    let prof_rejected = leaky.validate(&[PLANTED_SECRET]).is_err() && leaky.validate(&[]).is_err();
+    let prof_rejected = {
+        let mut leaky = base_prof.clone();
+        leaky.environ.push(cat2("APP_TOKEN=", PLANTED_SECRET));
+        leaky.validate(&[PLANTED_SECRET]).is_err() && leaky.validate(&[]).is_err()
+    };
 
-    let run_dir = work_root.join("pd06-run");
-    let rr = build_case(
+    let r = run_pd(
+        work_root,
+        "pd06",
         base_prof,
         Control::C06Main,
         5,
         10,
         1006,
         &[],
-        &run_dir,
-        None,
         None,
     )?;
-    let tpid = rr.target_pids[0];
-    let env_path = run_dir
+    let env_path = r
+        .run
         .join("deep")
-        .join(i64_str(tpid as i64))
+        .join(i64_str(r.tpid as i64))
         .join("environ");
-    let mut body = read_str(&env_path)?;
-    body.push_str("APP_TOKEN=");
-    body.push_str(PLANTED_SECRET);
-    body.push('\n');
+    let body = json::concat(&[&read_str(&env_path)?, "APP_TOKEN=", PLANTED_SECRET, "\n"]);
     write_file(&env_path, body.as_bytes())?;
 
-    let obs = reference_observe(&run_dir, "deep")?;
-    let ver = score::verify_run(&run_dir, None, &[PLANTED_SECRET])?;
-    let ver_rejected = !ver.ok && ver.has_secret_leaks;
-
+    let obs = reference_observe(&r.run, "deep")?;
+    let vf = verify_flags(&r.run, None, &[PLANTED_SECRET])?;
+    let ref_ok = prof_rejected && (vf & 1) == 0 && (vf & 4) != 0;
     Ok(pd_item(
         "PD-06",
         "Planted secret in environ hygiene & scan guard",
-        obs.pick == PickChoice::Pid(tpid) && obs.reason_surface == "environ",
-        prof_rejected && ver_rejected,
+        obs.pick == PickChoice::Pid(r.tpid) && obs.reason_surface == "environ",
+        ref_ok,
         obs.reason_surface,
-        bstr(prof_rejected && ver_rejected).to_string(),
+        own(bstr(ref_ok)),
     ))
 }
 
-fn run_pd_suite(work_root: &Path) -> Result<Vec<PdResult>, String> {
-    let base_prof = clean_profile("ci-runner", false);
-    let mut target_exe = base_prof.clone();
-    target_exe.identity.exe = "/opt/planted/unique-target-exe".to_string();
+#[inline(never)]
+fn pd07_case(work_root: &Path, base_prof: &Profile) -> Result<PdResult, String> {
+    let r = run_pd(
+        work_root,
+        "pd07",
+        base_prof,
+        Control::C06Main,
+        6,
+        10,
+        1007,
+        &[],
+        None,
+    )?;
+    let vc = verify_flags(&r.run, Some(&r.blind), &[])?;
+    let clean_ok = (vc & 0b11001) == 0b11001;
 
-    Ok(vec![
-        pd_ctrl_case(
+    write_file(&r.blind.join("answer.json"), b"{\"leaked\":true}\n")?;
+    write_file(&r.blind.join("decoys.pid"), b"12345\n")?;
+    let vd = verify_flags(&r.run, Some(&r.blind), &[])?;
+    let dirty_refused = (vd & 0b11001) == 0;
+    Ok(pd_item(
+        "PD-07",
+        "Blind-dir isolation & contamination fail-closed guard",
+        clean_ok,
+        dirty_refused,
+        own(bstr(clean_ok)),
+        own(bstr(dirty_refused)),
+    ))
+}
+
+fn set_pd08_attrs(p: &mut Profile, dumpable: bool, ppid: i32, sec: u32) {
+    p.dumpable = Some(dumpable);
+    p.identity.ppid = ppid;
+    p.status.ppid = ppid;
+    p.stat.ppid = ppid;
+    p.status.no_new_privs = u32::from(sec > 0);
+    p.status.seccomp = sec;
+    p.status.seccomp_filters = sec;
+}
+
+#[inline(never)]
+fn pd08_case(work_root: &Path, base_prof: &Profile) -> Result<PdResult, String> {
+    let mut target_prof = base_prof.clone();
+    set_pd08_attrs(&mut target_prof, true, 4242, 0);
+
+    let (passing_ok, ok_score) = {
+        let ok_r = run_pd(
             work_root,
-            &base_prof,
-            &PdCtrlSpec {
-                tag: "pd01",
-                id: "PD-01",
-                name: "C-01 obvious target detection",
-                ctrl: Control::C01Obvious,
-                level: 1,
-                decoys: 10,
-                seed: 1001,
-                phase: "table",
-                bad_defect: ObserverDefect::AlwaysAbsent,
-                check_isolated: true,
-            },
-        )?,
-        pd_ctrl_case(
-            work_root,
-            &base_prof,
-            &PdCtrlSpec {
-                tag: "pd02",
-                id: "PD-02",
-                name: "C-04 no-target false-positive guard",
-                ctrl: Control::C04NoTarget,
-                level: 5,
-                decoys: 15,
-                seed: 1002,
-                phase: "deep",
-                bad_defect: ObserverDefect::AlwaysPickFirst,
-                check_isolated: false,
-            },
-        )?,
-        pd_deep_surface_case(
-            work_root,
-            &base_prof,
-            "pd03",
-            "PD-03",
-            "Unique exe deep-phase detection",
-            1003,
-            "exe",
-            ObserverDefect::IgnoreExe,
+            "pd08-clean",
+            &target_prof,
+            Control::C06Main,
+            6,
+            10,
+            1008,
             &[],
-            Some(&target_exe),
-        )?,
-        pd_deep_surface_case(
-            work_root,
-            &base_prof,
-            "pd04",
-            "PD-04",
-            "Unique maps decoy (HN-05) deep-phase detection",
-            1004,
-            "maps",
-            ObserverDefect::IgnoreMaps,
-            &[HardNeg::Hn05Maps],
             None,
-        )?,
-        pd05_case(work_root, &base_prof)?,
-        pd06_case(work_root, &base_prof)?,
-    ])
+        )?;
+        let (ok_pick, ok_score) = obs_pop(&ok_r, "pick-clean.json", 0)?;
+        (
+            answer_diff_len(&ok_r.run)? == Some(0)
+                && ok_pick == PickChoice::Absent
+                && ok_score >= 9,
+            ok_score,
+        )
+    };
+
+    let mut bad_decoy = target_prof.clone();
+    set_pd08_attrs(&mut bad_decoy, false, 1, 2);
+    let bad_r = run_pd(
+        work_root,
+        "pd08-defect",
+        &bad_decoy,
+        Control::C06Main,
+        6,
+        10,
+        1008,
+        &[],
+        Some(&target_prof),
+    )?;
+    let (bad_pick, caught_score) = obs_pop(&bad_r, "pick-caught.json", 10)?;
+    let abs_pick = make_pick(
+        "deep",
+        ObserverDefect::None,
+        PickChoice::Absent,
+        "absent",
+        "forced",
+    );
+    let diff_cap = score_pop(&bad_r.run, &abs_pick, "pick-absent.json", 10)?;
+    let refusal_ok = answer_diff_len(&bad_r.run)?.unwrap_or(0) >= 2
+        && bad_pick == PickChoice::Pid(bad_r.tpid)
+        && caught_score <= 2
+        && diff_cap <= 7;
+    Ok(pd_item(
+        "PD-08",
+        "Opacity/seccomp inversion & flat-PPid decoy defect guard",
+        passing_ok,
+        refusal_ok,
+        cat2("score=", &i64_str(ok_score)),
+        cat2("caught=", &i64_str(caught_score)),
+    ))
+}
+
+fn pd03_case(work_root: &Path, base_prof: &Profile) -> Result<PdResult, String> {
+    let mut target_exe = base_prof.clone();
+    json::assign_str(
+        &mut target_exe.identity.exe,
+        "/opt/planted/unique-target-exe",
+    );
+    pd_deep_surface_case(
+        work_root,
+        base_prof,
+        "pd03",
+        "PD-03",
+        "Unique exe deep-phase detection",
+        1003,
+        "exe",
+        ObserverDefect::IgnoreExe,
+        &[],
+        Some(&target_exe),
+    )
+}
+
+fn pd04_case(work_root: &Path, base_prof: &Profile) -> Result<PdResult, String> {
+    pd_deep_surface_case(
+        work_root,
+        base_prof,
+        "pd04",
+        "PD-04",
+        "Unique maps decoy (HN-05) deep-phase detection",
+        1004,
+        "maps",
+        ObserverDefect::IgnoreMaps,
+        &[HardNeg::Hn05Maps],
+        None,
+    )
+}
+
+#[inline(never)]
+fn run_pd_suite(work_root: &Path) -> Result<Vec<PdResult>, String> {
+    const CTRL_SPECS: &[PdCtrlSpec] = &[
+        PdCtrlSpec {
+            tag: "pd01",
+            id: "PD-01",
+            name: "C-01 obvious target detection",
+            ctrl: Control::C01Obvious,
+            level: 1,
+            decoys: 10,
+            seed: 1001,
+            phase: "table",
+            bad_defect: ObserverDefect::AlwaysAbsent,
+            check_isolated: true,
+        },
+        PdCtrlSpec {
+            tag: "pd02",
+            id: "PD-02",
+            name: "C-04 no-target false-positive guard",
+            ctrl: Control::C04NoTarget,
+            level: 5,
+            decoys: 15,
+            seed: 1002,
+            phase: "deep",
+            bad_defect: ObserverDefect::AlwaysPickFirst,
+            check_isolated: false,
+        },
+    ];
+    type PdFn = fn(&Path, &Profile) -> Result<PdResult, String>;
+    const EXTRA_FNS: &[PdFn] = &[
+        pd03_case, pd04_case, pd05_case, pd06_case, pd07_case, pd08_case,
+    ];
+    let base_prof = clean_profile("ci-runner", false);
+    let mut out = Vec::with_capacity(8);
+    for spec in CTRL_SPECS {
+        out.push(pd_ctrl_case(work_root, &base_prof, spec)?);
+    }
+    for &f in EXTRA_FNS {
+        out.push(f(work_root, &base_prof)?);
+    }
+    Ok(out)
 }
 
 struct DiscReport {
@@ -982,6 +1216,7 @@ fn run_disc_trial(
     Ok(survived)
 }
 
+#[inline(never)]
 fn run_discrimination_matrix(work_root: &Path) -> Result<DiscReport, String> {
     const SEEDS: &[u64] = &[101, 202, 303];
     const DECOY_COUNTS: &[usize] = &[10, 50, 200];
@@ -1044,13 +1279,14 @@ fn run_discrimination_matrix(work_root: &Path) -> Result<DiscReport, String> {
     })
 }
 
+#[inline(never)]
 fn write_selftest_doc(
     w: &mut Jw,
     ok: bool,
     arr_key: &str,
     pds: &[PdResult],
     mode: u8,
-    disc_json: Option<&str>,
+    disc: Option<&DiscReport>,
 ) {
     w.reset(true);
     w.obj_open();
@@ -1058,35 +1294,50 @@ fn write_selftest_doc(
     w.k_bool("ok", ok);
     w.k_arr(arr_key);
     for p in pds {
-        match mode {
-            0 => p.write_guard(w, true),
-            1 => p.write_guard(w, false),
-            _ => p.write_full(w),
-        }
+        p.write_entry(w, mode);
     }
     w.arr_close();
-    if let Some(dj) = disc_json {
-        w.k_raw("discrimination", dj);
-        w.k_str("observer", "reference-blind-v1");
-        w.k_str("residual", DEFAULT_RESIDUAL);
+    if let Some(d) = disc {
+        w.k_obj("discrimination");
+        w.k_bool("ok", d.ok);
+        w.k_i64("runs_per_tier", d.runs_per_tier as i64);
+        w.k_str(
+            "matrix",
+            "3 seeds x 3 decoy counts (10,50,200) x 2 profiles (single,tree)",
+        );
+        w.k_i64s(
+            "survived_9of10,survived_7of10",
+            &[d.survived_9of10 as i64, d.survived_7of10 as i64],
+        );
+        w.k_f64s_r6(
+            "survival_9of10,survival_7of10",
+            &[d.survival_9of10, d.survival_7of10],
+        );
+        w.k_f64_pair_r6("ci_95_9of10", d.ci_9of10);
+        w.k_f64_pair_r6("ci_95_7of10", d.ci_7of10);
+        w.k_f64("threshold_9of10_min", 0.90);
+        w.k_f64("threshold_7of10_max", 0.50);
+        w.obj_close();
+        w.k_strs(
+            "observer,residual",
+            &["reference-blind-v1", DEFAULT_RESIDUAL],
+        );
     }
     w.obj_close();
 }
 
-/// Run the complete 9/10 planted-defect (`PD-01`..`PD-06`) and discrimination
+/// Run the complete 9/10 planted-defect (`PD-01`..`PD-08`) and discrimination
 /// acceptance suite (`psgen selftest`), returning `(ok, pretty_json)`.
-///
-/// When `out_dir` is `Some(dir)`, writes `passing.json` and `planted-defects.json`
-/// inside `dir`. Returns `Err(...)` if any guard or discrimination assertion fails.
+#[inline(never)]
 pub fn run_selftest(out_dir: Option<&Path>) -> Result<(bool, String), String> {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let scratch_name = cat3(
+    let scratch: PathBuf = std::env::temp_dir().join(json::concat(&[
         "psgen-selftest-",
         &u64_str(std::process::id() as u64),
-        &cat2("-", &u64_str(seq)),
-    );
-    let scratch: PathBuf = std::env::temp_dir().join(scratch_name);
+        "-",
+        &u64_str(seq),
+    ]));
     let _ = fs::remove_dir_all(&scratch);
     mkdir_all(&scratch)?;
 
@@ -1100,42 +1351,16 @@ pub fn run_selftest(out_dir: Option<&Path>) -> Result<(bool, String), String> {
     let all_pd_ok = pds.iter().all(PdResult::ok);
     let overall_ok = all_pd_ok && disc.ok;
 
-    let mut dw = Jw::new(true);
-    dw.obj_open();
-    dw.k_bool("ok", disc.ok);
-    dw.k_i64("runs_per_tier", disc.runs_per_tier as i64);
-    dw.k_str(
-        "matrix",
-        "3 seeds x 3 decoy counts (10,50,200) x 2 profiles (single,tree)",
-    );
-    dw.k_i64("survived_9of10", disc.survived_9of10 as i64);
-    dw.k_i64("survived_7of10", disc.survived_7of10 as i64);
-    dw.k_f64_r6("survival_9of10", disc.survival_9of10);
-    dw.k_f64_r6("survival_7of10", disc.survival_7of10);
-    dw.k_f64_pair_r6("ci_95_9of10", disc.ci_9of10);
-    dw.k_f64_pair_r6("ci_95_7of10", disc.ci_7of10);
-    dw.k_f64("threshold_9of10_min", 0.90);
-    dw.k_f64("threshold_7of10_max", 0.50);
-    dw.obj_close();
-    let disc_json = dw.finish();
-
     let mut w = Jw::new(true);
     if let Some(dir) = out_dir {
         mkdir_all(dir)?;
-        write_selftest_doc(&mut w, overall_ok, "guards", &pds, 0, Some(&disc_json));
+        write_selftest_doc(&mut w, overall_ok, "guards", &pds, 0, Some(&disc));
         w.write_to(&dir.join("passing.json"))?;
         write_selftest_doc(&mut w, all_pd_ok, "planted_defects", &pds, 1, None);
         w.write_to(&dir.join("planted-defects.json"))?;
     }
 
-    write_selftest_doc(
-        &mut w,
-        overall_ok,
-        "planted_defects",
-        &pds,
-        2,
-        Some(&disc_json),
-    );
+    write_selftest_doc(&mut w, overall_ok, "planted_defects", &pds, 2, Some(&disc));
     let report = w.finish();
 
     if !overall_ok {
@@ -1256,7 +1481,7 @@ mod tests {
         assert_eq!(disc.req_i64("runs_per_tier").unwrap(), 18);
 
         let pds = report.req_arr("planted_defects").unwrap();
-        assert_eq!(pds.len(), 6);
+        assert_eq!(pds.len(), 8);
         for pd in pds {
             assert!(pd.req_bool("ok").unwrap(), "guard failed: {pd}");
             assert!(pd.req_bool("passing_ok").unwrap());

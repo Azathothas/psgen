@@ -387,11 +387,11 @@ F_GET_SEALS = 1034
 F_ADD_SEALS = 1033
 
 
-def sealed_cfg(blob: bytes):
+def sealed_cfg(blob: bytes, name: bytes = b"psgen-test"):
     """A memfd config with the seals the stub requires, or None."""
     import ctypes
     libc = ctypes.CDLL("libc.so.6", use_errno=True)
-    fd = libc.memfd_create(b"psgen-test", 3)  # CLOEXEC | ALLOW_SEALING
+    fd = libc.memfd_create(name, 3)  # CLOEXEC | ALLOW_SEALING
     if fd < 0:
         return None
     os.write(fd, blob)
@@ -405,7 +405,7 @@ def sealed_cfg(blob: bytes):
     return fd
 
 
-def sealed_cfg_blob(blob: bytes):
+def sealed_cfg_blob(blob: bytes, nonce: bytes | None = None):
     """A sealed memfd config that is not descriptor 3.
 
     `Fd3` moves whatever it is given onto 3 and closes 3 afterwards, so a
@@ -413,7 +413,8 @@ def sealed_cfg_blob(blob: bytes):
     caller's own `os.close`. The test harness keeps descriptor 3 reserved for
     its own use, so the copy is moved above it first.
     """
-    fd = sealed_cfg(blob)
+    name = (b"pg:" + nonce) if nonce else b"psgen-test"
+    fd = sealed_cfg(blob, name=name)
     if fd is None:
         return None
     if fd == 3:
@@ -5234,12 +5235,29 @@ def cfg_blob(magic: bytes, version: int, *, stage: int, comm: bytes,
              self_copy: bytes, nonce: bytes, disk_kb: int) -> bytes:
     """A config in the wire format one psgen build reads.
 
-    `bf80156` used `PGCFG021`/version 2 and a 96-byte header; the fixed build
-    uses `PGCFG023`/version 3 and adds a nonce length at offset 96. Encoding
-    both lets a regression ask the same question of either binary: what did
-    the process *do* with this descriptor, not just what did it print.
+    Supports legacy `PGCFG021`/v2 (96B header), `PGCFG023`/v3 (104B header),
+    and unified `PGCFG023`/v5 (160B header). Encoding all lets regressions ask
+    what the process *did* with a forged descriptor, not just what it printed.
     """
     import struct
+
+    if magic == b"PGCFG023" and version == 5:
+        hdr = bytearray(160)
+        hdr[:8] = magic
+        struct.pack_into("<I", hdr, 8, version)
+        struct.pack_into("<I", hdr, 40, stage)
+        struct.pack_into("<i", hdr, 44, 5)    # max_fd
+        struct.pack_into("<i", hdr, 48, -1)   # arena_fd
+        struct.pack_into("<i", hdr, 52, -1)   # status_fd
+        struct.pack_into("<I", hdr, 60, disk_kb)
+        struct.pack_into("<i", hdr, 68, -1)   # execfn_fd
+        slices = [
+            comm, exe, cmd, user, temp, self_copy, nonce,
+            b"", b"", b"", b"", b"", b"", b"", b"",
+        ]
+        for idx, s in enumerate(slices):
+            struct.pack_into("<I", hdr, 100 + idx * 4, len(s))
+        return bytes(hdr) + b"".join(slices)
 
     header = 104 if magic == b"PGCFG023" else 96
     hdr = bytearray(header)
@@ -5365,7 +5383,7 @@ def forged_blob(tmp: Path, nonce: bytes):
     descriptor and never about the payload.
     """
     attack = Path(tmp) / "attack"
-    blob = cfg_blob(b"PGCFG023", 3, stage=1, comm=b"nginx", exe=b"",
+    blob = cfg_blob(b"PGCFG023", 5, stage=1, comm=b"nginx", exe=b"",
                     cmd=b"sleep 120", user=b"root",
                     temp=str(attack).encode(), self_copy=b"/bin/sh",
                     nonce=nonce, disk_kb=0)
@@ -6062,7 +6080,7 @@ def check_security_markers(tmp):
     # the exec stays a psgen process and the comm is the whole effect under
     # test; no other binary is involved.
     attack, blob = forged_blob(tmp, nonce)
-    made = sealed_cfg_blob(blob)
+    made = sealed_cfg_blob(blob, nonce=nonce)
     if made is None:
         skip("#25 cannot create a sealed memfd for the control")
     else:
@@ -6103,7 +6121,7 @@ def check_security_markers(tmp):
     # stays a psgen process and the comm is the whole effect under test; no
     # other binary is involved.
     attack, blob = forged_blob(tmp, nonce)
-    made = sealed_cfg_blob(blob)
+    made = sealed_cfg_blob(blob, nonce=nonce)
     if made is None:
         skip("#25 cannot create a sealed memfd for the control")
     else:

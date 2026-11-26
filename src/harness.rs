@@ -2,12 +2,14 @@
 //! generator, controls (`C-01`..`C-07`), and physically isolated blind bundle
 //! builder (`psgen run`).
 
+use crate::inject;
 use crate::json::{
     self, cat2, cat3, cat4, err_io, i64_str, mkdir_all, push_i64, push_i64_right, push_str_left,
     push_u64, push_u64_right, sort_strings, u64_str, write_file, write_in, Jw, OutDir,
 };
 use crate::profile::{self, ExtractOpts, Profile, ProfileFd, ProfileTask};
 use crate::rng::Rng;
+use crate::score;
 use crate::sha256;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,113 +18,102 @@ pub const HARNESS_SCHEMA: u32 = 1;
 pub const DEFAULT_RESIDUAL: &str = "same-uid local observer; root/kernel out of scope";
 const DECOY_TOKEN_LEN: usize = 32;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Mode {
     Table,
     Deep,
+    #[default]
     Both,
 }
 
-fn eq_any_ci(s: &str, opts_csv: &str) -> bool {
-    opts_csv.split(',').any(|o| s.eq_ignore_ascii_case(o))
+#[inline(never)]
+fn nth_pipe(table: &'static str, idx: usize) -> &'static str {
+    table.split('|').nth(idx).unwrap_or("")
+}
+
+#[inline(never)]
+fn parse_alias_idx(
+    s: &str,
+    aliases_pipe: &str,
+    kind: &str,
+    expected: &str,
+) -> Result<usize, String> {
+    let t = s.trim();
+    for (i, group) in aliases_pipe.split('|').enumerate() {
+        if group.split(',').any(|o| t.eq_ignore_ascii_case(o)) {
+            return Ok(i);
+        }
+    }
+    Err(cat4("invalid ", kind, " '", &cat3(t, "' ", expected)))
 }
 
 impl Mode {
     pub fn parse(s: &str) -> Result<Self, String> {
-        let t = s.trim();
-        if t.eq_ignore_ascii_case("table") {
-            Ok(Mode::Table)
-        } else if t.eq_ignore_ascii_case("deep") {
-            Ok(Mode::Deep)
-        } else if t.eq_ignore_ascii_case("both") {
-            Ok(Mode::Both)
-        } else {
-            Err(cat3(
-                "invalid mode '",
-                t,
-                "' (expected table, deep, or both)",
-            ))
-        }
+        let idx = parse_alias_idx(
+            s,
+            "table|deep|both",
+            "mode",
+            "(expected table, deep, or both)",
+        )?;
+        Ok([Mode::Table, Mode::Deep, Mode::Both]
+            .get(idx)
+            .copied()
+            .unwrap_or(Mode::Both))
     }
 
     pub fn as_str(&self) -> &'static str {
-        match self {
-            Mode::Table => "table",
-            Mode::Deep => "deep",
-            Mode::Both => "both",
-        }
+        nth_pipe("table|deep|both", *self as usize)
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Control {
     C01Obvious,
     C02Hidden,
     C03ExactClone,
     C04NoTarget,
     C05TargetOnly,
+    #[default]
     C06Main,
     C07HiddenByMask,
 }
 
 impl Control {
+    const ALL: &'static [Control] = &[
+        Control::C01Obvious,
+        Control::C02Hidden,
+        Control::C03ExactClone,
+        Control::C04NoTarget,
+        Control::C05TargetOnly,
+        Control::C06Main,
+        Control::C07HiddenByMask,
+    ];
+
     pub fn parse(s: &str) -> Result<Self, String> {
-        let t = s.trim();
-        if eq_any_ci(t, "c-01,c01,obvious,obvious-target") {
-            Ok(Control::C01Obvious)
-        } else if eq_any_ci(t, "c-02,c02,hidden,hidden-target") {
-            Ok(Control::C02Hidden)
-        } else if eq_any_ci(t, "c-03,c03,exact-clone,exact_clone,clone") {
-            Ok(Control::C03ExactClone)
-        } else if eq_any_ci(t, "c-04,c04,no-target,no_target") {
-            Ok(Control::C04NoTarget)
-        } else if eq_any_ci(t, "c-05,c05,target-only,target_only") {
-            Ok(Control::C05TargetOnly)
-        } else if eq_any_ci(t, "c-06,c06,main") {
-            Ok(Control::C06Main)
-        } else if eq_any_ci(t, "c-07,c07,hidden-by-mask,hidden_by_mask") {
-            Ok(Control::C07HiddenByMask)
-        } else {
-            Err(cat3("invalid control '", t, "' (expected C-01..C-07)"))
-        }
+        let idx = parse_alias_idx(
+            s,
+            "c-01,c01,obvious,obvious-target|c-02,c02,hidden,hidden-target|c-03,c03,exact-clone,exact_clone,clone|c-04,c04,no-target,no_target|c-05,c05,target-only,target_only|c-06,c06,main|c-07,c07,hidden-by-mask,hidden_by_mask",
+            "control",
+            "(expected C-01..C-07)",
+        )?;
+        Ok(Self::ALL.get(idx).copied().unwrap_or(Control::C06Main))
     }
 
     pub fn id(&self) -> &'static str {
-        match self {
-            Control::C01Obvious => "C-01",
-            Control::C02Hidden => "C-02",
-            Control::C03ExactClone => "C-03",
-            Control::C04NoTarget => "C-04",
-            Control::C05TargetOnly => "C-05",
-            Control::C06Main => "C-06",
-            Control::C07HiddenByMask => "C-07",
-        }
+        nth_pipe("C-01|C-02|C-03|C-04|C-05|C-06|C-07", *self as usize)
     }
 
     #[cfg(test)]
     pub fn slug(&self) -> &'static str {
-        match self {
-            Control::C01Obvious => "obvious",
-            Control::C02Hidden => "hidden",
-            Control::C03ExactClone => "exact-clone",
-            Control::C04NoTarget => "no-target",
-            Control::C05TargetOnly => "target-only",
-            Control::C06Main => "main",
-            Control::C07HiddenByMask => "hidden-by-mask",
-        }
+        nth_pipe(
+            "obvious|hidden|exact-clone|no-target|target-only|main|hidden-by-mask",
+            *self as usize,
+        )
     }
 
     #[cfg(test)]
     pub fn all() -> &'static [Control] {
-        &[
-            Control::C01Obvious,
-            Control::C02Hidden,
-            Control::C03ExactClone,
-            Control::C04NoTarget,
-            Control::C05TargetOnly,
-            Control::C06Main,
-            Control::C07HiddenByMask,
-        ]
+        Self::ALL
     }
 }
 
@@ -142,33 +133,17 @@ pub enum HardNeg {
 
 impl HardNeg {
     pub fn id(&self) -> &'static str {
-        match self {
-            HardNeg::Hn01Exe => "HN-01",
-            HardNeg::Hn02Ppid => "HN-02",
-            HardNeg::Hn03Starttime => "HN-03",
-            HardNeg::Hn04MemToken => "HN-04",
-            HardNeg::Hn05Maps => "HN-05",
-            HardNeg::Hn06Fd => "HN-06",
-            HardNeg::Hn07Status => "HN-07",
-            HardNeg::Hn08Syscall => "HN-08",
-            HardNeg::Hn09Cmdline => "HN-09",
-            HardNeg::Hn10Threads => "HN-10",
-        }
+        nth_pipe(
+            "HN-01|HN-02|HN-03|HN-04|HN-05|HN-06|HN-07|HN-08|HN-09|HN-10",
+            *self as usize,
+        )
     }
 
     pub fn surface(&self) -> &'static str {
-        match self {
-            HardNeg::Hn01Exe => "exe",
-            HardNeg::Hn02Ppid => "ppid",
-            HardNeg::Hn03Starttime => "starttime",
-            HardNeg::Hn04MemToken => "memory",
-            HardNeg::Hn05Maps => "maps",
-            HardNeg::Hn06Fd => "fd",
-            HardNeg::Hn07Status => "status",
-            HardNeg::Hn08Syscall => "syscall",
-            HardNeg::Hn09Cmdline => "cmdline",
-            HardNeg::Hn10Threads => "threads",
-        }
+        nth_pipe(
+            "exe|ppid|starttime|memory|maps|fd|status|syscall|cmdline|threads",
+            *self as usize,
+        )
     }
 
     pub fn all() -> &'static [HardNeg] {
@@ -187,19 +162,13 @@ impl HardNeg {
     }
 
     pub fn parse_one(s: &str) -> Result<Self, String> {
-        let t = s.trim();
-        let all = Self::all();
-        const ALIASES: &str = "hn-01,hn01,exe|hn-02,hn02,ppid|hn-03,hn03,starttime|hn-04,hn04,memory,mem,mem-token|hn-05,hn05,maps|hn-06,hn06,fd,fds|hn-07,hn07,status|hn-08,hn08,syscall,wchan|hn-09,hn09,cmdline,argv|hn-10,hn10,threads,task";
-        for (i, group) in ALIASES.split('|').enumerate() {
-            if eq_any_ci(t, group) {
-                return Ok(all[i]);
-            }
-        }
-        Err(cat3(
-            "invalid hard-negative '",
-            t,
-            "' (expected HN-01..HN-10, all, or none)",
-        ))
+        let idx = parse_alias_idx(
+            s,
+            "hn-01,hn01,exe|hn-02,hn02,ppid|hn-03,hn03,starttime|hn-04,hn04,memory,mem,mem-token|hn-05,hn05,maps|hn-06,hn06,fd,fds|hn-07,hn07,status|hn-08,hn08,syscall,wchan|hn-09,hn09,cmdline,argv|hn-10,hn10,threads,task",
+            "hard-negative",
+            "(expected HN-01..HN-10, all, or none)",
+        )?;
+        Ok(Self::all().get(idx).copied().unwrap_or(HardNeg::Hn01Exe))
     }
 
     pub fn parse_list(s: &str) -> Result<Vec<HardNeg>, String> {
@@ -245,6 +214,9 @@ pub struct RunOpts {
     pub live_target_pids: Vec<i32>,
     pub live_decoy_pids: Vec<i32>,
     pub decoy_token_prefix: String,
+    pub redact_tokens: Vec<String>,
+    pub redact_envs: Vec<String>,
+    pub live_mode: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -318,24 +290,31 @@ impl PidSet {
         }
     }
 
+    #[inline(never)]
     fn insert(&mut self, pid: i32) {
         if (0..65_536).contains(&pid) {
             let p = pid as usize;
-            self.bits[p >> 6] |= 1u64 << (p & 63);
+            if let Some(w) = self.bits.get_mut(p >> 6) {
+                *w |= 1u64 << (p & 63);
+            }
         } else if pid > 0 && !self.extra.contains(&pid) {
             self.extra.push(pid);
         }
     }
 
+    #[inline(never)]
     fn contains(&self, pid: i32) -> bool {
         if (0..65_536).contains(&pid) {
             let p = pid as usize;
-            (self.bits[p >> 6] & (1u64 << (p & 63))) != 0
+            self.bits
+                .get(p >> 6)
+                .is_some_and(|&w| (w & (1u64 << (p & 63))) != 0)
         } else {
             self.extra.contains(&pid)
         }
     }
 
+    #[inline(never)]
     fn alloc_monotonic(&mut self, start_cursor: i32, span: u32) -> i32 {
         let need = span.max(1) as i32;
         let mut cand = start_cursor.max(300);
@@ -361,16 +340,6 @@ fn reserve_tree_pids(prof: &Profile, alloc: &mut PidSet) {
     }
 }
 
-fn sort_tasks(v: &mut [ProfileTask]) {
-    for i in 1..v.len() {
-        let mut j = i;
-        while j > 0 && v[j - 1].tid > v[j].tid {
-            v.swap(j - 1, j);
-            j -= 1;
-        }
-    }
-}
-
 fn validate_run_id(id: &str) -> Result<String, String> {
     let trimmed = id.trim();
     if trimmed.is_empty()
@@ -393,7 +362,7 @@ fn default_run_id(seed: u64, control: Control, level: u8) -> String {
     mat.push(':');
     push_u64(&mut mat, level as u64);
     let digest = sha256::hash_hex(mat.as_bytes());
-    cat2("run-", &digest[..12])
+    cat2("run-", digest.get(..12).unwrap_or(&digest))
 }
 
 fn uid_display(uid: u32) -> String {
@@ -435,55 +404,240 @@ fn sanitize_comm_col(comm: &str) -> String {
     }
 }
 
-fn format_args(prof: &Profile) -> String {
+#[inline(never)]
+fn push_args(out: &mut String, prof: &Profile) {
     if prof.identity.argv.is_empty() {
-        cat3("[", &prof.identity.comm, "]")
-    } else {
-        let mut out = String::new();
-        for (i, a) in prof.identity.argv.iter().enumerate() {
-            if i > 0 {
-                out.push(' ');
-            }
-            for ch in a.chars() {
-                out.push(if matches!(ch, '\n' | '\r' | '\0') {
-                    ' '
-                } else {
-                    ch
-                });
-            }
+        out.push('[');
+        out.push_str(&prof.identity.comm);
+        out.push(']');
+        return;
+    }
+    for (i, a) in prof.identity.argv.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
         }
-        out
+        for ch in a.chars() {
+            out.push(if matches!(ch, '\n' | '\r' | '\0') {
+                ' '
+            } else {
+                ch
+            });
+        }
     }
 }
 
+#[inline(never)]
+fn sanitize_workspace_paths(s: &str) -> String {
+    let mut cur = profile::sanitize_host_home(s);
+    while let Some(pos) = cur.find("/workspaces/") {
+        let rest = &cur[pos + "/workspaces/".len()..];
+        let seg_len = rest
+            .bytes()
+            .take_while(|&b| {
+                !b.is_ascii_whitespace() && !matches!(b, b'/' | b':' | b'"' | b'\'' | b'\0')
+            })
+            .count();
+        let end = pos + "/workspaces/".len() + seg_len;
+        let mut next = String::with_capacity(cur.len());
+        next.push_str(&cur[..pos]);
+        next.push_str("/srv/work");
+        next.push_str(&cur[end..]);
+        cur = next;
+    }
+    cur
+}
+
+#[inline(never)]
+fn set_s(dst: &mut String, val: &str) {
+    dst.clear();
+    dst.push_str(val);
+}
+
+#[inline(never)]
+fn set_opt_s(dst: &mut Option<String>, val: Option<&str>) {
+    *dst = val.map(json::own);
+}
+
+#[inline(never)]
+fn set_vec_s(dst: &mut Vec<String>, vals: &[&str]) {
+    dst.clear();
+    for &v in vals {
+        dst.push(json::own(v));
+    }
+}
+
+#[inline(never)]
+fn sp_s(out: &mut String, s: &str) {
+    out.push_str(s);
+}
+
+#[inline(never)]
+fn sp_kv_s(out: &mut String, k: &str, v: &str) {
+    out.push_str(k);
+    out.push_str(v);
+}
+
+#[inline(never)]
+fn sp_kv_u(out: &mut String, k: &str, v: u64) {
+    out.push_str(k);
+    push_u64(out, v);
+}
+
+#[inline(never)]
+fn push_joined(out: &mut String, items: &[String], sep: &str) {
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            sp_s(out, sep);
+        }
+        sp_s(out, item);
+    }
+}
+
+#[inline(never)]
+fn push_sorted_joined(out: &mut String, items: &[String], sep: &str) {
+    let mut tmp = items.to_vec();
+    sort_strings(&mut tmp);
+    push_joined(out, &tmp, sep);
+}
+
+#[inline(never)]
+fn clear_mem_token(m: &mut profile::ProfileMemory) {
+    m.token_present = false;
+    m.token_sha256 = None;
+    m.token_len = None;
+    m.token_placements.clear();
+}
+
+#[inline(never)]
+fn apply_decoy_token(m: &mut profile::ProfileMemory, rng: &mut Rng, prefix: &str) -> usize {
+    let (tlen, digest) = generate_decoy_token(
+        rng,
+        prefix,
+        m.token_len,
+        m.token_charset.as_deref(),
+        m.token_sha256.as_deref(),
+    );
+    m.token_present = true;
+    m.token_sha256 = Some(digest);
+    if m.token_len.is_none() {
+        m.token_len = Some(tlen as u32);
+    }
+    tlen
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn make_proc_entry(
+    role: Role,
+    profile: Profile,
+    decoy_token_len: Option<usize>,
+    visible: bool,
+    is_live: bool,
+    parent_idx: Option<usize>,
+    orig_parent_pid: Option<i32>,
+    pgrp: i32,
+    session: i32,
+    depth: u32,
+    tie: u64,
+) -> ProcEntry {
+    ProcEntry {
+        role,
+        profile,
+        mutation: None,
+        decoy_token_len,
+        visible,
+        is_live,
+        parent_idx,
+        orig_parent_pid,
+        pgrp,
+        session,
+        depth,
+        tie,
+    }
+}
+
+#[inline(never)]
+fn set_ppid(p: &mut Profile, ppid: i32) {
+    p.identity.ppid = ppid;
+    p.status.ppid = ppid;
+    p.stat.ppid = ppid;
+}
+
+#[inline(never)]
+fn set_starttime(p: &mut Profile, st: u64) {
+    p.identity.starttime = st;
+    p.stat.starttime = st;
+}
+
+fn default_tok_len(p: &Profile) -> Option<usize> {
+    p.memory
+        .token_present
+        .then(|| p.memory.token_len.unwrap_or(DECOY_TOKEN_LEN as u32) as usize)
+}
+
+fn sanitize_vec(v: &mut [String]) {
+    for s in v.iter_mut() {
+        *s = sanitize_workspace_paths(s);
+    }
+}
+
+#[inline(never)]
 pub fn sanitize_live_profile(prof: &mut Profile) {
-    prof.identity.cwd = profile::sanitize_host_home(&prof.identity.cwd);
-    prof.identity.exe = profile::sanitize_host_home(&prof.identity.exe);
-    for arg in &mut prof.identity.argv {
-        *arg = profile::sanitize_host_home(arg);
-    }
+    prof.identity.cwd = sanitize_workspace_paths(&prof.identity.cwd);
+    prof.identity.exe = sanitize_workspace_paths(&prof.identity.exe);
+    sanitize_vec(&mut prof.identity.argv);
     if let Some(ref execfn) = prof.auxv.at_execfn {
-        prof.auxv.at_execfn = Some(profile::sanitize_host_home(execfn));
+        prof.auxv.at_execfn = Some(sanitize_workspace_paths(execfn));
     }
-    for env in &mut prof.environ {
-        *env = profile::sanitize_host_home(env);
-    }
-    for m in &mut prof.memory.maps {
-        *m = profile::sanitize_host_home(m);
-    }
-    for s in &mut prof.memory.smaps {
-        *s = profile::sanitize_host_home(s);
-    }
+    sanitize_vec(&mut prof.environ);
+    sanitize_vec(&mut prof.memory.maps);
+    sanitize_vec(&mut prof.memory.smaps);
     for fd in &mut prof.fds {
-        fd.target = profile::sanitize_host_home(&fd.target);
+        fd.target = sanitize_workspace_paths(&fd.target);
     }
     for child in &mut prof.children {
         sanitize_live_profile(child);
+    }
+    if let Some(ref mut par) = prof.parent {
+        sanitize_live_profile(par);
+    }
+    if let Some(ref mut tr) = prof.tracer {
+        sanitize_live_profile(tr);
+    }
+}
+
+/// Prune `self_pid` (the running `psgen` harness process) and its own parent from
+/// captured upward ancestor chains so live captures never pull `psgen` itself into
+/// the target or decoy trees.
+#[inline(never)]
+pub fn strip_self_ancestors(prof: &mut Profile) {
+    let self_pid = std::process::id() as i32;
+    let self_ppid = crate::live::read_stat(self_pid)
+        .map(|s| s.ppid as i32)
+        .unwrap_or(0);
+    strip_ancestors_inner(prof, self_pid, self_ppid);
+}
+
+fn strip_ancestors_inner(prof: &mut Profile, self_pid: i32, self_ppid: i32) {
+    if let Some(ref mut par) = prof.parent {
+        if par.identity.pid == self_pid || (self_ppid > 1 && par.identity.pid == self_ppid) {
+            prof.parent = None;
+        } else {
+            strip_ancestors_inner(par, self_pid, self_ppid);
+        }
+    }
+    if let Some(ref mut tr) = prof.tracer {
+        if tr.identity.pid == self_pid || (self_ppid > 1 && tr.identity.pid == self_ppid) {
+            prof.tracer = None;
+        } else {
+            strip_ancestors_inner(tr, self_pid, self_ppid);
+        }
     }
 }
 
 /// Normalize ephemeral kernel pipe/socket inodes so FD shape comparison
 /// matches across peers that hold distinct realistic inodes.
+#[inline(never)]
 pub fn normalize_fd_target(target: &str) -> String {
     for prefix in ["pipe:[", "socket:["] {
         if let Some(rest) = target.strip_prefix(prefix) {
@@ -520,30 +674,34 @@ fn remap_synthetic_fd_inodes(fds: &mut [ProfileFd], seed: u64, pid: i32) {
     }
 }
 
-/// Generate a deterministic 32-byte decoy token matching target token length.
-fn generate_decoy_token(rng: &mut Rng, prefix: &str) -> (usize, String) {
-    let raw_pfx = if prefix.trim().is_empty() {
-        "dtok_"
-    } else {
-        prefix.trim()
-    };
-    let pfx_len = raw_pfx.len().min(DECOY_TOKEN_LEN - 8);
-    let pfx = &raw_pfx[..pfx_len];
-    let hex_len = DECOY_TOKEN_LEN - pfx_len;
-    let mut hex_buf = [0u8; DECOY_TOKEN_LEN];
-    rng.hex(hex_len, &mut hex_buf[..hex_len]);
-    let mut token = String::with_capacity(DECOY_TOKEN_LEN);
-    token.push_str(pfx);
-    token.push_str(std::str::from_utf8(&hex_buf[..hex_len]).unwrap_or("00000000"));
-    (token.len(), sha256::hash_hex(token.as_bytes()))
+/// Generate a deterministic decoy token matching target length/charset and avoiding `avoid_sha256`.
+fn generate_decoy_token(
+    rng: &mut Rng,
+    prefix: &str,
+    want_len: Option<u32>,
+    charset: Option<&str>,
+    avoid_sha256: Option<&str>,
+) -> (usize, String) {
+    let pfx = prefix.trim();
+    let pfx_opt = if pfx.is_empty() { None } else { Some(pfx) };
+    let tok = inject::make_shaped_decoy_token(pfx_opt, want_len, charset, avoid_sha256, rng);
+    (tok.len(), sha256::hash_hex(&tok))
 }
 
+#[inline(never)]
+fn make_task(tid: i32, comm: &str, state: &str) -> ProfileTask {
+    ProfileTask {
+        tid,
+        comm: json::own(comm),
+        state: json::own(state),
+    }
+}
+
+#[inline(never)]
 fn sync_node_pid_ppid(node: &mut Profile, pid: i32, ppid: i32, orig_parent_pid: Option<i32>) {
     let old_pid = node.identity.pid;
     node.identity.pid = pid;
-    node.identity.ppid = ppid;
-    node.status.ppid = ppid;
-    node.stat.ppid = ppid;
+    set_ppid(node, ppid);
     if let Some(orig_p) = orig_parent_pid {
         if node.status.tracer_pid == orig_p && orig_p > 0 {
             node.status.tracer_pid = ppid;
@@ -556,11 +714,7 @@ fn sync_node_pid_ppid(node: &mut Profile, pid: i32, ppid: i32, orig_parent_pid: 
 
     let mut new_tasks = Vec::with_capacity(wanted as usize);
     if node.task.is_empty() {
-        new_tasks.push(ProfileTask {
-            tid: pid,
-            comm: node.identity.comm.clone(),
-            state: node.status.state.clone(),
-        });
+        new_tasks.push(make_task(pid, &node.identity.comm, &node.status.state));
     } else {
         let mut next_extra = 1i32;
         let mut main_placed = false;
@@ -573,11 +727,7 @@ fn sync_node_pid_ppid(node: &mut Profile, pid: i32, ppid: i32, orig_parent_pid: 
                 next_extra += 1;
                 x
             };
-            new_tasks.push(ProfileTask {
-                tid,
-                comm: t.comm.clone(),
-                state: t.state.clone(),
-            });
+            new_tasks.push(make_task(tid, &t.comm, &t.state));
         }
         if !main_placed {
             if let Some(first) = new_tasks.first_mut() {
@@ -586,13 +736,13 @@ fn sync_node_pid_ppid(node: &mut Profile, pid: i32, ppid: i32, orig_parent_pid: 
         }
     }
     while (new_tasks.len() as u32) < wanted {
-        new_tasks.push(ProfileTask {
-            tid: pid + new_tasks.len() as i32,
-            comm: node.identity.comm.clone(),
-            state: node.status.state.clone(),
-        });
+        new_tasks.push(make_task(
+            pid + new_tasks.len() as i32,
+            &node.identity.comm,
+            &node.status.state,
+        ));
     }
-    sort_tasks(&mut new_tasks);
+    json::shell_sort_by(&mut new_tasks, |a, b| a.tid > b.tid);
     node.task = new_tasks;
 }
 
@@ -615,36 +765,29 @@ fn push_synthetic_tree(
     let (parent_idx, orig_parent_pid) = match parent_link {
         Some((pidx, orig_p, parent_st)) => {
             if node.identity.starttime < parent_st {
-                node.identity.starttime = parent_st;
-                node.stat.starttime = parent_st;
+                set_starttime(&mut node, parent_st);
             }
             (Some(pidx), Some(orig_p))
         }
         None => (None, None),
     };
 
-    let tok_len = if node.memory.token_present {
-        Some(DECOY_TOKEN_LEN)
-    } else {
-        None
-    };
-
+    let tok_len = default_tok_len(&node);
     let my_st = node.identity.starttime;
     let my_idx = out.len();
-    out.push(ProcEntry {
+    out.push(make_proc_entry(
         role,
-        profile: node,
-        mutation: None,
-        decoy_token_len: tok_len,
+        node,
+        tok_len,
         visible,
-        is_live: false,
+        false,
         parent_idx,
         orig_parent_pid,
-        pgrp: 0,
-        session: 0,
+        0,
+        0,
         depth,
-        tie: rng.next_u64(),
-    });
+        rng.next_u64(),
+    ));
 
     for child in &kids {
         push_synthetic_tree(
@@ -663,6 +806,7 @@ fn push_synthetic_tree(
 /// Assign monotonically increasing PIDs correlated with `starttime` across all synthetic entries,
 /// guaranteeing `child.pid > parent.pid`, realistic `pgrp`/`session` inheritance, and unique
 /// per-process pipe/socket inodes.
+#[inline(never)]
 fn assign_synthetic_pids(entries: &mut [ProcEntry], alloc: &mut PidSet, rng: &mut Rng, seed: u64) {
     let mut synth: Vec<usize> = Vec::with_capacity(entries.len());
     for (i, e) in entries.iter().enumerate() {
@@ -672,25 +816,14 @@ fn assign_synthetic_pids(entries: &mut [ProcEntry], alloc: &mut PidSet, rng: &mu
     }
 
     // Shellsort by (starttime, depth, random tiebreaker) so parents always precede children
-    // and PID order monotonically tracks process creation time (avoids core::slice::sort bloat).
-    const GAPS: &[usize] = &[701, 301, 132, 57, 23, 10, 4, 1];
-    let key = |idx: usize| {
-        let e = &entries[idx];
-        (e.profile.identity.starttime, e.depth, e.tie)
-    };
-    let slen = synth.len();
-    for &gap in GAPS {
-        if gap >= slen {
-            continue;
-        }
-        for i in gap..slen {
-            let mut j = i;
-            while j >= gap && key(synth[j - gap]) > key(synth[j]) {
-                synth.swap(j - gap, j);
-                j -= gap;
-            }
-        }
-    }
+    // and PID order monotonically tracks process creation time.
+    json::shell_sort_by(&mut synth, |&a, &b| {
+        let (Some(ea), Some(eb)) = (entries.get(a), entries.get(b)) else {
+            return false;
+        };
+        (ea.profile.identity.starttime, ea.depth, ea.tie)
+            > (eb.profile.identity.starttime, eb.depth, eb.tie)
+    });
 
     let n = synth.len().max(1);
     let mut cursor = rng.range(1_200, 3_600) as i32;
@@ -698,22 +831,34 @@ fn assign_synthetic_pids(entries: &mut [ProcEntry], alloc: &mut PidSet, rng: &mu
     let mut prev_st: Option<u64> = None;
 
     for idx in synth {
-        let span = entries[idx]
-            .profile
-            .status
-            .threads
-            .max(entries[idx].profile.stat.num_threads)
-            .max(entries[idx].profile.task.len() as u32)
-            .max(1);
-        let st = entries[idx].profile.identity.starttime;
+        let Some((span, st, parent_idx, orig_parent_pid, cur_ppid)) = entries.get(idx).map(|e| {
+            let p = &e.profile;
+            (
+                p.status
+                    .threads
+                    .max(p.stat.num_threads)
+                    .max(p.task.len() as u32)
+                    .max(1),
+                p.identity.starttime,
+                e.parent_idx,
+                e.orig_parent_pid,
+                p.identity.ppid,
+            )
+        }) else {
+            continue;
+        };
         let step = rng.range(1, max_step) as i32;
         let jump_bonus = match prev_st {
             Some(pst) if st > pst => ((st - pst) / 2_000).min(12) as i32,
             _ => 0,
         };
         cursor = cursor.saturating_add(step + jump_bonus);
-        if let Some(pidx) = entries[idx].parent_idx {
-            let parent_pid = entries[pidx].profile.identity.pid;
+        let parent_info = parent_idx.and_then(|pidx| {
+            entries
+                .get(pidx)
+                .map(|pe| (pe.profile.identity.pid, pe.pgrp, pe.session))
+        });
+        if let Some((parent_pid, _, _)) = parent_info {
             if cursor <= parent_pid {
                 cursor = parent_pid + 1;
             }
@@ -722,33 +867,31 @@ fn assign_synthetic_pids(entries: &mut [ProcEntry], alloc: &mut PidSet, rng: &mu
         cursor = pid + span as i32;
         prev_st = Some(st);
 
-        let (ppid, pgrp, session) = match entries[idx].parent_idx {
-            Some(pidx) => (
-                entries[pidx].profile.identity.pid,
-                entries[pidx].pgrp,
-                entries[pidx].session,
-            ),
-            None => (entries[idx].profile.identity.ppid, pid, pid),
-        };
-        let orig_parent_pid = entries[idx].orig_parent_pid;
-        sync_node_pid_ppid(&mut entries[idx].profile, pid, ppid, orig_parent_pid);
-        entries[idx].pgrp = pgrp;
-        entries[idx].session = session;
-        remap_synthetic_fd_inodes(&mut entries[idx].profile.fds, seed, pid);
+        let (ppid, pgrp, session) = parent_info.unwrap_or((cur_ppid, pid, pid));
+        if let Some(e) = entries.get_mut(idx) {
+            sync_node_pid_ppid(&mut e.profile, pid, ppid, orig_parent_pid);
+            e.pgrp = pgrp;
+            e.session = session;
+            remap_synthetic_fd_inodes(&mut e.profile.fds, seed, pid);
+        }
     }
 
     // Set pgrp/session for live entries (children inherit parent's pgrp/session).
     for idx in 0..entries.len() {
-        if entries[idx].is_live {
-            let (pgrp, session) = match entries[idx].parent_idx {
-                Some(pidx) => (entries[pidx].pgrp, entries[pidx].session),
-                None => {
-                    let pid = entries[idx].profile.identity.pid;
-                    (pid, pid)
-                }
-            };
-            entries[idx].pgrp = pgrp;
-            entries[idx].session = session;
+        let Some((is_live, parent_idx, pid)) = entries
+            .get(idx)
+            .map(|e| (e.is_live, e.parent_idx, e.profile.identity.pid))
+        else {
+            continue;
+        };
+        if is_live {
+            let (pgrp, session) = parent_idx
+                .and_then(|pidx| entries.get(pidx).map(|pe| (pe.pgrp, pe.session)))
+                .unwrap_or((pid, pid));
+            if let Some(e) = entries.get_mut(idx) {
+                e.pgrp = pgrp;
+                e.session = session;
+            }
         }
     }
 }
@@ -790,6 +933,7 @@ fn adjust_smaps_heap_rss(smaps: &mut [String], delta_kb: i64) {
 /// Apply Level 6 `starttime`, 4K-aligned `vsize`, and `rss` (plus matching `smaps`) jitter.
 /// Applied symmetrically to BOTH synthetic Target and Level 6 decoys so Target is statistically
 /// indistinguishable from the decoy distribution.
+#[inline(never)]
 fn apply_level6_jitter(node: &mut Profile, rng: &mut Rng, parent_starttime: Option<u64>) {
     let base_st = match parent_starttime {
         Some(pst) => pst.saturating_add(rng.range(5, 45)),
@@ -800,8 +944,7 @@ fn apply_level6_jitter(node: &mut Profile, rng: &mut Rng, parent_starttime: Opti
                 .max(100) as u64
         }
     };
-    node.identity.starttime = base_st;
-    node.stat.starttime = base_st;
+    set_starttime(node, base_st);
 
     let aligned_vsize = node.stat.vsize & !4095u64;
     let vsize_delta = (rng.range(0, 16) as i64 - 8) * 4096;
@@ -819,6 +962,7 @@ fn apply_level6_jitter(node: &mut Profile, rng: &mut Rng, parent_starttime: Opti
     }
 }
 
+#[inline(never)]
 fn reset_decoy_deep(
     d: &mut Profile,
     exe: &str,
@@ -828,28 +972,44 @@ fn reset_decoy_deep(
     sc: &str,
     wchan: &str,
 ) {
-    d.identity.exe = exe.to_string();
+    set_s(&mut d.identity.exe, exe);
     d.identity.exe_memfd = None;
-    d.auxv.at_execfn = Some(exe.to_string());
+    set_opt_s(&mut d.auxv.at_execfn, Some(exe));
     let (maps, smaps) = profile::basic_maps_smaps(exe, ino, exe_kb, heap_kb);
     d.memory.maps = maps;
     d.memory.smaps = smaps;
     d.memory.token_present = false;
     d.memory.token_sha256 = None;
-    d.syscall.syscall = sc.to_string();
-    d.syscall.wchan = wchan.to_string();
+    set_s(&mut d.syscall.syscall, sc);
+    set_s(&mut d.syscall.wchan, wchan);
     d.dumpable = Some(true);
 }
 
+#[inline(never)]
 fn null_fds(n: i32) -> Vec<ProfileFd> {
     (0..n)
         .map(|fd| ProfileFd {
             fd,
-            target: "/dev/null".to_string(),
+            target: json::own("/dev/null"),
         })
         .collect()
 }
 
+#[inline(never)]
+fn default_decoy_env() -> Vec<String> {
+    vec![json::own("PATH=/usr/bin:/bin"), json::own("LANG=C")]
+}
+
+#[inline(never)]
+fn single_sleeping_task(comm: &str) -> Vec<ProfileTask> {
+    vec![ProfileTask {
+        tid: 0,
+        comm: json::own(comm),
+        state: json::own("S"),
+    }]
+}
+
+#[inline(never)]
 fn build_level1_decoy(target: &Profile, rng: &mut Rng) -> Profile {
     let mut d = target.clone();
     d.children.clear();
@@ -857,36 +1017,29 @@ fn build_level1_decoy(target: &Profile, rng: &mut Rng) -> Profile {
         .identity
         .starttime
         .saturating_add(rng.range(50, 5_000));
-    d.source.masker = "level1".to_string();
-    d.source.profile = "single".to_string();
-    d.identity.comm = "sleep".to_string();
-    d.identity.argv = vec![target.identity.label.clone(), "1800".to_string()];
+    set_s(&mut d.source.masker, "level1");
+    set_s(&mut d.source.profile, "single");
+    set_s(&mut d.identity.comm, "sleep");
+    set_vec_s(&mut d.identity.argv, &[&target.identity.label, "1800"]);
     d.identity.cmdline_raw_nuls = Some(1);
     d.identity.pid = 0;
-    d.identity.ppid = 1;
-    d.identity.starttime = st;
-    d.identity.cwd = "/tmp".to_string();
-    d.status.name = "sleep".to_string();
-    d.status.state = "S".to_string();
-    d.status.ppid = 1;
+    set_ppid(&mut d, 1);
+    set_starttime(&mut d, st);
+    set_s(&mut d.identity.cwd, "/tmp");
+    set_s(&mut d.status.name, "sleep");
+    set_s(&mut d.status.state, "S");
     d.status.threads = 1;
     d.status.tracer_pid = 0;
     d.status.no_new_privs = 0;
     d.status.seccomp = 0;
     d.status.seccomp_filters = 0;
-    d.stat.ppid = 1;
     d.stat.num_threads = 1;
-    d.stat.starttime = st;
     d.stat.vsize = 5_840_896;
     d.stat.rss = 192;
     d.memory.denied_by.clear();
     d.fds = null_fds(3);
-    d.environ = vec!["PATH=/usr/bin:/bin".to_string(), "LANG=C".to_string()];
-    d.task = vec![ProfileTask {
-        tid: 0,
-        comm: "sleep".to_string(),
-        state: "S".to_string(),
-    }];
+    d.environ = default_decoy_env();
+    d.task = single_sleeping_task("sleep");
     reset_decoy_deep(
         &mut d,
         "/usr/bin/sleep",
@@ -899,6 +1052,7 @@ fn build_level1_decoy(target: &Profile, rng: &mut Rng) -> Profile {
     d
 }
 
+#[inline(never)]
 fn build_level2_decoy(target: &Profile, rng: &mut Rng) -> Profile {
     let mut d = target.clone();
     d.children.clear();
@@ -908,16 +1062,16 @@ fn build_level2_decoy(target: &Profile, rng: &mut Rng) -> Profile {
     } else {
         "/usr/libexec/decoy-stub"
     };
-    d.identity.ppid = alt_ppid;
-    d.status.ppid = alt_ppid;
-    d.stat.ppid = alt_ppid;
-    d.identity.cwd = "/tmp".to_string();
-    d.identity.starttime = target
-        .identity
-        .starttime
-        .saturating_add(rng.range(20, 4_000));
-    d.stat.starttime = d.identity.starttime;
-    d.environ = vec!["PATH=/usr/bin:/bin".to_string(), "LANG=C".to_string()];
+    set_ppid(&mut d, alt_ppid);
+    set_s(&mut d.identity.cwd, "/tmp");
+    set_starttime(
+        &mut d,
+        target
+            .identity
+            .starttime
+            .saturating_add(rng.range(20, 4_000)),
+    );
+    d.environ = default_decoy_env();
     d.fds = null_fds(2);
     reset_decoy_deep(
         &mut d,
@@ -931,6 +1085,7 @@ fn build_level2_decoy(target: &Profile, rng: &mut Rng) -> Profile {
     d
 }
 
+#[inline(never)]
 fn degrade_deep_for_level3(node: &mut Profile, rng: &mut Rng, parent_st: Option<u64>) {
     let alt_exe = if node.identity.exe == "/usr/libexec/decoy-tree-worker" {
         "/usr/bin/decoy-tree-worker"
@@ -940,73 +1095,50 @@ fn degrade_deep_for_level3(node: &mut Profile, rng: &mut Rng, parent_st: Option<
     let sc = node.syscall.syscall.clone();
     let wc = node.syscall.wchan.clone();
     reset_decoy_deep(node, alt_exe, "888", 1536, 2432, &sc, &wc);
-    node.environ = vec![
-        "PATH=/usr/bin:/bin".to_string(),
-        "DECOY_STAGE=tree-only".to_string(),
-    ];
+    set_vec_s(
+        &mut node.environ,
+        &["PATH=/usr/bin:/bin", "DECOY_STAGE=tree-only"],
+    );
     node.fds = vec![
         ProfileFd {
             fd: 0,
-            target: "/dev/null".to_string(),
+            target: json::own("/dev/null"),
         },
         ProfileFd {
             fd: 1,
-            target: "pipe:[99001]".to_string(),
+            target: json::own("pipe:[99001]"),
         },
     ];
     let st = match parent_st {
         Some(pst) => pst.saturating_add(rng.range(5, 45)),
         None => node.identity.starttime.saturating_add(rng.range(10, 2_000)),
     };
-    node.identity.starttime = st;
-    node.stat.starttime = st;
+    set_starttime(node, st);
     for child in &mut node.children {
         degrade_deep_for_level3(child, rng, Some(st));
     }
 }
 
-fn tree_has_token(p: &Profile) -> bool {
-    p.memory.token_present || p.children.iter().any(tree_has_token)
-}
-
+#[inline(never)]
 fn prepare_level4_to_6_decoy(
     target: &Profile,
     level: u8,
     rng: &mut Rng,
     token_prefix: &str,
     is_root: bool,
-    target_tree_has_token: bool,
 ) -> (Profile, Option<usize>) {
     let mut node = target.clone();
-    let mut tok_len = None;
-
-    if level == 4 {
-        node.memory.token_present = false;
-        node.memory.token_sha256 = None;
+    let tok_len = if level >= 5 && node.memory.token_present {
+        Some(apply_decoy_token(&mut node.memory, rng, token_prefix))
     } else {
-        let place_token = node.memory.token_present || (!target_tree_has_token && is_root);
-        if place_token {
-            let (tlen, digest) = generate_decoy_token(rng, token_prefix);
-            node.memory.token_present = true;
-            node.memory.token_sha256 = Some(digest);
-            tok_len = Some(tlen);
-        } else {
-            node.memory.token_present = false;
-            node.memory.token_sha256 = None;
-        }
-    }
+        clear_mem_token(&mut node.memory);
+        None
+    };
 
     let orig_children = std::mem::take(&mut node.children);
     let mut new_children = Vec::with_capacity(orig_children.len());
     for child in &orig_children {
-        let (c_node, _) = prepare_level4_to_6_decoy(
-            child,
-            level,
-            rng,
-            token_prefix,
-            false,
-            target_tree_has_token,
-        );
+        let (c_node, _) = prepare_level4_to_6_decoy(child, level, rng, token_prefix, false);
         new_children.push(c_node);
     }
     node.children = new_children;
@@ -1018,6 +1150,7 @@ fn prepare_level4_to_6_decoy(
     (node, tok_len)
 }
 
+#[inline(never)]
 fn build_hard_negative(
     target: &Profile,
     hn: HardNeg,
@@ -1029,8 +1162,7 @@ fn build_hard_negative(
     if level >= 5 {
         for child in &mut node.children {
             if child.memory.token_present {
-                let (_, digest) = generate_decoy_token(rng, token_prefix);
-                child.memory.token_sha256 = Some(digest);
+                let _ = apply_decoy_token(&mut child.memory, rng, token_prefix);
             }
         }
     }
@@ -1038,105 +1170,74 @@ fn build_hard_negative(
         apply_level6_jitter(&mut node, rng, None);
     }
 
-    let mut tok_len = if node.memory.token_present {
-        Some(DECOY_TOKEN_LEN)
-    } else {
-        None
-    };
+    let mut tok_len = default_tok_len(&node);
 
-    let mutation = match hn {
+    match hn {
         HardNeg::Hn01Exe => {
             let new_exe = if node.identity.exe == "/usr/bin/hn01-alt-bin" {
                 "/usr/local/bin/hn01-alt-bin"
             } else {
                 "/usr/bin/hn01-alt-bin"
             };
-            node.identity.exe = new_exe.to_string();
+            set_s(&mut node.identity.exe, new_exe);
             node.identity.exe_memfd = None;
-            node.auxv.at_execfn = Some(new_exe.to_string());
-            "exe mutated"
         }
         HardNeg::Hn02Ppid => {
             let new_ppid = if node.identity.ppid == 1 { 2048 } else { 1 };
-            node.identity.ppid = new_ppid;
-            node.status.ppid = new_ppid;
-            node.stat.ppid = new_ppid;
-            "ppid mutated"
+            set_ppid(&mut node, new_ppid);
         }
         HardNeg::Hn03Starttime => {
             let new_st = node.identity.starttime.saturating_add(500_000);
-            node.identity.starttime = new_st;
-            node.stat.starttime = new_st;
+            set_starttime(&mut node, new_st);
             for child in &mut node.children {
-                child.identity.starttime = new_st.saturating_add(18);
-                child.stat.starttime = child.identity.starttime;
+                set_starttime(child, new_st.saturating_add(18));
             }
-            "starttime mutated"
         }
         HardNeg::Hn04MemToken => {
-            let flipped = !node.memory.token_present;
-            node.memory.token_present = flipped;
-            if flipped {
-                let (tlen, digest) = generate_decoy_token(rng, token_prefix);
-                node.memory.token_sha256 = Some(digest);
+            if !node.memory.token_present {
+                let tlen = apply_decoy_token(&mut node.memory, rng, token_prefix);
+                node.memory.token_len = Some(tlen as u32);
                 tok_len = Some(tlen);
             } else {
-                node.memory.token_sha256 = None;
+                clear_mem_token(&mut node.memory);
                 tok_len = None;
             }
-            "mem_scan token_present mutated"
         }
         HardNeg::Hn05Maps => {
-            node.memory
-                .maps
-                .push("<addr> rwxp 00000000 00:00 0 /tmp/hn05-injected.so".to_string());
-            node.memory.smaps.push(
-                "rwxp /tmp/hn05-injected.so Rss:128kB Private_Dirty:128kB Anonymous:128kB"
-                    .to_string(),
-            );
-            "maps mutated"
+            node.memory.maps.push(json::own(
+                "<addr> rwxp 00000000 00:00 0 /tmp/hn05-injected.so",
+            ));
+            node.memory.smaps.push(json::own(
+                "rwxp /tmp/hn05-injected.so Rss:128kB Private_Dirty:128kB Anonymous:128kB",
+            ));
         }
         HardNeg::Hn06Fd => {
             let next_fd = node.fds.iter().map(|f| f.fd).max().unwrap_or(2) + 1;
             node.fds.push(ProfileFd {
                 fd: next_fd,
-                target: "socket:[9999006]".to_string(),
+                target: json::own("socket:[9999006]"),
             });
-            "fd added"
         }
         HardNeg::Hn07Status => {
             node.status.no_new_privs = u32::from(node.status.no_new_privs == 0);
             node.status.seccomp = if node.status.seccomp == 0 { 2 } else { 0 };
             node.status.seccomp_filters = u32::from(node.status.seccomp == 2);
             node.status.tracer_pid = if node.status.tracer_pid == 0 { 9999 } else { 0 };
-            "status flags mutated"
         }
         HardNeg::Hn08Syscall => {
-            if node.syscall.syscall == "epoll_wait" {
-                node.syscall.syscall = "nanosleep".to_string();
-                node.syscall.wchan = "hrtimer_nanosleep".to_string();
+            let (sc, wc) = if node.syscall.syscall == "epoll_wait" {
+                ("nanosleep", "hrtimer_nanosleep")
             } else {
-                node.syscall.syscall = "epoll_wait".to_string();
-                node.syscall.wchan = "do_epoll_wait".to_string();
-            }
-            "syscall mutated"
+                ("epoll_wait", "do_epoll_wait")
+            };
+            set_s(&mut node.syscall.syscall, sc);
+            set_s(&mut node.syscall.wchan, wc);
         }
         HardNeg::Hn09Cmdline => {
             if node.identity.argv.is_empty() {
                 node.identity.argv.push(node.identity.comm.clone());
             }
-            node.identity.argv.push("--hn09-mutated-arg".to_string());
-            if node.stat.arg_start != 0 {
-                let new_len = render_cmdline_bytes(&node).len() as u64;
-                let new_arg_end = node.stat.arg_start.saturating_add(new_len);
-                if node.stat.env_start > 0 && new_arg_end > node.stat.env_start {
-                    let shift = new_arg_end - node.stat.env_start;
-                    node.stat.env_start = node.stat.env_start.saturating_add(shift);
-                    node.stat.env_end = node.stat.env_end.saturating_add(shift);
-                }
-                node.stat.arg_end = new_arg_end;
-            }
-            "cmdline argv mutated"
+            node.identity.argv.push(json::own("--hn09-mutated-arg"));
         }
         HardNeg::Hn10Threads => {
             let new_threads = node.status.threads.saturating_add(3);
@@ -1147,16 +1248,20 @@ fn build_hard_negative(
                 node.task.push(ProfileTask {
                     tid: base_tid + i,
                     comm: cat2("hn10-worker-", &i64_str(i as i64)),
-                    state: "S".to_string(),
+                    state: json::own("S"),
                 });
             }
-            "thread count mutated"
         }
-    };
+    }
 
+    let mutation = nth_pipe(
+        "exe mutated|ppid mutated|starttime mutated|mem_scan token_present mutated|maps mutated|fd added|status flags mutated|syscall mutated|cmdline argv mutated|thread count mutated",
+        hn as usize,
+    );
     (node, mutation, tok_len)
 }
 
+#[inline(never)]
 fn build_churn_processes(target: &Profile, count: usize, rng: &mut Rng) -> Vec<ProcEntry> {
     const DAEMONS: &str =
         "systemd-journal|/usr/lib/systemd/systemd-journald|epoll_wait|do_epoll_wait\n\
@@ -1183,41 +1288,35 @@ cron|/usr/sbin/cron|nanosleep|hrtimer_nanosleep";
                 .saturating_sub(rng.range(1_000, 10_000))
                 .max(50);
             let mut prof = build_level1_decoy(target, rng);
-            prof.source.masker = "churn".to_string();
-            prof.identity.label = comm.to_string();
-            prof.identity.comm = comm.to_string();
-            prof.identity.argv = vec![exe.to_string()];
+            set_s(&mut prof.source.masker, "churn");
+            set_s(&mut prof.identity.label, comm);
+            set_s(&mut prof.identity.comm, comm);
+            set_vec_s(&mut prof.identity.argv, &[exe]);
             prof.identity.pid = 0;
             prof.identity.uid = churn_uid;
             prof.identity.gid = churn_uid;
-            prof.identity.starttime = st;
-            prof.identity.cwd = "/".to_string();
-            prof.status.name = comm.to_string();
-            prof.status.uid = uid_str.clone();
-            prof.status.gid = uid_str.clone();
-            prof.stat.starttime = st;
+            set_starttime(&mut prof, st);
+            set_s(&mut prof.identity.cwd, "/");
+            set_s(&mut prof.status.name, comm);
+            set_s(&mut prof.status.uid, &uid_str);
+            set_s(&mut prof.status.gid, &uid_str);
             prof.stat.vsize = 18_432_000;
             prof.stat.rss = 1024;
             reset_decoy_deep(&mut prof, exe, "101", 1536, 2432, sc, wchan);
-            prof.task = vec![ProfileTask {
-                tid: 0,
-                comm: comm.to_string(),
-                state: "S".to_string(),
-            }];
-            out.push(ProcEntry {
-                role: Role::Churn,
-                profile: prof,
-                mutation: None,
-                decoy_token_len: None,
-                visible: true,
-                is_live: false,
-                parent_idx: None,
-                orig_parent_pid: None,
-                pgrp: 0,
-                session: 0,
-                depth: 0,
-                tie: rng.next_u64(),
-            });
+            prof.task = single_sleeping_task(comm);
+            out.push(make_proc_entry(
+                Role::Churn,
+                prof,
+                None,
+                true,
+                false,
+                None,
+                None,
+                0,
+                0,
+                0,
+                rng.next_u64(),
+            ));
         }
     }
     out
@@ -1228,17 +1327,15 @@ fn is_dumpable_denied(entry: &ProcEntry, observer_uid: u32) -> bool {
 }
 
 fn state_label(code: &str) -> &'static str {
-    match code {
-        "R" => "R (running)",
-        "S" => "S (sleeping)",
-        "D" => "D (disk sleep)",
-        "T" => "T (stopped)",
-        "t" => "t (tracing stop)",
-        "Z" => "Z (zombie)",
-        "X" => "X (dead)",
-        "I" => "I (idle)",
-        _ => "S (sleeping)",
-    }
+    let idx = if code.len() == 1 {
+        "RSDTtZXI".find(code).unwrap_or(1)
+    } else {
+        1
+    };
+    nth_pipe(
+        "R (running)|S (sleeping)|D (disk sleep)|T (stopped)|t (tracing stop)|Z (zombie)|X (dead)|I (idle)",
+        idx,
+    )
 }
 
 #[inline(never)]
@@ -1274,54 +1371,78 @@ fn push_kv_kb(out: &mut String, k: &str, kb: u64) {
     out.push_str(" kB\n");
 }
 
+#[inline(never)]
+fn push_kv_strs(out: &mut String, keys_csv: &str, vals: &[&str]) {
+    for (k, &v) in keys_csv.split(',').zip(vals.iter()) {
+        push_kv_str(out, k, v);
+    }
+}
+
+#[inline(never)]
+fn push_kv_i64s(out: &mut String, keys_csv: &str, vals: &[i64]) {
+    for (k, &v) in keys_csv.split(',').zip(vals.iter()) {
+        push_kv_i64(out, k, v);
+    }
+}
+
+#[inline(never)]
+fn push_kv_kbs(out: &mut String, keys_csv: &str, vals: &[u64]) {
+    for (k, &v) in keys_csv.split(',').zip(vals.iter()) {
+        push_kv_kb(out, k, v);
+    }
+}
+
+#[inline(never)]
 fn render_status_file(p: &Profile) -> String {
     let mut out = String::with_capacity(512);
-    push_kv_str(&mut out, "Name", &p.status.name);
-    push_kv_str(&mut out, "State", state_label(&p.status.state));
-    for (k, v) in [
-        ("Tgid", p.identity.pid as i64),
-        ("Pid", p.identity.pid as i64),
-        ("PPid", p.status.ppid as i64),
-        ("TracerPid", p.status.tracer_pid as i64),
-    ] {
-        push_kv_i64(&mut out, k, v);
-    }
+    push_kv_strs(
+        &mut out,
+        "Name,State",
+        &[&p.status.name, state_label(&p.status.state)],
+    );
+    push_kv_i64s(
+        &mut out,
+        "Tgid,Pid,PPid,TracerPid",
+        &[
+            p.identity.pid as i64,
+            p.identity.pid as i64,
+            p.status.ppid as i64,
+            p.status.tracer_pid as i64,
+        ],
+    );
     push_kv_tab_str(&mut out, "Uid", &p.status.uid);
     push_kv_tab_str(&mut out, "Gid", &p.status.gid);
     push_kv_i64(&mut out, "Threads", p.status.threads as i64);
-    for (k, kb) in [
-        ("VmSize", p.stat.vsize / 1024),
-        ("VmRSS", p.stat.rss.saturating_mul(4)),
-        ("VmLck", p.status.vm_lck.unwrap_or(0)),
-        ("RssShmem", p.status.rss_shmem.unwrap_or(0)),
-    ] {
-        push_kv_kb(&mut out, k, kb);
-    }
-    for (k, v) in [
-        ("CapPrm", p.status.cap_prm.as_str()),
-        ("CapEff", p.status.cap_eff.as_str()),
-        ("CapBnd", p.status.cap_bnd.as_str()),
-    ] {
-        push_kv_str(&mut out, k, v);
-    }
-    for (k, v) in [
-        ("NoNewPrivs", p.status.no_new_privs as i64),
-        ("Seccomp", p.status.seccomp as i64),
-        ("Seccomp_filters", p.status.seccomp_filters as i64),
-    ] {
-        push_kv_i64(&mut out, k, v);
-    }
+    push_kv_kbs(
+        &mut out,
+        "VmSize,VmRSS,VmLck,RssShmem",
+        &[
+            p.stat.vsize / 1024,
+            p.stat.rss.saturating_mul(4),
+            p.status.vm_lck.unwrap_or(0),
+            p.status.rss_shmem.unwrap_or(0),
+        ],
+    );
+    push_kv_strs(
+        &mut out,
+        "CapPrm,CapEff,CapBnd",
+        &[&p.status.cap_prm, &p.status.cap_eff, &p.status.cap_bnd],
+    );
+    push_kv_i64s(
+        &mut out,
+        "NoNewPrivs,Seccomp,Seccomp_filters",
+        &[
+            p.status.no_new_privs as i64,
+            p.status.seccomp as i64,
+            p.status.seccomp_filters as i64,
+        ],
+    );
     out
 }
 
-fn push_sp_u64s(out: &mut String, vals: &[u64]) {
-    for &v in vals {
-        out.push(' ');
-        push_u64(out, v);
-    }
-}
-
+#[inline(never)]
 fn render_stat_file(p: &Profile, pgrp: i32, session: i32, denied: bool) -> String {
+    const SEGS: &str = " 0 -1 | 0 0 0 0 0 0 0 0 | 0 | 0 | | | 18446744073709551615 0 0 | 0 0 0 0 0 0 0 0 0 17 0 0 | 0 0 0 0 0 0 | | | ";
     let flags = p.stat.flags.unwrap_or(4_194_304);
     let (startstack, arg_s, arg_e, env_s, env_e) = if denied {
         (0, 0, 0, 0, 0)
@@ -1338,29 +1459,35 @@ fn render_stat_file(p: &Profile, pgrp: i32, session: i32, denied: bool) -> Strin
     let sid = if session > 0 { session } else { p.identity.pid };
     let mut out = String::with_capacity(256);
     push_i64(&mut out, p.identity.pid as i64);
-    out.push_str(" (");
-    out.push_str(&p.identity.comm);
-    out.push_str(") ");
-    out.push_str(&p.status.state);
+    sp_kv_s(&mut out, " (", &p.identity.comm);
+    sp_kv_s(&mut out, ") ", &p.status.state);
     for v in [p.stat.ppid, pg, sid] {
         out.push(' ');
         push_i64(&mut out, v as i64);
     }
-    out.push_str(" 0 -1 ");
-    push_u64(&mut out, flags);
-    out.push_str(" 0 0 0 0 0 0 0 0 ");
-    push_i64(&mut out, p.syscall.priority as i64);
-    out.push_str(" 0 ");
-    push_u64(&mut out, p.stat.num_threads as u64);
-    out.push_str(" 0");
-    push_sp_u64s(&mut out, &[p.stat.starttime, p.stat.vsize, p.stat.rss]);
-    out.push_str(" 18446744073709551615 0 0 ");
-    push_u64(&mut out, startstack);
-    out.push_str(" 0 0 0 0 0 0 0 0 0 17 0 0 ");
-    push_i64(&mut out, p.syscall.policy as i64);
-    out.push_str(" 0 0 0 0 0 0");
-    push_sp_u64s(&mut out, &[arg_s, arg_e, env_s, env_e]);
-    out.push_str(" 0\n");
+    let vals: [u64; 12] = [
+        flags,
+        p.syscall.priority as i64 as u64,
+        p.stat.num_threads as u64,
+        p.stat.starttime,
+        p.stat.vsize,
+        p.stat.rss,
+        startstack,
+        p.syscall.policy as i64 as u64,
+        arg_s,
+        arg_e,
+        env_s,
+        env_e,
+    ];
+    for (i, (seg, &v)) in SEGS.split('|').zip(vals.iter()).enumerate() {
+        sp_s(&mut out, seg);
+        if i == 1 || i == 7 {
+            push_i64(&mut out, v as i64);
+        } else {
+            push_u64(&mut out, v);
+        }
+    }
+    sp_s(&mut out, " 0\n");
     out
 }
 
@@ -1377,6 +1504,7 @@ fn render_cmdline_bytes(p: &Profile) -> Vec<u8> {
     out
 }
 
+#[inline(never)]
 fn write_deep_entry(deep_root: &Path, entry: &ProcEntry, observer_uid: u32) -> Result<(), String> {
     let p = &entry.profile;
     let pid_dir = deep_root.join(i64_str(p.identity.pid as i64));
@@ -1393,16 +1521,24 @@ fn write_deep_entry(deep_root: &Path, entry: &ProcEntry, observer_uid: u32) -> R
         render_stat_file(p, entry.pgrp, entry.session, denied).as_bytes(),
     );
     o.write("cmdline", &render_cmdline_bytes(p));
-    o.line("comm", &p.identity.comm);
-    o.line("syscall", &p.syscall.syscall);
-    o.line("wchan", &p.syscall.wchan);
+    for (k, v) in "comm,syscall,wchan".split(',').zip([
+        &p.identity.comm,
+        &p.syscall.syscall,
+        &p.syscall.wchan,
+    ]) {
+        o.line(k, v);
+    }
 
     let mut w = Jw::new(true);
     w.obj_open();
-    w.k_opt_str("pid", &p.identity.ns.pid);
-    w.k_opt_str("mnt", &p.identity.ns.mnt);
-    w.k_opt_str("user", &p.identity.ns.user);
-    w.k_opt_str("net", &p.identity.ns.net);
+    for (k, v) in "pid,mnt,user,net".split(',').zip([
+        &p.identity.ns.pid,
+        &p.identity.ns.mnt,
+        &p.identity.ns.user,
+        &p.identity.ns.net,
+    ]) {
+        w.k_opt_str(k, v);
+    }
     w.obj_close();
     o.jw("ns.json", &mut w);
 
@@ -1412,11 +1548,12 @@ fn write_deep_entry(deep_root: &Path, entry: &ProcEntry, observer_uid: u32) -> R
     for t in &p.task {
         w.elem_obj();
         w.k_i64("tid", t.tid as i64);
-        w.k_str("comm", &t.comm);
-        w.k_str("state", &t.state);
+        w.k_strs("comm,state", &[&t.comm, &t.state]);
         w.obj_close();
-        let body = cat4("comm=", &t.comm, "\nstate=", &t.state);
-        to.line(&i64_str(t.tid as i64), &body);
+        to.line(
+            &i64_str(t.tid as i64),
+            &cat4("comm=", &t.comm, "\nstate=", &t.state),
+        );
     }
     w.arr_close();
     o.jw("task.json", &mut w);
@@ -1430,16 +1567,25 @@ fn write_deep_entry(deep_root: &Path, entry: &ProcEntry, observer_uid: u32) -> R
     } else {
         o.line("exe", &p.identity.exe);
         o.line("cwd", &p.identity.cwd);
-        o.lines("environ", &p.environ);
+        if p.environ.is_empty() && p.environ_all_nul && p.environ_raw_len > 0 {
+            let n = p.environ_raw_len.min(65_536) as usize;
+            o.write("environ", &vec![0u8; n]);
+        } else {
+            o.lines("environ", &p.environ);
+        }
         w.out.clear();
-        w.out.push_str("AT_EXECFN=");
-        w.out.push_str(p.auxv.at_execfn.as_deref().unwrap_or(""));
-        w.out.push_str("\nAT_PLATFORM=");
-        w.out.push_str(p.auxv.at_platform.as_deref().unwrap_or(""));
-        w.out.push_str("\nAT_BASE=");
-        push_u64(&mut w.out, p.auxv.at_base);
-        w.out.push_str("\nAT_ENTRY=");
-        push_u64(&mut w.out, p.auxv.at_entry);
+        sp_kv_s(
+            &mut w.out,
+            "AT_EXECFN=",
+            p.auxv.at_execfn.as_deref().unwrap_or(""),
+        );
+        sp_kv_s(
+            &mut w.out,
+            "\nAT_PLATFORM=",
+            p.auxv.at_platform.as_deref().unwrap_or(""),
+        );
+        sp_kv_u(&mut w.out, "\nAT_BASE=", p.auxv.at_base);
+        sp_kv_u(&mut w.out, "\nAT_ENTRY=", p.auxv.at_entry);
         w.out.push('\n');
         o.write("auxv", w.out.as_bytes());
         o.lines("maps", &p.memory.maps);
@@ -1469,11 +1615,15 @@ fn write_deep_entry(deep_root: &Path, entry: &ProcEntry, observer_uid: u32) -> R
         w.k_null("token_len");
     } else {
         w.k_bool("token_present", p.memory.token_present);
-        match entry.decoy_token_len {
-            Some(n) => w.k_u64("token_len", n as u64),
-            None if p.memory.token_present => w.k_u64("token_len", DECOY_TOKEN_LEN as u64),
+        match entry
+            .decoy_token_len
+            .or_else(|| default_tok_len(p))
+            .map(|n| n as u64)
+        {
+            Some(n) => w.k_u64("token_len", n),
             None => w.k_null("token_len"),
         }
+        w.k_str_arr("token_placements", &p.memory.token_placements);
     }
     w.obj_close();
     o.jw("mem_scan.json", &mut w);
@@ -1481,10 +1631,14 @@ fn write_deep_entry(deep_root: &Path, entry: &ProcEntry, observer_uid: u32) -> R
     o.check()
 }
 
+#[inline(never)]
 fn render_blind_table(entries: &[ProcEntry], indices: &[usize]) -> String {
     let mut out = String::from("PID     PPID    USER       COMM            ARGS\n");
     for &idx in indices {
-        let p = &entries[idx].profile;
+        let Some(entry) = entries.get(idx) else {
+            continue;
+        };
+        let p = &entry.profile;
         push_i64_right(&mut out, p.identity.pid as i64, 7);
         out.push(' ');
         push_i64_right(&mut out, p.identity.ppid as i64, 7);
@@ -1493,7 +1647,7 @@ fn render_blind_table(entries: &[ProcEntry], indices: &[usize]) -> String {
         out.push(' ');
         push_str_left(&mut out, &sanitize_comm_col(&p.identity.comm), 15);
         out.push(' ');
-        out.push_str(&format_args(p));
+        push_args(&mut out, p);
         out.push('\n');
     }
     out
@@ -1545,29 +1699,61 @@ pub fn parse_blind_table_pids(text: &str) -> Vec<i32> {
         .unwrap_or_default()
 }
 
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
-    mkdir_all(dst)?;
-    let entries = fs::read_dir(src).map_err(|e| err_io("cannot read", src, &e))?;
+#[inline(never)]
+fn walk_blind_dir(
+    root: &Path,
+    rel_prefix: &str,
+    on_dir: &mut dyn FnMut(&str) -> Result<(), String>,
+    on_file: &mut dyn FnMut(&Path, &str) -> Result<(), String>,
+) -> Result<(), String> {
+    let dir = if rel_prefix.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(rel_prefix)
+    };
+    let entries = fs::read_dir(&dir).map_err(|e| err_io("cannot read", &dir, &e))?;
     for entry in entries {
-        let entry = entry.map_err(|e| err_io("cannot read", src, &e))?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-        let meta =
-            fs::symlink_metadata(&src_path).map_err(|e| err_io("cannot stat", &src_path, &e))?;
+        let entry = entry.map_err(|e| err_io("cannot read", &dir, &e))?;
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            return Err(cat2("non-UTF-8 filename in ", &dir.to_string_lossy()));
+        };
+        let rel = if rel_prefix.is_empty() {
+            String::from(name_str)
+        } else {
+            cat3(rel_prefix, "/", name_str)
+        };
+        let path = entry.path();
+        let meta = fs::symlink_metadata(&path).map_err(|e| err_io("cannot stat", &path, &e))?;
         if meta.file_type().is_symlink() {
-            return Err("refusing symlink in blind_dir".to_string());
+            return Err(cat2("refusing symlink in blind_dir: ", &rel));
         }
         if meta.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path)?;
+            on_dir(&rel)?;
+            walk_blind_dir(root, &rel, on_dir, on_file)?;
         } else if meta.is_file() {
-            let data = json::read_bytes(&src_path)?;
-            write_file(&dst_path, &data)?;
+            on_file(&path, &rel)?;
         }
     }
     Ok(())
 }
 
-/// Format canonical `status` security/capability signature (shared by `harness` and `selftest`).
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
+    mkdir_all(dst)?;
+    walk_blind_dir(
+        src,
+        "",
+        &mut |rel| mkdir_all(&dst.join(rel)),
+        &mut |src_path, rel| {
+            let data = json::read_bytes(src_path)?;
+            write_file(&dst.join(rel), &data)
+        },
+    )
+}
+
+/// Format canonical `status` security/capability/memory signature (shared by `harness` and `selftest`).
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
 pub fn format_status_sig(
     nnp: &str,
     sec: &str,
@@ -1576,25 +1762,73 @@ pub fn format_status_sig(
     cap_eff: &str,
     cap_prm: &str,
     cap_bnd: &str,
+    vm_lck: &str,
+    rss_shmem: &str,
 ) -> String {
-    let mut s = String::with_capacity(96);
-    s.push_str("nnp=");
-    s.push_str(nnp);
-    s.push_str("|sec=");
-    s.push_str(sec);
-    s.push_str("|sf=");
-    s.push_str(sf);
-    s.push_str("|tr=");
-    s.push_str(if traced { "true" } else { "false" });
-    s.push_str("|ce=");
-    s.push_str(cap_eff);
-    s.push_str("|cp=");
-    s.push_str(cap_prm);
-    s.push_str("|cb=");
-    s.push_str(cap_bnd);
+    let mut s = String::with_capacity(128);
+    let tr = if traced { "true" } else { "false" };
+    for (k, v) in "nnp=,|sec=,|sf=,|tr=,|ce=,|cp=,|cb=,|vl=,|rs="
+        .split(',')
+        .zip([
+            nnp, sec, sf, tr, cap_eff, cap_prm, cap_bnd, vm_lck, rss_shmem,
+        ])
+    {
+        sp_kv_s(&mut s, k, v);
+    }
     s
 }
 
+/// Normalize `smaps` text for structural comparison, bucketing `[heap]` kB figures
+/// into 256 KiB bins so Level 6 +-32 KiB heap jitter remains indistinguishable while
+/// real mapping/permission/RSS anomalies are preserved.
+pub fn normalize_smaps_for_sig(smaps_text: &str) -> String {
+    let mut out = String::with_capacity(smaps_text.len());
+    for raw in smaps_text.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        if line.contains("[heap]") {
+            if let Some(rss_pos) = line.find("Rss:") {
+                out.push_str(&line[..rss_pos]);
+                let after = &line[rss_pos + 4..];
+                let bucket = after
+                    .find("kB")
+                    .and_then(|pos| json::parse_u64_s(&after[..pos]))
+                    .map(|kb| kb / 256)
+                    .unwrap_or(0);
+                out.push_str("RssBin:");
+                push_u64(&mut out, bucket);
+                continue;
+            }
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+fn sid_relation(entry: &ProcEntry, all_pids: &PidSet) -> &'static str {
+    let p = &entry.profile;
+    let sid = if p.identity.sid > 0 {
+        p.identity.sid
+    } else {
+        entry.session
+    };
+    if sid == p.identity.pid {
+        "self"
+    } else if all_pids.contains(p.identity.ppid) && sid == p.identity.ppid {
+        "parent"
+    } else if sid > 0 {
+        "ext"
+    } else {
+        "none"
+    }
+}
+
+#[inline(never)]
 fn surface_signature(
     entry: &ProcEntry,
     surface_idx: usize,
@@ -1603,69 +1837,210 @@ fn surface_signature(
     parent_set: &PidSet,
 ) -> String {
     let p = &entry.profile;
-    if is_dumpable_denied(entry, observer_uid) && matches!(surface_idx, 2 | 5 | 6 | 7 | 8) {
-        return "EACCES".to_string();
+    let denied = is_dumpable_denied(entry, observer_uid);
+    // Indices match score::FIDELITY_SURFACES:
+    // 0:comm, 1:cmdline, 2:ppid, 3:exe, 4:maps, 5:environ, 6:status, 7:stat,
+    // 8:cwd, 9:fds, 10:auxv, 11:memory, 12:threads, 13:syscall, 14:starttime
+    if denied && matches!(surface_idx, 3 | 4 | 5 | 8 | 9 | 10 | 11) {
+        return json::own("EACCES");
     }
+    let mut s = String::new();
     match surface_idx {
-        0 => p.identity.comm.clone(),
-        1 => format_args(p),
-        2 => p.identity.exe.clone(),
-        3 => {
-            let is_child = all_pids.contains(p.identity.ppid);
-            let has_child = parent_set.contains(p.identity.pid);
-            let hc = if has_child { "true" } else { "false" };
-            if is_child {
-                cat2("cluster-parent|has_child=", hc)
+        0 => sp_s(&mut s, &p.identity.comm),
+        1 => {
+            push_args(&mut s, p);
+            sp_kv_u(
+                &mut s,
+                "|nuls=",
+                p.identity.cmdline_raw_nuls.unwrap_or(1) as u64,
+            );
+        }
+        2 => {
+            if all_pids.contains(p.identity.ppid) {
+                sp_s(&mut s, "cluster-parent");
             } else {
-                cat3(&i64_str(p.identity.ppid as i64), "|has_child=", hc)
+                push_i64(&mut s, p.identity.ppid as i64);
+            }
+            sp_kv_s(
+                &mut s,
+                "|has_child=",
+                if parent_set.contains(p.identity.pid) {
+                    "true"
+                } else {
+                    "false"
+                },
+            );
+        }
+        3 => sp_s(&mut s, &p.identity.exe),
+        4 => {
+            push_joined(&mut s, &p.memory.maps, "\n");
+            sp_s(&mut s, "||");
+            let mut smaps_raw = String::new();
+            push_joined(&mut smaps_raw, &p.memory.smaps, "\n");
+            sp_s(&mut s, &normalize_smaps_for_sig(&smaps_raw));
+        }
+        5 => {
+            push_sorted_joined(&mut s, &p.environ, "\n");
+            if p.environ_all_nul {
+                sp_kv_u(&mut s, "|all_nul=", p.environ_raw_len);
+            } else if p.environ_raw_len > 0 {
+                sp_kv_u(&mut s, "|raw=", p.environ_raw_len);
             }
         }
-        4 => u64_str(p.identity.starttime / 25_000),
-        5 => {
-            let mut e = p.environ.clone();
-            sort_strings(&mut e);
-            e.join("\n")
+        6 => {
+            for (k, v) in "nnp=,|sec=,|sf=".split(',').zip([
+                p.status.no_new_privs as u64,
+                p.status.seccomp as u64,
+                p.status.seccomp_filters as u64,
+            ]) {
+                sp_kv_u(&mut s, k, v);
+            }
+            for (k, v) in "|tr=,|ce=,|cp=,|cb=".split(',').zip([
+                if p.status.tracer_pid != 0 {
+                    "true"
+                } else {
+                    "false"
+                },
+                p.status.cap_eff.as_str(),
+                p.status.cap_prm.as_str(),
+                p.status.cap_bnd.as_str(),
+            ]) {
+                sp_kv_s(&mut s, k, v);
+            }
+            sp_kv_u(&mut s, "|vl=", p.status.vm_lck.unwrap_or(0));
+            sp_kv_u(&mut s, "|rs=", p.status.rss_shmem.unwrap_or(0));
+            sp_kv_s(
+                &mut s,
+                "|dump=",
+                match p.dumpable {
+                    Some(true) => "1",
+                    Some(false) => "0",
+                    None => "u",
+                },
+            );
+            sp_kv_s(&mut s, "|sid=", sid_relation(entry, all_pids));
         }
-        6 => cat2(
-            "readable=true|token=",
-            if p.memory.token_present {
-                "true"
+        7 => {
+            let (arg_span, env_span, stack_nz) = if denied {
+                (0u64, 0u64, false)
             } else {
-                "false"
-            },
-        ),
-        7 => p.memory.maps.join("\n"),
-        8 => {
-            let mut fds: Vec<String> = p
+                (
+                    p.stat.arg_end.saturating_sub(p.stat.arg_start),
+                    p.stat.env_end.saturating_sub(p.stat.env_start),
+                    p.stat.startstack != 0,
+                )
+            };
+            for (k, v) in "arg=,|env=,|st=,|fl=".split(',').zip([
+                arg_span,
+                env_span,
+                u64::from(stack_nz),
+                p.stat.flags.unwrap_or(4_194_304),
+            ]) {
+                sp_kv_u(&mut s, k, v);
+            }
+        }
+        8 => sp_s(&mut s, &p.identity.cwd),
+        9 => {
+            let fds: Vec<String> = p
                 .fds
                 .iter()
                 .map(|f| cat3(&i64_str(f.fd as i64), ":", &normalize_fd_target(&f.target)))
                 .collect();
-            sort_strings(&mut fds);
-            fds.join("|")
+            push_sorted_joined(&mut s, &fds, "|");
         }
-        9 => format_status_sig(
-            &u64_str(p.status.no_new_privs as u64),
-            &u64_str(p.status.seccomp as u64),
-            &u64_str(p.status.seccomp_filters as u64),
-            p.status.tracer_pid != 0,
-            &p.status.cap_eff,
-            &p.status.cap_prm,
-            &p.status.cap_bnd,
-        ),
-        10 => cat3(&p.syscall.syscall, "|", &p.syscall.wchan),
+        10 => {
+            sp_kv_s(&mut s, "execfn=", p.auxv.at_execfn.as_deref().unwrap_or(""));
+            sp_kv_s(
+                &mut s,
+                "|plat=",
+                p.auxv.at_platform.as_deref().unwrap_or(""),
+            );
+        }
         11 => {
-            let mut comms: Vec<String> = p.task.iter().map(|t| t.comm.clone()).collect();
-            sort_strings(&mut comms);
-            cat3(&u64_str(p.status.threads as u64), "|", &comms.join(","))
+            sp_kv_s(
+                &mut s,
+                "readable=true|token=",
+                if p.memory.token_present {
+                    "true"
+                } else {
+                    "false"
+                },
+            );
+            if p.memory.token_present {
+                let tlen = entry
+                    .decoy_token_len
+                    .or_else(|| default_tok_len(p))
+                    .unwrap_or(DECOY_TOKEN_LEN) as u64;
+                sp_kv_u(&mut s, "|len=", tlen);
+                if !p.memory.token_placements.is_empty() {
+                    sp_s(&mut s, "|pl=");
+                    push_sorted_joined(&mut s, &p.memory.token_placements, ",");
+                }
+            }
         }
-        _ => String::new(),
+        12 => {
+            let comms: Vec<String> = p.task.iter().map(|t| t.comm.clone()).collect();
+            push_u64(&mut s, p.status.threads as u64);
+            s.push('|');
+            push_sorted_joined(&mut s, &comms, ",");
+        }
+        13 => {
+            sp_s(&mut s, &p.syscall.syscall);
+            sp_kv_s(&mut s, "|", &p.syscall.wchan);
+        }
+        14 => push_u64(&mut s, p.identity.starttime / 50_000),
+        _ => {}
+    }
+    s
+}
+
+#[inline(never)]
+fn any_surface_match(
+    needle: &ProcEntry,
+    hay: &[&ProcEntry],
+    si: usize,
+    observer_uid: u32,
+    all_pids: &PidSet,
+    parent_set: &PidSet,
+) -> bool {
+    let same_depth = hay.iter().any(|h| h.depth == needle.depth);
+    hay.iter().any(|h| {
+        (!same_depth || h.depth == needle.depth)
+            && entry_matches_surface(needle, h, si, observer_uid, all_pids, parent_set)
+    })
+}
+
+fn entry_matches_surface(
+    a: &ProcEntry,
+    b: &ProcEntry,
+    si: usize,
+    observer_uid: u32,
+    all_pids: &PidSet,
+    parent_set: &PidSet,
+) -> bool {
+    if si == 14 {
+        a.profile
+            .identity
+            .starttime
+            .abs_diff(b.profile.identity.starttime)
+            <= 50_000
+    } else {
+        surface_signature(a, si, observer_uid, all_pids, parent_set)
+            == surface_signature(b, si, observer_uid, all_pids, parent_set)
     }
 }
 
-fn compute_differing_surfaces(entries: &[ProcEntry], observer_uid: u32) -> Vec<String> {
-    const SURFACES: &str =
-        "comm,cmdline,exe,ppid,starttime,environ,memory,maps,fd,status,syscall,threads";
+struct FidelitySummary {
+    differing: Vec<String>,
+    total_decoys: usize,
+    ps_indistinguishable: usize,
+    proc_indistinguishable: usize,
+    per_surface_parity: [f64; 15],
+}
+
+#[inline(never)]
+fn compute_fidelity(entries: &[ProcEntry], observer_uid: u32) -> FidelitySummary {
+    const PS_IDX: [usize; 4] = [0, 1, 2, 14];
     let mut all_pids = PidSet::new();
     let mut targets: Vec<&ProcEntry> = Vec::new();
     let mut decoys: Vec<&ProcEntry> = Vec::new();
@@ -1680,8 +2055,15 @@ fn compute_differing_surfaces(entries: &[ProcEntry], observer_uid: u32) -> Vec<S
             decoys.push(e);
         }
     }
+    let total_decoys = decoys.len();
     if targets.is_empty() || decoys.is_empty() {
-        return Vec::new();
+        return FidelitySummary {
+            differing: Vec::new(),
+            total_decoys,
+            ps_indistinguishable: total_decoys,
+            proc_indistinguishable: total_decoys,
+            per_surface_parity: [1.0; 15],
+        };
     }
 
     let mut parent_set = PidSet::new();
@@ -1692,27 +2074,56 @@ fn compute_differing_surfaces(entries: &[ProcEntry], observer_uid: u32) -> Vec<S
     }
 
     let mut differing = Vec::new();
-    for (si, surf) in SURFACES.split(',').enumerate() {
-        let mut decoy_sigs: Vec<String> = Vec::new();
-        for d in &decoys {
-            let sig = surface_signature(d, si, observer_uid, &all_pids, &parent_set);
-            if !decoy_sigs.contains(&sig) {
-                decoy_sigs.push(sig);
+    let mut per_surface_parity = [1.0f64; 15];
+    let mut decoy_surface_ok: Vec<u16> = vec![0; decoys.len()];
+
+    for (si, (&surf, parity_slot)) in score::FIDELITY_SURFACES
+        .iter()
+        .zip(per_surface_parity.iter_mut())
+        .enumerate()
+    {
+        let mut matched_decoys = 0usize;
+        for (di, d) in decoys.iter().enumerate() {
+            if any_surface_match(d, &targets, si, observer_uid, &all_pids, &parent_set) {
+                matched_decoys += 1;
+                if let Some(m) = decoy_surface_ok.get_mut(di) {
+                    *m |= 1 << si;
+                }
             }
         }
-        if targets.iter().any(|t| {
-            !decoy_sigs.contains(&surface_signature(
-                t,
-                si,
-                observer_uid,
-                &all_pids,
-                &parent_set,
-            ))
-        }) {
-            differing.push(surf.to_string());
+        *parity_slot = matched_decoys as f64 / total_decoys as f64;
+
+        if targets
+            .iter()
+            .any(|t| !any_surface_match(t, &decoys, si, observer_uid, &all_pids, &parent_set))
+        {
+            differing.push(json::own(surf));
         }
     }
-    differing
+
+    let mut ps_indist = 0usize;
+    let mut proc_indist = 0usize;
+    let all_mask: u16 = (1u16 << 15) - 1;
+    let mut ps_mask: u16 = 0;
+    for &idx in &PS_IDX {
+        ps_mask |= 1 << idx;
+    }
+    for &mask in &decoy_surface_ok {
+        if (mask & ps_mask) == ps_mask {
+            ps_indist += 1;
+        }
+        if (mask & all_mask) == all_mask {
+            proc_indist += 1;
+        }
+    }
+
+    FidelitySummary {
+        differing,
+        total_decoys,
+        ps_indistinguishable: ps_indist,
+        proc_indistinguishable: proc_indist,
+        per_surface_parity,
+    }
 }
 
 fn build_neutral_readme(run_id: &str, mode: Mode) -> String {
@@ -1736,63 +2147,109 @@ fn build_neutral_readme(run_id: &str, mode: Mode) -> String {
     )
 }
 
-fn push_live_tree(
+fn push_live_node(
     prof: &Profile,
     role: Role,
     parent_idx: Option<usize>,
     depth: u32,
     visible: bool,
+    seen: &mut PidSet,
     out: &mut Vec<ProcEntry>,
-) {
+) -> Option<usize> {
+    let pid = prof.identity.pid;
+    if seen.contains(pid) {
+        return out
+            .iter()
+            .position(|e| e.is_live && e.profile.identity.pid == pid);
+    }
+    seen.insert(pid);
     let mut node = prof.clone();
     let kids = std::mem::take(&mut node.children);
-    let pid = node.identity.pid;
-    let tok_len = if node.memory.token_present {
-        Some(DECOY_TOKEN_LEN)
+    node.parent = None;
+    node.tracer = None;
+    let tok_len = default_tok_len(&node);
+    let pgrp = if node.identity.pgid > 0 {
+        node.identity.pgid
     } else {
-        None
+        pid
+    };
+    let session = if node.identity.sid > 0 {
+        node.identity.sid
+    } else {
+        pid
     };
     let my_idx = out.len();
-    out.push(ProcEntry {
-        role,
-        profile: node,
-        mutation: None,
-        decoy_token_len: tok_len,
-        visible,
-        is_live: true,
-        parent_idx,
-        orig_parent_pid: None,
-        pgrp: pid,
-        session: pid,
-        depth,
-        tie: 0,
-    });
+    out.push(make_proc_entry(
+        role, node, tok_len, visible, true, parent_idx, None, pgrp, session, depth, 0,
+    ));
     for c in &kids {
-        push_live_tree(c, role, Some(my_idx), depth + 1, visible, out);
+        push_live_node(c, role, Some(my_idx), depth + 1, visible, seen, out);
+    }
+    Some(my_idx)
+}
+
+#[inline(never)]
+fn push_live_tree(
+    prof: &Profile,
+    role: Role,
+    visible: bool,
+    seen: &mut PidSet,
+    out: &mut Vec<ProcEntry>,
+) {
+    let mut chain: Vec<&Profile> = Vec::new();
+    let mut cur = prof;
+    for _ in 0..16 {
+        chain.push(cur);
+        if let Some(par) = cur.parent.as_deref() {
+            cur = par;
+        } else {
+            break;
+        }
+    }
+    let mut parent_idx: Option<usize> = None;
+    for (depth, node) in chain.into_iter().rev().enumerate() {
+        parent_idx = push_live_node(node, role, parent_idx, depth as u32, visible, seen, out);
     }
 }
 
-fn capture_live_profiles(pids: &[i32]) -> Result<Vec<Profile>, String> {
+#[inline(never)]
+fn capture_live_profiles(
+    pids: &[i32],
+    redact_tokens: &[String],
+    redact_envs: &[String],
+    forbidden: &[&str],
+    alloc: &mut PidSet,
+) -> Result<Vec<Profile>, String> {
     let mut captured = Vec::with_capacity(pids.len());
     for &lpid in pids {
         let mut eopts = ExtractOpts::for_pid(lpid);
         eopts.tree = true;
+        eopts.ancestors = true;
+        eopts.redact_tokens = redact_tokens.to_vec();
+        eopts.redact_envs = redact_envs.to_vec();
         let mut p = profile::extract_live(&eopts)?;
+        strip_self_ancestors(&mut p);
         sanitize_live_profile(&mut p);
+        p.validate(forbidden)?;
+        reserve_tree_pids(&p, alloc);
         captured.push(p);
     }
     Ok(captured)
 }
 
+#[inline(never)]
 fn add_synthetic_decoys(
     template: &Profile,
     count: usize,
     level: u8,
     token_prefix: &str,
+    is_live: bool,
     rng: &mut Rng,
     out: &mut Vec<ProcEntry>,
 ) {
-    let has_tok = tree_has_token(template);
+    if count == 0 || is_live {
+        return;
+    }
     for _ in 0..count {
         let (d, tok_len) = match level {
             1 => (build_level1_decoy(template, rng), None),
@@ -1802,7 +2259,7 @@ fn add_synthetic_decoys(
                 degrade_deep_for_level3(&mut d, rng, None);
                 (d, None)
             }
-            4..=6 => prepare_level4_to_6_decoy(template, level, rng, token_prefix, true, has_tok),
+            4..=6 => prepare_level4_to_6_decoy(template, level, rng, token_prefix, true),
             _ => continue,
         };
         let start_idx =
@@ -1812,8 +2269,8 @@ fn add_synthetic_decoys(
                 root_entry.decoy_token_len = tok_len;
             }
             for child_entry in out.iter_mut().skip(start_idx + 1) {
-                if child_entry.profile.memory.token_present {
-                    child_entry.decoy_token_len = Some(DECOY_TOKEN_LEN);
+                if let Some(n) = default_tok_len(&child_entry.profile) {
+                    child_entry.decoy_token_len = Some(n);
                 }
             }
         }
@@ -1822,6 +2279,34 @@ fn add_synthetic_decoys(
         let churn_n = (count / 10).clamp(2, 10);
         out.extend(build_churn_processes(template, churn_n, rng));
     }
+}
+
+fn current_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn write_blind_manifest(bdir: &Path) -> Result<usize, String> {
+    let mut files = Vec::new();
+    walk_blind_dir(bdir, "", &mut |_| Ok(()), &mut |_, rel| {
+        if rel != "BLIND_MANIFEST.sha256" {
+            files.push(String::from(rel));
+        }
+        Ok(())
+    })?;
+    sort_strings(&mut files);
+    let mut body = String::new();
+    for rel in &files {
+        let digest = sha256::hash_file(&bdir.join(rel))?;
+        sp_s(&mut body, &digest);
+        sp_s(&mut body, "  ");
+        sp_s(&mut body, rel);
+        body.push('\n');
+    }
+    write_in(bdir, "BLIND_MANIFEST.sha256", body.as_bytes())?;
+    Ok(files.len())
 }
 
 #[inline(never)]
@@ -1883,6 +2368,7 @@ pub fn verify_target_presence(
     Ok(())
 }
 
+#[inline(never)]
 fn write_private_artifacts(
     opts: &RunOpts,
     run_id: &str,
@@ -1907,12 +2393,16 @@ fn write_private_artifacts(
     for e in entries {
         w.elem_obj();
         w.k_str("role", e.role.as_str());
-        w.k_i64("pid", e.profile.identity.pid as i64);
-        w.k_i64("ppid", e.profile.identity.ppid as i64);
+        w.k_i64s(
+            "pid,ppid",
+            &[
+                e.profile.identity.pid as i64,
+                e.profile.identity.ppid as i64,
+            ],
+        );
         w.k_bool("visible", e.visible);
         if let Role::HardNeg(hn) = e.role {
-            w.k_str("hn_id", hn.id());
-            w.k_str("surface", hn.surface());
+            w.k_strs("hn_id,surface", &[hn.id(), hn.surface()]);
         }
         if let Some(m) = e.mutation {
             w.k_str("mutation", m);
@@ -1948,12 +2438,13 @@ fn write_private_artifacts(
         }
     }
 
-    let differing = compute_differing_surfaces(entries, observer_uid);
+    let fidelity = compute_fidelity(entries, observer_uid);
     let hn_count = role_counts[3];
     let decoy_count = decoy_pids.len() + exact_clone_pids.len();
 
     w.reset(true);
     push_common_meta(&mut w, run_id, opts, observer_uid);
+    w.k_u64("created_epoch_ms", current_epoch_ms());
     w.k_bool("target_present", target_present);
     w.k_bool("target_visible_in_table", target_visible_in_table);
     w.k_i32_arr("target_pids", target_pids);
@@ -1962,17 +2453,34 @@ fn write_private_artifacts(
         if let Role::HardNeg(hn) = e.role {
             w.elem_obj();
             w.k_i64("pid", e.profile.identity.pid as i64);
-            w.k_str("hn_id", hn.id());
-            w.k_str("surface", hn.surface());
-            w.k_str("mutation", e.mutation.unwrap_or(""));
+            w.k_strs(
+                "hn_id,surface,mutation",
+                &[hn.id(), hn.surface(), e.mutation.unwrap_or("")],
+            );
             w.obj_close();
         }
     }
     w.arr_close();
     w.k_i32_arr("decoy_pids", &decoy_pids);
     w.k_i32_arr("exact_clone_pids", &exact_clone_pids);
+    w.k_u64s(
+        "total_decoys,ps_indistinguishable_decoys,proc_indistinguishable_decoys",
+        &[
+            fidelity.total_decoys as u64,
+            fidelity.ps_indistinguishable as u64,
+            fidelity.proc_indistinguishable as u64,
+        ],
+    );
+    w.k_obj("per_surface_parity");
+    for (&surf, &val) in score::FIDELITY_SURFACES
+        .iter()
+        .zip(fidelity.per_surface_parity.iter())
+    {
+        w.k_f64_r6(surf, val);
+    }
+    w.obj_close();
     w.k_obj("differing_surfaces");
-    w.k_str_arr("target_vs_decoys", &differing);
+    w.k_str_arr("target_vs_decoys", &fidelity.differing);
     w.obj_close();
     w.k_str("residual", DEFAULT_RESIDUAL);
     w.obj_close();
@@ -1992,8 +2500,10 @@ fn write_private_artifacts(
         }
     }
     w.obj_close();
-    w.k_str("version", env!("CARGO_PKG_VERSION"));
-    w.k_str("residual", DEFAULT_RESIDUAL);
+    w.k_strs(
+        "version,residual",
+        &[env!("CARGO_PKG_VERSION"), DEFAULT_RESIDUAL],
+    );
     w.obj_close();
     o.jw("evidence/metadata.json", &mut w);
     o.check()?;
@@ -2011,22 +2521,26 @@ fn push_root(
     push_synthetic_tree(prof, roles, rng, None, 0, visible, out)
 }
 
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
 fn push_targets(
     live_targets: &[Profile],
     synth: &Profile,
     visible: bool,
     also_clone: bool,
+    is_live: bool,
+    seen_live: &mut PidSet,
     rng: &mut Rng,
     out: &mut Vec<ProcEntry>,
 ) {
     if !live_targets.is_empty() {
         for lt in live_targets {
-            push_live_tree(lt, Role::Target, None, 0, visible, out);
-            if also_clone {
+            push_live_tree(lt, Role::Target, visible, seen_live, out);
+            if also_clone && !is_live {
                 push_root(lt, (Role::ExactClone, Role::ExactClone), true, rng, out);
             }
         }
-    } else {
+    } else if !is_live {
         push_root(synth, (Role::Target, Role::Target), visible, rng, out);
         if also_clone {
             push_root(synth, (Role::ExactClone, Role::ExactClone), true, rng, out);
@@ -2034,53 +2548,73 @@ fn push_targets(
     }
 }
 
+#[inline(never)]
 fn populate_entries(
     opts: &RunOpts,
     base_target: &Profile,
     effective_template: &Profile,
     live_targets: &[Profile],
     live_decoys: &[Profile],
+    is_live: bool,
     rng: &mut Rng,
 ) -> Vec<ProcEntry> {
     let mut entries = Vec::new();
+    let mut seen_live = PidSet::new();
     match opts.control {
         Control::C01Obvious => {
-            if !live_targets.is_empty() {
-                push_targets(live_targets, base_target, true, false, rng, &mut entries);
+            if is_live || !live_targets.is_empty() {
+                push_targets(
+                    live_targets,
+                    base_target,
+                    true,
+                    false,
+                    is_live,
+                    &mut seen_live,
+                    rng,
+                    &mut entries,
+                );
             } else {
                 let mut ob = base_target.clone();
-                ob.identity.label = "obvious-target-unique".to_string();
-                ob.identity.comm = "obvious-target".to_string();
-                ob.status.name = "obvious-target".to_string();
-                ob.identity.argv = vec![
-                    "obvious-target-unique".to_string(),
-                    "--obvious-control".to_string(),
-                ];
-                ob.identity.exe = "/srv/ci/obvious-target-unique".to_string();
-                ob.auxv.at_execfn = Some("/srv/ci/obvious-target-unique".to_string());
+                set_s(&mut ob.identity.label, "obvious-target-unique");
+                set_s(&mut ob.identity.comm, "obvious-target");
+                set_s(&mut ob.status.name, "obvious-target");
+                set_vec_s(
+                    &mut ob.identity.argv,
+                    &["obvious-target-unique", "--obvious-control"],
+                );
+                set_s(&mut ob.identity.exe, "/srv/ci/obvious-target-unique");
+                set_opt_s(
+                    &mut ob.auxv.at_execfn,
+                    Some("/srv/ci/obvious-target-unique"),
+                );
                 if let Some(t) = ob.task.first_mut() {
-                    t.comm = "obvious-target".to_string();
+                    set_s(&mut t.comm, "obvious-target");
                 }
                 push_root(&ob, (Role::Target, Role::Target), true, rng, &mut entries);
+            }
+            for ld in live_decoys {
+                push_live_tree(ld, Role::Decoy, true, &mut seen_live, &mut entries);
             }
             add_synthetic_decoys(
                 effective_template,
                 10,
                 1,
                 &opts.decoy_token_prefix,
+                is_live,
                 rng,
                 &mut entries,
             );
         }
         Control::C02Hidden | Control::C04NoTarget => {
             for ld in live_decoys {
-                push_live_tree(ld, Role::Decoy, None, 0, true, &mut entries);
+                push_live_tree(ld, Role::Decoy, true, &mut seen_live, &mut entries);
             }
             add_synthetic_decoys(
                 effective_template,
                 opts.decoys,
                 opts.level,
                 &opts.decoy_token_prefix,
+                is_live,
                 rng,
                 &mut entries,
             );
@@ -2091,13 +2625,20 @@ fn populate_entries(
                 base_target,
                 true,
                 opts.control == Control::C03ExactClone,
+                is_live,
+                &mut seen_live,
                 rng,
                 &mut entries,
             );
+            if opts.control == Control::C03ExactClone && is_live {
+                for ld in live_decoys {
+                    push_live_tree(ld, Role::ExactClone, true, &mut seen_live, &mut entries);
+                }
+            }
         }
         Control::C06Main | Control::C07HiddenByMask => {
             let vis = opts.control == Control::C06Main;
-            if live_targets.is_empty() && opts.level >= 6 {
+            if !is_live && live_targets.is_empty() && opts.level >= 6 {
                 let mut t_node = base_target.clone();
                 // Apply the EXACT same Level 6 jitter distribution to synthetic Target
                 // as to Level 6 decoys so Target is statistically indistinguishable.
@@ -2110,16 +2651,26 @@ fn populate_entries(
                     &mut entries,
                 );
             } else {
-                push_targets(live_targets, base_target, vis, false, rng, &mut entries);
+                push_targets(
+                    live_targets,
+                    base_target,
+                    vis,
+                    false,
+                    is_live,
+                    &mut seen_live,
+                    rng,
+                    &mut entries,
+                );
             }
             for ld in live_decoys {
-                push_live_tree(ld, Role::Decoy, None, 0, true, &mut entries);
+                push_live_tree(ld, Role::Decoy, true, &mut seen_live, &mut entries);
             }
             add_synthetic_decoys(
                 effective_template,
                 opts.decoys,
                 opts.level,
                 &opts.decoy_token_prefix,
+                is_live,
                 rng,
                 &mut entries,
             );
@@ -2150,10 +2701,34 @@ fn populate_entries(
     entries
 }
 
+#[inline(never)]
 fn clear_dir_if_exists(dir: &Path) -> Result<(), String> {
     if dir.exists() {
         fs::remove_dir_all(dir).map_err(|e| err_io("cannot clear", dir, &e))?;
     }
+    Ok(())
+}
+
+#[inline(never)]
+fn write_blind_bundle(
+    bdir: &Path,
+    run_id: &str,
+    mode: Mode,
+    blind_table: &str,
+    deep_dir: &Path,
+) -> Result<(), String> {
+    clear_dir_if_exists(bdir)?;
+    mkdir_all(bdir)?;
+    write_in(bdir, "blind-table.txt", blind_table.as_bytes())?;
+    if mode != Mode::Table {
+        copy_dir_recursive(deep_dir, &bdir.join("deep"))?;
+    }
+    write_in(
+        bdir,
+        "README.txt",
+        build_neutral_readme(run_id, mode).as_bytes(),
+    )?;
+    let _ = write_blind_manifest(bdir)?;
     Ok(())
 }
 
@@ -2170,14 +2745,15 @@ pub fn build_run_with_target_override(
     target_override: Option<&Profile>,
 ) -> Result<RunResult, String> {
     if !(1..=6).contains(&opts.level) {
-        return Err("invalid decoy level (expected 1..=6)".to_string());
+        return Err(String::from("invalid decoy level (expected 1..=6)"));
     }
-    opts.profile.validate(&[])?;
+    let forbidden: Vec<&str> = opts.redact_tokens.iter().map(String::as_str).collect();
+    opts.profile.validate(&forbidden)?;
     if let Some(ov) = target_override {
-        ov.validate(&[])?;
+        ov.validate(&forbidden)?;
     }
     if opts.blind_dir.as_ref() == Some(&opts.out_dir) {
-        return Err("blind_dir must be distinct from out_dir".to_string());
+        return Err(String::from("blind_dir must be distinct from out_dir"));
     }
 
     let run_id = match &opts.run_id {
@@ -2197,14 +2773,22 @@ pub fn build_run_with_target_override(
         alloc.insert(p);
     }
 
-    let live_targets = capture_live_profiles(&opts.live_target_pids)?;
-    let live_decoys = capture_live_profiles(&opts.live_decoy_pids)?;
-    for lt in &live_targets {
-        reserve_tree_pids(lt, &mut alloc);
-    }
-    for ld in &live_decoys {
-        reserve_tree_pids(ld, &mut alloc);
-    }
+    let is_live =
+        opts.live_mode || !opts.live_target_pids.is_empty() || !opts.live_decoy_pids.is_empty();
+    let live_targets = capture_live_profiles(
+        &opts.live_target_pids,
+        &opts.redact_tokens,
+        &opts.redact_envs,
+        &forbidden,
+        &mut alloc,
+    )?;
+    let live_decoys = capture_live_profiles(
+        &opts.live_decoy_pids,
+        &opts.redact_tokens,
+        &opts.redact_envs,
+        &forbidden,
+        &mut alloc,
+    )?;
 
     let (target_present, target_visible_in_table) = match opts.control {
         Control::C01Obvious
@@ -2215,11 +2799,7 @@ pub fn build_run_with_target_override(
         Control::C07HiddenByMask => (true, false),
     };
 
-    let effective_template = if !live_targets.is_empty() {
-        &live_targets[0]
-    } else {
-        template
-    };
+    let effective_template = live_targets.first().unwrap_or(template);
     let base_target = target_override.unwrap_or(effective_template);
 
     let mut entries = populate_entries(
@@ -2228,6 +2808,7 @@ pub fn build_run_with_target_override(
         effective_template,
         &live_targets,
         &live_decoys,
+        is_live,
         &mut rng,
     );
     assign_synthetic_pids(&mut entries, &mut alloc, &mut rng, opts.seed);
@@ -2258,7 +2839,9 @@ pub fn build_run_with_target_override(
     if opts.mode != Mode::Table {
         mkdir_all(&deep_dir)?;
         for &idx in &visible_indices {
-            write_deep_entry(&deep_dir, &entries[idx], observer_uid)?;
+            if let Some(entry) = entries.get(idx) {
+                write_deep_entry(&deep_dir, entry, observer_uid)?;
+            }
         }
     }
 
@@ -2284,18 +2867,7 @@ pub fn build_run_with_target_override(
     let manifest_files = sha256::write_manifest(&opts.out_dir)?;
 
     if let Some(ref bdir) = opts.blind_dir {
-        mkdir_all(bdir)?;
-        let blind_deep = bdir.join("deep");
-        clear_dir_if_exists(&blind_deep)?;
-        write_in(bdir, "blind-table.txt", blind_table.as_bytes())?;
-        if opts.mode != Mode::Table {
-            copy_dir_recursive(&deep_dir, &blind_deep)?;
-        }
-        write_in(
-            bdir,
-            "README.txt",
-            build_neutral_readme(&run_id, opts.mode).as_bytes(),
-        )?;
+        write_blind_bundle(bdir, &run_id, opts.mode, &blind_table, &deep_dir)?;
     }
 
     Ok(RunResult {
@@ -2343,6 +2915,9 @@ mod tests {
             live_target_pids: Vec::new(),
             live_decoy_pids: Vec::new(),
             decoy_token_prefix: "dtok_".to_string(),
+            redact_tokens: Vec::new(),
+            redact_envs: Vec::new(),
+            live_mode: false,
         }
     }
 
@@ -2389,21 +2964,43 @@ mod tests {
             fs::read_to_string(out2.join("blind-table.txt")).unwrap()
         );
         assert_eq!(
-            fs::read_to_string(out1.join("MANIFEST.sha256")).unwrap(),
-            fs::read_to_string(out2.join("MANIFEST.sha256")).unwrap()
+            fs::read_to_string(blind1.join("BLIND_MANIFEST.sha256")).unwrap(),
+            fs::read_to_string(blind2.join("BLIND_MANIFEST.sha256")).unwrap()
         );
+        let m1: Vec<String> = fs::read_to_string(out1.join("MANIFEST.sha256"))
+            .unwrap()
+            .lines()
+            .filter(|l| !l.ends_with("  answer.json"))
+            .map(String::from)
+            .collect();
+        let m2: Vec<String> = fs::read_to_string(out2.join("MANIFEST.sha256"))
+            .unwrap()
+            .lines()
+            .filter(|l| !l.ends_with("  answer.json"))
+            .map(String::from)
+            .collect();
+        assert_eq!(m1, m2);
 
         assert!(sha256::verify_manifest(&out1).unwrap().is_ok());
+        let ver_blind = score::verify_run_with_blind(&out1, None, Some(&blind1), &[]).unwrap();
+        assert!(ver_blind.ok && ver_blind.blind_dir_ok, "{}", ver_blind.json);
 
         assert!(blind1.join("blind-table.txt").is_file());
         assert!(blind1.join("deep").is_dir());
         assert!(blind1.join("README.txt").is_file());
+        assert!(blind1.join("BLIND_MANIFEST.sha256").is_file());
         assert!(!blind1.join("answer.json").exists());
         assert!(!blind1.join("population.json").exists());
         assert!(!blind1.join("profile.json").exists());
+        assert!(!blind1.join("MANIFEST.sha256").exists());
         let readme = fs::read_to_string(blind1.join("README.txt")).unwrap();
         assert!(!readme.to_ascii_lowercase().contains("psgen"));
         assert!(!readme.to_ascii_lowercase().contains("pmask"));
+
+        let ans1 = json::parse(&fs::read_to_string(out1.join("answer.json")).unwrap()).unwrap();
+        assert!(ans1.req_u64("created_epoch_ms").unwrap() > 0);
+        assert!(ans1.req_u64("total_decoys").unwrap() > 0);
+        assert!(ans1.get("per_surface_parity").is_some());
 
         let rows =
             parse_blind_table(&fs::read_to_string(out1.join("blind-table.txt")).unwrap()).unwrap();
@@ -2484,21 +3081,6 @@ mod tests {
                 depth: 0,
                 tie: 0,
             };
-            const ALL_SURFACES: &[&str] = &[
-                "comm",
-                "cmdline",
-                "exe",
-                "ppid",
-                "starttime",
-                "environ",
-                "memory",
-                "maps",
-                "fd",
-                "status",
-                "syscall",
-                "threads",
-            ];
-
             for hn_obj in hns {
                 let hpid = hn_obj.req_i64("pid").unwrap() as i32;
                 let expected_surface = hn_obj.req_str("surface").unwrap();
@@ -2526,11 +3108,10 @@ mod tests {
                     tie: 0,
                 };
                 let mut diffs = Vec::new();
-                for (si, &surf) in ALL_SURFACES.iter().enumerate() {
-                    let ts = surface_signature(&t_entry, si, 2000, &all_pids, &parent_set);
-                    let hs = surface_signature(&h_entry, si, 2000, &all_pids, &parent_set);
-                    if ts != hs {
-                        diffs.push(surf);
+                for (si, &surf) in score::FIDELITY_SURFACES.iter().enumerate() {
+                    if !entry_matches_surface(&t_entry, &h_entry, si, 2000, &all_pids, &parent_set)
+                    {
+                        diffs.push(if surf == "fds" { "fd" } else { surf });
                     }
                 }
                 assert_eq!(
@@ -2671,6 +3252,29 @@ mod tests {
                 assert!(res.target_pids[1] > res.target_pids[0]);
             }
         }
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn live_mode_zero_count_emits_no_synthetic_churn_and_passes_blind_verify() {
+        let base = test_dir("live-zero");
+        let out = base.join("run");
+        let blind = base.join("blind");
+        let mut opts = base_opts(out.clone(), Some(blind.clone()), false);
+        opts.live_mode = true;
+        opts.control = Control::C04NoTarget;
+        opts.decoys = 0;
+        opts.level = 6;
+        opts.hard_negatives = Vec::new();
+
+        let res = build_run(&opts).unwrap();
+        assert_eq!(res.total_rows, 0, "live mode count=0 must emit 0 rows");
+        assert_eq!(res.decoy_count, 0);
+        assert_eq!(res.hn_count, 0);
+
+        let ver = score::verify_run_with_blind(&out, None, Some(&blind), &[]).unwrap();
+        assert!(ver.ok && ver.blind_dir_ok, "verify failed: {}", ver.json);
+
         let _ = fs::remove_dir_all(&base);
     }
 }
